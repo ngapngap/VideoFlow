@@ -103,6 +103,39 @@ curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/admin/status
 $env:MUSE2API_DRIVER="browser"; $env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 ```
 
+## Fix 5 — Enforce hạn mức khi lease (trước đây quota chỉ để xem)
+
+**File:** `muse2api/accounts/model.py`
+
+**Vấn đề:** pool **không** enforce hạn mức khi chọn account — chỉ cooldown *sau khi*
+muse.ai báo hết. Account đã biết cạn quota vẫn được lease, đốt một request vô ích.
+
+**Sửa:** thêm `Account.quota_exhausted(now)` đọc snapshot đã lưu trong `meta.quota`:
+
+| Điều kiện | Kết luận |
+|---|---|
+| `weekly_used_pct < 100` hoặc không có snapshot | dùng được |
+| `weekly_used_pct >= 100` + `extra_left` còn > 0 | **dùng được** (quota bổ sung) |
+| `weekly_used_pct >= 100` + `resets_at` đã qua | dùng được (đã reset) |
+| `weekly_used_pct >= 100` + reset ở tương lai/không rõ | **chặn lease** |
+
+`is_available()` gọi hàm này **trước** nhánh cooldown — nếu chỉ xét cooldown thì account
+bị chặn vì hết quota sẽ được lease lại ngay khi cooldown hết (bug do test bắt được).
+Shape đếm của driver mock (`messages_used/limit`) và `resets_at` không parse được đều
+coi là **dùng được** — pool không bao giờ chặn account dựa trên phỏng đoán.
+`extra_left` parse: `"0 tokens"`/`none`/`-` → hết; `"1,200 tokens"`/`"0 / 5000"` → còn.
+
+## Fix 6 — PATCH /admin/accounts/{id} bypass kiểm tra trùng session
+
+**File:** `muse2api/api/routes/admin.py`
+
+Fix 3 chỉ chặn ở `POST /admin/accounts` và `/accounts/import`; `PATCH` (đổi cookie của
+account đã có) vẫn cho gán `hatch_sess` của account khác → hai account tranh nhau cookie
+rotation và cùng chết. Nay PATCH kiểm tra cùng logic, có cờ `?allow_duplicate_session=true`.
+
+**Test:** `tests/test_engine_fixes.py` (pytest, chạy trong CI) — 19 test phủ quota
+enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `UpstreamVmDisabled`.
+
 ## Build & phát hành
 
 Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`).

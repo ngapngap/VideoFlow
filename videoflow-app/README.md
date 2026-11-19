@@ -1,6 +1,10 @@
-# VideoFlow Desktop (v1.3.1 — Full Option)
+# VideoFlow Desktop (v1.4.0 — Full Option)
 
 Ứng dụng Desktop tự động hóa quy trình **Tạo Ảnh → Tạo Video (Local-Only)** triển khai đầy đủ theo **Bản thiết kế v1.3** và **Phụ lục chốt v1.3.1**, xây dựng trên nền tảng **Tauri v2 (Rust)** + **Svelte 4 / TypeScript**.
+
+**Từ v1.4.0:** có thêm engine nội bộ **VideoFlow Muse** (đóng gói kèm app) — quản lý pool cookie muse.ai, tạo **video** và **ảnh bằng model `muse-image`** trực tiếp, theo dõi hạn mức (quota tuần + quota bổ sung); và **tự cập nhật** qua GitHub Releases.
+
+Phát hành: xem [`docs/RELEASE.md`](docs/RELEASE.md) · Tải bản mới: https://github.com/ngapngap/VideoFlow/releases/latest
 
 ## Chạy & Kiểm tra
 

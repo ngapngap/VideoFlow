@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -42,8 +43,34 @@ class Account(BaseModel):
         default_factory=dict, description="Driver-specific data such as quota snapshots or vm ids"
     )
 
+    def quota_exhausted(self, now: float | None = None) -> bool:
+        """True when the last readable quota snapshot says this account is out of
+        weekly quota and the reported reset moment has not arrived yet.
+
+        muse.ai reports usage as a percentage of the weekly allowance plus an optional
+        extra-token balance. Only what we can actually read is enforced: a snapshot with
+        ``weekly_used_pct >= 100`` that still lies before ``resets_at``. Anything unknown
+        (no snapshot, unparseable date, count-based shape from the mock driver) counts as
+        usable — the pool must never block an account on a guess.
+        """
+        q = (self.meta or {}).get("quota") or {}
+        pct = q.get("weekly_used_pct")
+        if not isinstance(pct, (int, float)) or pct < 100:
+            return False
+        # Extra tokens bought on top of the plan keep the account usable.
+        extra = q.get("extra_left")
+        if isinstance(extra, str) and extra.strip() and not _extra_is_zero(extra):
+            return False
+        reset_in = _reset_deadline(q.get("resets_at"), now or _now())
+        return reset_in is None or reset_in > 0
+
     def is_available(self, now: float | None = None) -> bool:
         if not self.enabled or self.status == AccountStatus.INVALID:
+            return False
+        # Quota cạn chặn cả account đang cooling đã hết hạn cooldown — nếu chỉ xét
+        # cooldown thì account bị chặn do hết quota sẽ được lease lại ngay khi hết
+        # cooldown, đốt một request vào upstream vô ích.
+        if self.quota_exhausted(now):
             return False
         if self.status == AccountStatus.COOLING:
             return (now or _now()) >= self.cooldown_until
@@ -60,3 +87,57 @@ def _mask(value: str) -> str:
     if len(value) <= 8:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
+
+
+_ZERO_EXTRA = ("0", "0.0", "none", "null", "n/a", "-", "—")
+
+
+def _extra_is_zero(text: str) -> bool:
+    """``"0 tokens"``/``"none"`` → exhausted; ``"1,200 tokens"`` → still has balance."""
+    cleaned = text.strip().lower().replace(",", "").replace("tokens", "").strip()
+    if not cleaned or cleaned in _ZERO_EXTRA:
+        return True
+    # Leading number decides ("0 / 5000"); anything unparseable is treated as non-zero
+    # so an unknown balance never blocks the account.
+    head = cleaned.split()[0]
+    try:
+        return float(head) <= 0
+    except ValueError:
+        return False
+
+
+_RESET_FORMATS = (
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%d/%m/%Y",
+)
+
+
+def _reset_deadline(resets_at: Any, now: float) -> float | None:
+    """Seconds from ``now`` until the weekly quota resets, or None when unknown.
+
+    muse.ai renders the reset as a human date ("Oct 12, 2025", sometimes a time).
+    Unparseable values return None so callers fall back to "do not block".
+    """
+    if not resets_at:
+        return None
+    if isinstance(resets_at, (int, float)):
+        return float(resets_at) - now
+    text = str(resets_at).strip()
+    # Drop a trailing clock/timezone part: "Oct 12, 2025 at 10:00 (GMT+7)".
+    for sep in (" at ", ", ", " - ", " (", "T"):
+        if sep in text:
+            text = text.split(sep, 1)[0] if sep != ", " else text
+            break
+    for fmt in _RESET_FORMATS:
+        try:
+            when = datetime.strptime(text, fmt).replace(
+                hour=23, minute=59, second=59
+            ).timestamp()
+            return when - now
+        except ValueError:
+            continue
+    return None

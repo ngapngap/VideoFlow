@@ -1817,7 +1817,8 @@ fn muse_sanitize_id(id: &str) -> AppResult<String> {
 
 #[tauri::command]
 pub async fn muse_sidecar_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
-    let st = tauri::async_runtime::spawn_blocking(crate::muse_sidecar::status)
+    let cfg = state.settings_cache.read().clone();
+    let st = tauri::async_runtime::spawn_blocking(move || crate::muse_sidecar::status(&cfg))
         .await
         .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
     let cfg = state.settings_cache.read().clone();
@@ -1841,7 +1842,7 @@ pub async fn muse_start_sidecar(state: State<'_, AppState>) -> AppResult<serde_j
     let cfg = state.settings_cache.read().clone();
     let st = tauri::async_runtime::spawn_blocking(move || {
         crate::muse_sidecar::start(&cfg)?;
-        crate::muse_sidecar::status()
+        crate::muse_sidecar::status(&cfg)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;

@@ -226,6 +226,11 @@ export interface SidecarStatus {
   driver: string | null;
   account_total: number | null;
   account_available: number | null;
+  /** Cấu hình lúc engine spawn — so với Settings để biết có cần khởi động lại. */
+  cfg_port: number | null;
+  cfg_chromium: string | null;
+  cfg_headless: boolean | null;
+  restart_required: boolean;
 }
 
 export interface MuseStatusView {

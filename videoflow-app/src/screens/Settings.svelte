@@ -124,6 +124,24 @@
     }
   }
 
+  /** Dừng rồi khởi động lại engine để áp dụng Cài đặt mới (port/chromium/headless). */
+  async function museRestart() {
+    if (museSidecarBusy) return;
+    museSidecarBusy = true;
+    museErr = "";
+    try {
+      await api.muse_stop_sidecar();
+      await api.muse_start_sidecar();
+      showToast("success", "Đã áp dụng cài đặt mới cho engine VideoFlow Muse.");
+      await museRefresh();
+    } catch (e) {
+      museErr = formatApiError(e);
+      showToast("error", museErr);
+    } finally {
+      museSidecarBusy = false;
+    }
+  }
+
   async function museStop() {
     if (museSidecarBusy) return;
     museSidecarBusy = true;
@@ -636,6 +654,11 @@
       applySettingsView(view);
       hideAllKeyVisibility();
       dirty = false;
+      // Cấu hình engine (port/Edge/headless) đổi → hỏi lại trạng thái để hiện cảnh báo
+      // "cần khởi động lại" ngay, không bắt người dùng bấm Làm mới.
+      if (museStatus?.sidecar.running) {
+        museRefresh();
+      }
       saveMsg = "Đã lưu cài đặt thành công";
       showToast("success", "Đã lưu cấu hình hệ thống.");
       setTimeout(() => {
@@ -1349,8 +1372,32 @@
                 <Icons name="refresh" size={14} />
                 <span>{museLoading ? "Đang tải..." : "Làm mới"}</span>
               </button>
+              {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+                <button
+                  type="button"
+                  class="btn-primary"
+                  disabled={museSidecarBusy || $running}
+                  on:click={museRestart}
+                  title="Cài đặt Port / Edge / headless đã đổi — áp dụng bằng cách khởi động lại engine"
+                >
+                  <Icons name="redo" size={14} />
+                  <span>{museSidecarBusy ? "Đang áp dụng..." : "Áp dụng & khởi động lại"}</span>
+                </button>
+              {/if}
             </div>
           </div>
+
+          {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+            <div class="muse-stale-config">
+              <Icons name="alert" size={14} />
+              <span>
+                Cài đặt <b>Port / Edge / headless</b> đã thay đổi nhưng engine đang chạy với cấu hình cũ
+                (port {museStatus.sidecar.cfg_port ?? "?"},
+                {museStatus.sidecar.cfg_headless ? "headless" : "có giao diện"}).
+                Bấm <b>"Áp dụng &amp; khởi động lại"</b> để có hiệu lực.
+              </span>
+            </div>
+          {/if}
 
           <div class="hint">
             Sidecar tự dò Microsoft Edge/Chrome trên máy và điều khiển headless. Cookie muse.ai lưu
@@ -2707,6 +2754,22 @@
     font-size: var(--fs-label);
     color: var(--c-muted);
     padding: 10px 0;
+  }
+  .muse-stale-config {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin: 0 0 4px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--c-warn) 45%, transparent);
+    border-radius: 8px;
+    background: var(--c-warn-bg);
+    color: var(--c-warn-dark);
+    font-size: var(--fs-hint);
+    line-height: 1.45;
+  }
+  .muse-stale-config b {
+    font-weight: 700;
   }
   .muse-config {
     display: grid;

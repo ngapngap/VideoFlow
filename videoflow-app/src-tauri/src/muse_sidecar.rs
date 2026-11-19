@@ -29,6 +29,10 @@ struct SidecarHandle {
     child: Child,
     port: u16,
     api_key: String,
+    /// Cấu hình đã dùng để spawn — so với Settings hiện tại để biết cần restart.
+    cfg_port: u16,
+    cfg_chromium: String,
+    cfg_headless: bool,
 }
 
 static SIDECAR: OnceLock<parking_lot::RwLock<Option<SidecarHandle>>> = OnceLock::new();
@@ -46,6 +50,12 @@ pub struct SidecarStatus {
     pub driver: Option<String>,
     pub account_total: Option<u32>,
     pub account_available: Option<u32>,
+    /// Cấu hình lúc spawn (để UI biết cài đặt đã đổi mà chưa áp dụng).
+    pub cfg_port: Option<u16>,
+    pub cfg_chromium: Option<String>,
+    pub cfg_headless: Option<bool>,
+    /// True khi Cài đặt hiện tại khác cấu hình engine đang chạy → cần Khởi động lại.
+    pub restart_required: bool,
 }
 
 /// Thông tin phiên cần cho lớp adapter gọi API nội bộ.
@@ -296,7 +306,7 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     {
         let guard = sidecar_cell().read();
         if guard.is_some() {
-            return status();
+            return status(cfg);
         }
     }
 
@@ -369,8 +379,11 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
                     child,
                     port,
                     api_key: api_key.clone(),
+                    cfg_port: cfg.muse_sidecar_port,
+                    cfg_chromium: cfg.muse_chromium_path.trim().to_string(),
+                    cfg_headless: cfg.muse_headless,
                 });
-                let st = status()?;
+                let st = status(cfg)?;
                 log_info(&format!(
                     "VideoFlow Muse engine đã chạy: port={port}, cdp={cdp_port}, chromium={}",
                     chromium.display()
@@ -490,7 +503,7 @@ pub fn stop_for_quit() {
 }
 
 /// Đọc trạng thái sidecar: process còn sống + snapshot /admin/status khi gọi được.
-pub fn status() -> AppResult<SidecarStatus> {
+pub fn status(live: &Settings) -> AppResult<SidecarStatus> {
     let session = current_session();
     let Some(session) = session else {
         return Ok(SidecarStatus {
@@ -500,24 +513,28 @@ pub fn status() -> AppResult<SidecarStatus> {
             driver: None,
             account_total: None,
             account_available: None,
+            cfg_port: None,
+            cfg_chromium: None,
+            cfg_headless: None,
+            restart_required: false,
         });
     };
     // Process đã chết nhưng state chưa dọn → dọn.
-    let alive = {
+    let spawn_cfg = {
         let mut guard = sidecar_cell().write();
         match guard.as_mut() {
             Some(h) => match h.child.try_wait() {
                 Ok(Some(_)) => {
                     *guard = None;
-                    false
+                    None
                 }
-                Ok(None) => true,
-                Err(_) => false,
+                Ok(None) => Some((h.cfg_port, h.cfg_chromium.clone(), h.cfg_headless)),
+                Err(_) => None,
             },
-            None => false,
+            None => None,
         }
     };
-    if !alive {
+    let Some((cfg_port, cfg_chromium, cfg_headless)) = spawn_cfg else {
         return Ok(SidecarStatus {
             running: false,
             port: None,
@@ -525,10 +542,18 @@ pub fn status() -> AppResult<SidecarStatus> {
             driver: None,
             account_total: None,
             account_available: None,
+            cfg_port: None,
+            cfg_chromium: None,
+            cfg_headless: None,
+            restart_required: false,
         });
-    }
+    };
     // Best-effort fetch /admin/status: sidecar vừa spawn có thể chưa sẵn sàng middleware.
     let detail = admin_get(session.port, &session.api_key, "/admin/status").ok();
+    // Cài đặt hiện tại khác cấu hình lúc spawn → cần Khởi động lại mới có hiệu lực.
+    let restart_required = live.muse_sidecar_port != cfg_port
+        || live.muse_chromium_path.trim() != cfg_chromium
+        || live.muse_headless != cfg_headless;
     Ok(SidecarStatus {
         running: true,
         port: Some(session.port),
@@ -550,6 +575,10 @@ pub fn status() -> AppResult<SidecarStatus> {
             .and_then(|a| a.get("available"))
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
+        cfg_port: Some(cfg_port),
+        cfg_chromium: Some(cfg_chromium),
+        cfg_headless: Some(cfg_headless),
+        restart_required,
     })
 }
 
@@ -601,16 +630,38 @@ mod tests {
         let _ = find_free_port(busy);
     }
 
+    /// Chạy khi có exe engine cạnh app (dev: `binaries/`) — CI release build exe trước
+    /// rồi chạy test này, nên đường spawn thật không còn bị bỏ qua.
+    /// Bỏ qua (skip, không fail) khi thiếu exe để `cargo test` trên máy dev trống vẫn xanh.
     #[test]
-    #[ignore = "spawn sidecar thật (cần Edge/Chrome + exe đã build); chạy: cargo test --lib -- --ignored"]
     fn spawn_sidecar_that_roi_dung_lai_duoc() {
-        let cfg = Settings::default();
+        if sidecar_exe_path().is_err() {
+            eprintln!("skip: chưa build engine exe (binaries/videoflow-muse-*.exe)");
+            return;
+        }
+        let cfg = Settings {
+            // headless + Edge mặc định; engine tự dò Edge/Chrome trên máy.
+            muse_headless: true,
+            ..Settings::default()
+        };
         let st = start(&cfg).expect("spawn sidecar");
         assert!(st.running);
         assert!(st.port.is_some());
-        let after = status().expect("status");
+        assert!(!st.restart_required, "vừa spawn thì không được báo cần restart");
+        let after = status(&cfg).expect("status");
         assert_eq!(after.driver.as_deref(), Some("browser"));
+
+        // Đổi cấu hình (headless) khi engine đang chạy → phải báo cần khởi động lại.
+        let changed = Settings {
+            muse_headless: false,
+            ..cfg.clone()
+        };
+        assert!(
+            status(&changed).unwrap().restart_required,
+            "đổi headless phải khiến status báo restart_required"
+        );
+
         stop().expect("stop sidecar");
-        assert!(!status().unwrap().running);
+        assert!(!status(&cfg).unwrap().running);
     }
 }

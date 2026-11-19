@@ -145,13 +145,19 @@ async def import_accounts(body: AccountsImportRequest, svc: Services = Depends(g
 
 @router.patch("/accounts/{account_id}")
 async def update_account(account_id: str, body: AccountUpdate,
-                         svc: Services = Depends(get_services)) -> dict:
+                         svc: Services = Depends(get_services),
+                         allow_duplicate_session: bool = False) -> dict:
     acc = _get(svc, account_id)
     if body.label is not None:
         acc.label = body.label
     if body.enabled is not None:
         acc.enabled = body.enabled
     if body.cookies is not None:
+        # Same guard as POST: a hatching session must not be shared by two accounts,
+        # otherwise both fight over its rotation and die together.
+        if not allow_duplicate_session:
+            probe = Account(id=acc.id, label=acc.label, cookies=body.cookies)
+            _check_duplicate_session(probe, svc)
         acc.cookies = {k: v for k, v in body.cookies.items() if v}
         # Fresh cookies give an invalid account another chance.
         acc.status = AccountStatus.ACTIVE

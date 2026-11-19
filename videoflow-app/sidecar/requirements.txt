@@ -1,0 +1,17 @@
+# Runtime + build dependencies của engine VideoFlow Muse (muse2api), đã pin phiên bản.
+# Cài: pip install -r requirements.txt
+# Build exe: pyinstaller muse2api.spec --distpath ../src-tauri/binaries --noconfirm
+#
+# Pin (thay vì ">=") để build CI/máy dev ra cùng một exe — bản engine chạy trên
+# máy người dùng cuối nên phải tái lập được.
+fastapi==0.136.0
+starlette==1.0.0
+uvicorn[standard]==0.44.0
+pydantic==2.13.0
+pydantic-settings==2.16.3
+httpx[socks]==0.28.1
+socksio==1.0.0
+websockets==16.0
+python-multipart==0.0.26
+# Build tool (không cần khi chỉ chạy source)
+pyinstaller==6.20.0

@@ -45,7 +45,28 @@ tự cập nhật được nữa (phải cài tay 1 lần).
 |---|---|
 | Frontend | `npm ci` → `npm run check` (svelte-check) → `npm run build` |
 | Rust | stub sidecar → `cargo clippy --all-targets -D warnings` → `cargo test` |
-| Sidecar | `compileall` → chạy API mock → kiểm `/healthz`, `/admin/status`, chặn cookie trùng session |
+| Sidecar | cài `requirements.txt` (đã pin) → `compileall` → pytest (`tests/`: quota enforcement, chặn trùng session ở POST **và** PATCH) → chạy API mock kiểm `/healthz`, `/admin/status` |
+| Rust | ... → build engine exe thật → `cargo test` (gồm test spawn engine qua **browser driver thật** với Edge headless) → smoke `/admin/status` xác nhận `driver=browser, ok=true` |
+
+## Code-signing (SmartScreen)
+
+Hiện bộ cài **chưa được Authenticode-sign** nên Windows SmartScreen sẽ cảnh báo
+"Windows protected your PC" ở lần chạy đầu — người dùng phải bấm *More info → Run anyway*.
+Điều này **không ảnh hưởng auto-update** (updater dùng chữ ký minisign riêng, đã có `.sig`).
+
+Để hết cảnh báo, cần chứng chỉ code-signing (OV ~$200/năm, EV để có reputation ngay):
+
+```yaml
+# thêm vào step tauri-action trong release.yml
+env:
+  TAURI_SIGNING_PRIVATE_KEY: ...
+  WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}      # base64 .pfx
+  WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+# và bundle.windows.certificateThumbprint / digestAlgorithm / timestampUrl trong tauri.conf.json
+```
+
+Không có cert thì cứ phát hành bình thường; ghi rõ trong release notes để người dùng biết
+phải bấm *Run anyway*.
 
 ## Auto-update trong app
 

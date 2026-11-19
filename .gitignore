@@ -9,6 +9,13 @@ target/
 # Sidecar muse2api (PyInstaller)
 videoflow-app/sidecar/build/
 **/__pycache__/
+# Runtime state của engine khi chạy trực tiếp từ repo — data/accounts.json chứa COOKIE THẬT
+videoflow-app/sidecar/data/
+videoflow-app/sidecar/.env
+videoflow-app/sidecar/.venv/
+videoflow-app/sidecar/**/*.db
+videoflow-app/sidecar/**/*.db-wal
+videoflow-app/sidecar/**/*.db-shm
 
 # Build artifacts
 *.exe
