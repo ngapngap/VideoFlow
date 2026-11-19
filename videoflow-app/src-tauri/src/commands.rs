@@ -1766,6 +1766,7 @@ pub fn force_quit_app(
             let _ = crate::state_db::recover_interrupted_runs(&conn);
         }
     }
+    crate::muse_sidecar::stop_for_quit();
     app.exit(0);
     Ok(())
 }
@@ -1798,6 +1799,354 @@ pub async fn list_models(
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+// ━━ Commands: VideoFlow Muse nội bộ (engine + pool cookie + hạn mức) ━━
+
+fn muse_session_or_err(cfg: &Settings) -> AppResult<(u16, String)> {
+    let session = crate::muse_sidecar::ensure_running(cfg)?;
+    Ok((session.port, session.api_key))
+}
+
+/// `sanitize_url_segment` trả `ApiFail` (kiểu lỗi adapter) — đổi sang `AppError`
+/// theo hợp đồng command 13.2.
+fn muse_sanitize_id(id: &str) -> AppResult<String> {
+    crate::adapters::sanitize_url_segment(id, false)
+        .map_err(|e| AppError::new(&e.code, e.message))
+}
+
+#[tauri::command]
+pub async fn muse_sidecar_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    let st = tauri::async_runtime::spawn_blocking(crate::muse_sidecar::status)
+        .await
+        .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
+    let cfg = state.settings_cache.read().clone();
+    let chromium = if cfg.muse_chromium_path.trim().is_empty() {
+        crate::muse_sidecar::detect_chromium("")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        cfg.muse_chromium_path.clone()
+    };
+    Ok(serde_json::json!({
+        "sidecar": st,
+        "video_source": cfg.video_source,
+        "chromium_path": chromium,
+        "headless": cfg.muse_headless,
+    }))
+}
+
+#[tauri::command]
+pub async fn muse_start_sidecar(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    let st = tauri::async_runtime::spawn_blocking(move || {
+        crate::muse_sidecar::start(&cfg)?;
+        crate::muse_sidecar::status()
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
+    // Serialize SidecarStatus sang JSON thủ công (không derive Serialize ở type lib)
+    Ok(serde_json::json!({
+        "running": st.running,
+        "port": st.port,
+        "version": st.version,
+        "driver": st.driver,
+        "account_total": st.account_total,
+        "account_available": st.account_available,
+    }))
+}
+
+#[tauri::command]
+pub fn muse_stop_sidecar() -> AppResult<bool> {
+    crate::muse_sidecar::stop()?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn muse_list_accounts(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        crate::muse_sidecar::admin_get(port, &key, "/admin/accounts")
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+/// Nhận cookie ở 3 format (dict JSON / chuỗi header raw / list EditThisCookie) —
+/// muse2api tự parse; kèm `?allow_duplicate_session` khi user chọn bỏ qua cảnh báo trùng.
+#[tauri::command]
+pub async fn muse_add_cookie(
+    label: String,
+    cookies: serde_json::Value,
+    allow_duplicate: bool,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let body = serde_json::json!({
+            "label": label.trim(),
+            "cookies": cookies,
+        });
+        let dup_flag = if allow_duplicate { "?allow_duplicate_session=true" } else { "" };
+        crate::muse_sidecar::admin_send(
+            port,
+            &key,
+            "POST",
+            &format!("/admin/accounts{dup_flag}"),
+            Some(&body),
+        )
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_update_account(
+    account_id: String,
+    enabled: Option<bool>,
+    label: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let mut body = serde_json::Map::new();
+        if let Some(e) = enabled {
+            body.insert("enabled".into(), serde_json::Value::Bool(e));
+        }
+        if let Some(l) = label {
+            body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
+        }
+        let path = format!(
+            "/admin/accounts/{}",
+            muse_sanitize_id(&account_id)?
+        );
+        crate::muse_sidecar::admin_send(port, &key, "PATCH", &path, Some(&serde_json::Value::Object(body)))
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_delete_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let path = format!(
+            "/admin/accounts/{}",
+            muse_sanitize_id(&account_id)?
+        );
+        crate::muse_sidecar::admin_send(port, &key, "DELETE", &path, None)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_renew_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let path = format!(
+            "/admin/accounts/{}/renew",
+            muse_sanitize_id(&account_id)?
+        );
+        crate::muse_sidecar::admin_send(port, &key, "POST", &path, None)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+/// Đọc hạn mức của một account: dùng cache 30 phút của sidecar khi `refresh=false`,
+/// force đọc lại từ trang Settings → Usage của muse.ai khi `refresh=true` (thao tác
+/// browser thật — có thể bị từ chối khi account đang phục vụ request).
+#[tauri::command]
+pub async fn muse_account_quota(
+    account_id: String,
+    refresh: bool,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let id = muse_sanitize_id(&account_id)?;
+        let flag = if refresh { "?refresh=1" } else { "" };
+        let path = format!("/admin/accounts/{id}/quota{flag}");
+        crate::muse_sidecar::admin_get(port, &key, &path)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+/// Tải Chrome extension import cookie (GET /admin/extension.zip) về thư mục dữ liệu app
+/// rồi mở Explorer tại đó cho user cài vào trình duyệt.
+#[tauri::command]
+pub async fn muse_download_extension(state: State<'_, AppState>) -> AppResult<String> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let dir = crate::settings::app_data_dir().join(crate::muse_sidecar::MUSE_DATA_DIR);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::new("MUSE_EXT_FAIL", format!("Không tạo được thư mục: {e}")))?;
+        let dest = dir.join("videoflow-muse-extension.zip");
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| AppError::new("MUSE_EXT_FAIL", format!("{e}")))?;
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/admin/extension.zip"))
+            .bearer_auth(&key)
+            .send()
+            .map_err(|e| AppError::new("MUSE_EXT_FAIL", format!("Tải extension thất bại: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(AppError::new(
+                "MUSE_EXT_FAIL",
+                format!("Sidecar trả lỗi {status} khi tải extension.zip"),
+            ));
+        }
+        let bytes = resp
+            .bytes()
+            .map_err(|e| AppError::new("MUSE_EXT_FAIL", format!("Đọc nội dung thất bại: {e}")))?;
+        std::fs::write(&dest, &bytes)
+            .map_err(|e| AppError::new("MUSE_EXT_FAIL", format!("Không ghi được file: {e}")))?;
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new(windows_explorer_binary())
+                .raw_arg(format!("\"{}\"", dir.to_string_lossy()))
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+// ━━ Commands: Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
+
+/// Phiên bản app hiện tại lấy từ `tauri.conf.json` (package_info) — không hardcode.
+#[tauri::command]
+pub fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub current_version: String,
+    pub version: Option<String>,
+    pub notes: Option<String>,
+    pub date: Option<String>,
+}
+
+/// Kiểm tra bản mới trên endpoint updater (`latest.json` của GitHub Release).
+/// Không báo lỗi chặn UI khi mạng hỏng: trả `available: false` kèm `notes` mô tả lỗi.
+#[tauri::command]
+pub async fn check_app_update(app: AppHandle) -> AppResult<UpdateInfo> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let current = app.package_info().version.to_string();
+    let updater = app
+        .updater()
+        .map_err(|e| AppError::new("UPDATE_INIT_FAIL", format!("Không khởi tạo updater: {e}")))?;
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateInfo {
+            available: true,
+            current_version: current,
+            version: Some(update.version.clone()),
+            notes: update.body.clone(),
+            date: update.date.map(|d| d.to_string()),
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            current_version: current,
+            version: None,
+            notes: None,
+            date: None,
+        }),
+        Err(e) => Ok(UpdateInfo {
+            available: false,
+            current_version: current,
+            version: None,
+            notes: Some(format!("Không kiểm tra được bản cập nhật: {e}")),
+            date: None,
+        }),
+    }
+}
+
+/// Tải + cài bản cập nhật, phát tiến độ qua event `update_progress`
+/// (`{ downloaded, total, percent }`), rồi khởi động lại app.
+#[tauri::command]
+pub async fn install_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    if state.running.load(Ordering::SeqCst) {
+        return Err(AppError::new(
+            "RUN_IN_PROGRESS",
+            "Đang chạy pipeline — dừng (STOP) rồi mới cập nhật để không mất tiến độ.",
+        ));
+    }
+
+    let updater = app
+        .updater()
+        .map_err(|e| AppError::new("UPDATE_INIT_FAIL", format!("Không khởi tạo updater: {e}")))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| AppError::new("UPDATE_CHECK_FAIL", format!("Không kiểm tra được bản mới: {e}")))?
+        .ok_or_else(|| {
+            AppError::new("UPDATE_NOT_FOUND", "Bạn đang dùng phiên bản mới nhất.")
+        })?;
+
+    let emitter = app.clone();
+    let mut downloaded: u64 = 0;
+    update
+        .download_and_install(
+            move |chunk_len, total| {
+                downloaded += chunk_len as u64;
+                let percent = total
+                    .filter(|t| *t > 0)
+                    .map(|t| (downloaded.saturating_mul(100) / t).min(100) as u32);
+                let _ = emitter.emit(
+                    "update_progress",
+                    serde_json::json!({
+                        "downloaded": downloaded,
+                        "total": total,
+                        "percent": percent,
+                    }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| {
+            AppError::new("UPDATE_INSTALL_FAIL", format!("Cài bản cập nhật thất bại: {e}"))
+        })?;
+
+    log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
+    // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
+    crate::muse_sidecar::stop_for_quit();
+    app.restart();
+}
+
+fn log_info_app(msg: &str) {
+    crate::muse_sidecar::log_app_event(msg);
 }
 
 // ━━ Commands: Lịch sử, Chi tiết lượt, Xuất CSV/Log, Nhật ký & Explorer ━━

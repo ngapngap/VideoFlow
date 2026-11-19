@@ -39,8 +39,18 @@ pub fn register_secret_for_redaction(secret: &str) {
 pub struct Settings {
     pub endpoint_image_base_url: String,
     pub endpoint_image_model: String,
+    /// Nguồn sinh ảnh: "gateway" (gateway ngoài, mặc định) | "internal" (VideoFlow Muse).
+    pub image_source: String,
     pub endpoint_video_base_url: String,
     pub endpoint_video_model: String,
+    /// Nguồn sinh video: "gateway" (gateway ngoài, mặc định) | "internal" (muse2api nội bộ).
+    pub video_source: String,
+    /// Đường dẫn trình duyệt (Edge/Chrome) sidecar muse2api điều khiển; rỗng = tự dò.
+    pub muse_chromium_path: String,
+    /// Sidecar chạy Chromium headless (mặc định true).
+    pub muse_headless: bool,
+    /// Port sidecar muse2api ưa thích (18610; bận thì tự xin port khác).
+    pub muse_sidecar_port: u16,
     pub video_size: String,
     pub video_seconds: u32,
     pub image_timeout_s: u64,        // mặc định 300 giây (6.6 Thẻ 2)
@@ -66,8 +76,13 @@ impl Default for Settings {
         Self {
             endpoint_image_base_url: "https://gpt.photowrapped.com/v1".into(),
             endpoint_image_model: "gpt-image-2".into(),
+            image_source: "gateway".into(),
             endpoint_video_base_url: "https://muse.photowrapped.com/v1".into(),
             endpoint_video_model: "muse-video".into(),
+            video_source: "gateway".into(),
+            muse_chromium_path: String::new(),
+            muse_headless: true,
+            muse_sidecar_port: 18610,
             video_size: "720x1280".into(),
             video_seconds: 8,
             image_timeout_s: 300,
@@ -118,6 +133,15 @@ impl Settings {
         );
         clean.endpoint_video_model =
             trim_or_default(&clean.endpoint_video_model, &def.endpoint_video_model);
+        // Nguồn ảnh/video chỉ nhận 2 giá trị hợp lệ; sai định dạng về gateway ngoài.
+        if clean.image_source != "internal" {
+            clean.image_source = "gateway".into();
+        }
+        if clean.video_source != "internal" {
+            clean.video_source = "gateway".into();
+        }
+        clean.muse_chromium_path = clean.muse_chromium_path.trim().to_string();
+        clean.muse_sidecar_port = clean.muse_sidecar_port.max(1);
         clean.video_size = trim_or_default(&clean.video_size, &def.video_size);
 
         clean.concurrency = clean.concurrency.clamp(1, 3);

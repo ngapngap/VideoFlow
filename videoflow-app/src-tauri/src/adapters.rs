@@ -49,6 +49,53 @@ fn active_api_key(base_url: &str, which: &str) -> String {
     crate::settings::get_api_key(which).unwrap_or_default()
 }
 
+/// Resolve base URL + key cho nguồn video theo `video_source`:
+/// - `"internal"`: sidecar muse2api nội bộ `http://127.0.0.1:{port}/v1` + key phiên.
+///   Sidecar chưa chạy thì tự spawn (lazy). Lỗi spawn → ApiFail NghiepVu (không
+///   retry — lỗi cấu hình/môi trường, người dùng phải sửa xong mới chạy lại).
+/// - Mặc định `"gateway"`: giữ nguyên endpoint ngoài đã lưu + key từ keyring.
+fn resolve_video_base_and_key(cfg: &Settings) -> Result<(String, String), ApiFail> {
+    if cfg.video_source != "internal" {
+        let base = cfg.endpoint_video_base_url.trim().trim_end_matches('/').to_string();
+        let key = active_api_key(&base, "video");
+        return Ok((base, key));
+    }
+    match crate::muse_sidecar::ensure_running(cfg) {
+        Ok(session) => Ok((session.v1_base(), session.api_key)),
+        Err(e) => Err(ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "MUSE_SIDECAR_UNAVAILABLE".into(),
+            message: e.message,
+        }),
+    }
+}
+
+fn is_internal_video_source(cfg: &Settings) -> bool {
+    cfg.video_source == "internal"
+}
+
+/// Resolve base URL + key + model cho nguồn ảnh:
+/// - `"internal"`: engine VideoFlow Muse `http://127.0.0.1:{port}/v1`, key phiên,
+///   model cố định `muse-image` (muse2api tự resolve alias).
+/// - Mặc định: endpoint gateway ngoài + model đã cấu hình + key keyring.
+fn resolve_image_base_and_key(cfg: &Settings) -> Result<(String, String, String), ApiFail> {
+    if cfg.image_source != "internal" {
+        let base = cfg.endpoint_image_base_url.trim().trim_end_matches('/').to_string();
+        let key = active_api_key(&base, "anh");
+        return Ok((base, key, cfg.endpoint_image_model.trim().to_string()));
+    }
+    match crate::muse_sidecar::ensure_running(cfg) {
+        Ok(session) => Ok((session.v1_base(), session.api_key, "muse-image".to_string())),
+        Err(e) => Err(ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "MUSE_SIDECAR_UNAVAILABLE".into(),
+            message: e.message,
+        }),
+    }
+}
+
 fn client(timeout_s: u64) -> reqwest::blocking::Client {
     let key = timeout_s.max(1);
     let cache = HTTP_CLIENTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
@@ -148,6 +195,20 @@ impl ApiFail {
                 http_status: Some(status),
                 code: "QUOTA_EXHAUSTED".into(),
                 message: format!("Hết quota (HTTP {status}): {msg}"),
+            };
+        }
+
+        // Workspace bị muse.ai cắt (muse2api trả 503 kèm code `upstream_vm_disabled`):
+        // retry/fail-over vô nghĩa — phải mở ticket trên muse.ai, xếp NghiepVu.
+        if err_code_json == "upstream_vm_disabled"
+            || combined_low.contains("vm_state=disabled")
+            || combined_low.contains("disconnected this account's workspace")
+        {
+            return Self {
+                kind: ApiFailKind::NghiepVu,
+                http_status: Some(status),
+                code: "UPSTREAM_VM_DISABLED".into(),
+                message: format!("Workspace tài khoản bị muse.ai ngắt kết nối (HTTP {status}): {msg}"),
             };
         }
 
@@ -329,15 +390,15 @@ pub fn create_image(cfg: &Settings, image_path: &Path, prompt: &str) -> Result<I
             message: format!("MIME ảnh không hợp lệ: {e}"),
         })?;
 
+    let (base_clean, key, model) = resolve_image_base_and_key(cfg)?;
+
     let form = reqwest::blocking::multipart::Form::new()
         .text("prompt", prompt.to_string())
-        .text("model", cfg.endpoint_image_model.clone())
+        .text("model", model)
         .text("n", "1")
         .text("response_format", "b64_json")
         .part("image", part);
 
-    let base_clean = cfg.endpoint_image_base_url.trim().trim_end_matches('/');
-    let key = active_api_key(base_clean, "anh");
     let url = format!("{base_clean}/images/edits");
 
     let resp = client(cfg.image_timeout_s)
@@ -488,8 +549,7 @@ pub fn create_video_task(
     let (data_url, reencoded_jpeg) =
         build_video_image_data_url_info(&file_bytes, image_path, MAX_VIDEO_INPUT_IMAGE_BYTES)?;
 
-    let base_clean = cfg.endpoint_video_base_url.trim().trim_end_matches('/');
-    let key = active_api_key(base_clean, "video");
+    let (base_clean, key) = resolve_video_base_and_key(cfg)?;
     let url = format!("{base_clean}/videos");
 
     let payload = serde_json::json!({
@@ -610,6 +670,29 @@ pub fn classify_poll_task_failure(json: &Value) -> PollOutcome {
         };
     }
 
+    // Workspace bị muse.ai cắt (vm_state=DISABLED): fail-over/retry vô nghĩa, phải
+    // mở ticket trên muse.ai — giữ nguyên message tiếng Anh gốc để copy được hướng dẫn.
+    if raw_code == "upstream_vm_disabled"
+        || combined_low.contains("vm_state=disabled")
+        || combined_low.contains("disconnected this account's workspace")
+    {
+        return PollOutcome::Loi {
+            message: format!("Workspace tài khoản bị muse.ai ngắt kết nối: {msg}"),
+            kind: ApiFailKind::NghiepVu,
+            code: "UPSTREAM_VM_DISABLED".into(),
+        };
+    }
+
+    // Pool hết account khả dụng (tất cả đang cooldown/hết quota): lỗi tạm thời —
+    // retry theo backoff là hợp lý vì account sẽ hồi phục khi cooldown hết.
+    if raw_code == "no_account_available" || combined_low.contains("no account available") {
+        return PollOutcome::Loi {
+            message: format!("Pool muse2api chưa có account khả dụng: {msg}"),
+            kind: ApiFailKind::TamThoi { retry_after_s: None },
+            code: "TASK_TRANSIENT_ERROR".into(),
+        };
+    }
+
     let is_transient = [
         "internal_error",
         "server_error",
@@ -643,8 +726,7 @@ pub fn classify_poll_task_failure(json: &Value) -> PollOutcome {
 /// Bước 2 của B3: poll một lần GET /v1/videos/{task_id} theo bảng giá trị 13.3.
 pub fn poll_once(cfg: &Settings, task_id: &str) -> Result<PollOutcome, ApiFail> {
     let safe_tid = sanitize_url_segment(task_id, false)?;
-    let base_clean = cfg.endpoint_video_base_url.trim().trim_end_matches('/');
-    let key = active_api_key(base_clean, "video");
+    let (base_clean, key) = resolve_video_base_and_key(cfg)?;
     let url = format!("{base_clean}/videos/{safe_tid}");
 
     let resp = client(60)
@@ -820,11 +902,8 @@ pub fn media_url(cfg: &Settings, name: &str) -> Result<String, ApiFail> {
     let clean = clean.strip_prefix("v1/media/").unwrap_or(clean);
     let clean = clean.strip_prefix("media/").unwrap_or(clean);
     let safe = sanitize_url_segment(clean, true)?;
-    Ok(format!(
-        "{}/media/{}",
-        cfg.endpoint_video_base_url.trim().trim_end_matches('/'),
-        safe
-    ))
+    let (base, _key) = resolve_video_base_and_key(cfg)?;
+    Ok(format!("{base}/media/{safe}"))
 }
 
 /// Chọn URL tải video cuối cùng: ưu tiên URL trực tiếp -> `media_name` -> fallback cuối cùng là `task_id`.
@@ -926,9 +1005,8 @@ pub fn download_video(
             ));
         }
 
-        let base_clean = cfg.endpoint_video_base_url.trim();
-        let key = active_api_key(base_clean, "video");
-        let attach_auth = !key.is_empty() && is_same_origin(&current_url, base_clean);
+        let (base_clean, key) = resolve_video_base_and_key(cfg)?;
+        let attach_auth = !key.is_empty() && is_same_origin(&current_url, &base_clean);
 
         let mut req = client(600).get(current_url.trim());
         if attach_auth {
@@ -1062,13 +1140,32 @@ pub fn download_video(
 
 /// Xác định `base_url` và `api_key` thực tế:
 /// - Nếu `base_url` là `Some(draft)`, giữ nguyên `draft.trim()` (kể cả khi người dùng xóa trắng `""` để không test nhầm URL cũ!).
-/// - Nếu `base_url` là `None`, mới lấy từ cấu hình đã lưu.
+/// - Nếu `base_url` là `None`, mới lấy từ cấu hình đã lưu; riêng nguồn video `"internal"`
+///   thì dùng sidecar muse2api localhost + key phiên (tự spawn nếu chưa chạy).
 pub fn resolve_endpoint_and_key(
     cfg: &Settings,
     which: &str,
     base_url: Option<&str>,
     api_key: Option<&str>,
 ) -> (String, String) {
+    // Nguồn nội bộ (ảnh hoặc video) chỉ áp dụng khi không truyền draft URL/key.
+    if base_url.is_none() && api_key.is_none() {
+        let internal = if which == "anh" {
+            cfg.image_source == "internal"
+        } else {
+            is_internal_video_source(cfg)
+        };
+        if internal {
+            let resolved = if which == "anh" {
+                resolve_image_base_and_key(cfg).map(|(b, k, _m)| (b, k))
+            } else {
+                resolve_video_base_and_key(cfg)
+            };
+            // Lỗi engine: về rỗng để caller báo "Chưa nhập Base URL" dễ hiểu hơn là
+            // nổ lỗi nội bộ trong lúc user chỉ đang bấm Test kết nối.
+            return resolved.unwrap_or_default();
+        }
+    }
     let resolved_base = match base_url {
         Some(draft) => draft.trim().to_string(),
         None => match which {
@@ -1230,6 +1327,48 @@ mod tests {
             let t = ApiFail::classify_http(st, None, "gateway timeout");
             assert_eq!(t.kind, ApiFailKind::TamThoi { retry_after_s: None });
         }
+    }
+
+    #[test]
+    fn test_vm_disabled_classification_khong_retry() {
+        // muse2api trả 503 + code upstream_vm_disabled → NghiepVu (không auto-retry)
+        let f = ApiFail::classify_http(
+            503,
+            None,
+            r#"{"error":{"code":"upstream_vm_disabled","message":"muse.ai disconnected this account's workspace (vm_state=DISABLED); it needs a support ticket on muse.ai to reconnect."}}"#,
+        );
+        assert_eq!(f.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f.code, "UPSTREAM_VM_DISABLED");
+
+        // Poll task failed cùng code → NghiepVu
+        let p = classify_poll_task_failure(&serde_json::json!({
+            "status": "failed",
+            "error": {"code": "upstream_vm_disabled",
+                      "message": "muse.ai disconnected this account's workspace"}
+        }));
+        match p {
+            PollOutcome::Loi { kind, code, .. } => {
+                assert_eq!(kind, ApiFailKind::NghiepVu);
+                assert_eq!(code, "UPSTREAM_VM_DISABLED");
+            }
+            other => panic!("expected Loi, got {other:?}"),
+        }
+
+        // 503 no_account_available (pool trống) → TamThoi (retry hợp lệ)
+        let na = ApiFail::classify_http(
+            503,
+            None,
+            r#"{"error":{"code":"no_account_available","message":"no muse.ai account is available"}}"#,
+        );
+        assert_eq!(na.kind, ApiFailKind::TamThoi { retry_after_s: None });
+
+        // vm_disabled trong message dù code lạ → vẫn nhận diện được
+        let f2 = ApiFail::classify_http(
+            502,
+            None,
+            r#"{"error":{"message":"muse.ai disconnected this account's workspace (vm_state=DISABLED)"}}"#,
+        );
+        assert_eq!(f2.kind, ApiFailKind::NghiepVu);
     }
 
     #[test]

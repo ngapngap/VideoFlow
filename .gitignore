@@ -6,6 +6,10 @@ dist/
 target/
 **/gen/schemas/
 
+# Sidecar muse2api (PyInstaller)
+videoflow-app/sidecar/build/
+**/__pycache__/
+
 # Build artifacts
 *.exe
 *.msi
@@ -24,3 +28,6 @@ Thumbs.db
 
 # PDF tài liệu thiết kế — giữ local
 *.pdf
+
+# Updater signing key (never commit)
+.updater-key.*

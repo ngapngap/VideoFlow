@@ -1,7 +1,7 @@
 {
   "name": "videoflow-desktop-ui",
   "private": true,
-  "version": "1.3.1",
+  "version": "1.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0"
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^3.1.2",

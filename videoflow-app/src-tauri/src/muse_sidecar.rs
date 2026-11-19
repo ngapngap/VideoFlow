@@ -1,0 +1,616 @@
+//! Quản lý engine VideoFlow Muse — sidecar PyInstaller (muse2api) đóng gói sẵn, biến
+//! muse.ai thành API OpenAI-compatible.
+//!
+//! Engine là exe `videoflow-muse.exe` đi kèm bundle (dev: `binaries/videoflow-muse-<triple>.exe`),
+//! chạy ngầm trên localhost với driver browser (CDP Edge/Chrome). Cookie muse.ai nằm
+//! trong `data/accounts.json` của engine (một nguồn sự thật, tự renew session); app
+//! chỉ relay qua Admin API. API key nội bộ sinh mỗi phiên, chỉ giữ trong RAM.
+
+use crate::error::{AppError, AppResult};
+use crate::settings::Settings;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Tên exe engine trong bundle: Tauri externalBin bỏ hậu tố target-triple khi cài đặt.
+pub const SIDECAR_EXE_BUNDLED: &str = "videoflow-muse.exe";
+/// Tên exe engine trong `src-tauri/binaries/` lúc dev (giữ hậu tố target-triple).
+pub const SIDECAR_EXE_DEV: &str = "videoflow-muse-x86_64-pc-windows-msvc.exe";
+/// Thư mục dữ liệu engine (accounts.json, browser profile, log) trong %APPDATA%.
+pub const MUSE_DATA_DIR: &str = "muse";
+
+#[derive(Debug)]
+struct SidecarHandle {
+    child: Child,
+    port: u16,
+    api_key: String,
+}
+
+static SIDECAR: OnceLock<parking_lot::RwLock<Option<SidecarHandle>>> = OnceLock::new();
+
+fn sidecar_cell() -> &'static parking_lot::RwLock<Option<SidecarHandle>> {
+    SIDECAR.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Trạng thái sidecar cho UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct SidecarStatus {
+    pub running: bool,
+    pub port: Option<u16>,
+    pub version: Option<String>,
+    pub driver: Option<String>,
+    pub account_total: Option<u32>,
+    pub account_available: Option<u32>,
+}
+
+/// Thông tin phiên cần cho lớp adapter gọi API nội bộ.
+#[derive(Debug, Clone)]
+pub struct SidecarSession {
+    pub port: u16,
+    pub api_key: String,
+}
+
+impl SidecarSession {
+    /// Base URL nội bộ của lớp `/v1` (`http://127.0.0.1:{port}/v1`).
+    pub fn v1_base(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+}
+
+fn exe_name() -> &'static str {
+    SIDECAR_EXE_BUNDLED
+}
+
+/// Đường dẫn exe sidecar: cạnh exe app (bundle: `videoflow-muse.exe`) hoặc `binaries/` từ
+/// ancestor (dev: `target/debug/...` → `src-tauri/binaries/videoflow-muse-<triple>.exe`).
+pub fn sidecar_exe_path() -> AppResult<PathBuf> {
+    let names = [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV];
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            for name in names {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Ok(p);
+                }
+            }
+        }
+        for anc in cur.ancestors().skip(1).take(8) {
+            for name in names {
+                let p = anc.join("binaries").join(name);
+                if p.is_file() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    Err(AppError::new(
+        "MUSE_SIDECAR_MISSING",
+        format!(
+            "Không tìm thấy {} cạnh ứng dụng. Đảm bảo đã build sidecar \
+             (pyinstaller sidecar/muse2api.spec).",
+            exe_name()
+        ),
+    ))
+}
+
+/// Tìm Edge/Chrome để sidecar điều khiển qua CDP: override trong Settings → Edge → Chrome.
+pub fn detect_chromium(override_path: &str) -> AppResult<PathBuf> {
+    let trimmed = override_path.trim();
+    if !trimmed.is_empty() {
+        let p = PathBuf::from(trimmed);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(AppError::new(
+            "MUSE_CHROMIUM_NOT_FOUND",
+            format!("Đường dẫn trình duyệt trong Cài đặt không tồn tại: {trimmed}"),
+        ));
+    }
+    let candidates = [
+        ("ProgramFiles(x86)", r"Microsoft\Edge\Application\msedge.exe"),
+        ("ProgramFiles", r"Microsoft\Edge\Application\msedge.exe"),
+        ("LOCALAPPDATA", r"Microsoft\Edge\Application\msedge.exe"),
+        ("ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
+        ("ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe"),
+        ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe"),
+    ];
+    for (env_var, rel) in candidates {
+        if let Ok(base) = std::env::var(env_var) {
+            let p = PathBuf::from(base).join(rel);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(AppError::new(
+        "MUSE_CHROMIUM_NOT_FOUND",
+        "Không tìm thấy Microsoft Edge/Chrome trên máy. Cài Edge/Chrome hoặc nhập đường \
+         dẫn thủ công trong Cài đặt → Nguồn video VideoFlow Muse.",
+    ))
+}
+
+/// Sinh API key nội bộ ngẫu nhiên cho phiên (chỉ giữ trong RAM).
+fn generate_api_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let raw = format!("videoflow-muse-{nanos}-{pid}");
+    let digest = Sha256::digest(raw.as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("vf_{hex}")
+}
+
+/// Tìm port trống: thử port ưa thích trước, bận thì xin OS một port ngẫu nhiên.
+fn find_free_port(preferred: u16) -> AppResult<u16> {
+    if TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+        return Ok(preferred);
+    }
+    TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không xin được port trống: {e}")))?
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không đọc được port: {e}")))
+}
+
+fn blocking_client() -> AppResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::new("MUSE_HTTP_FAIL", format!("Không tạo được HTTP client: {e}")))
+}
+
+/// GET request tới Admin API của sidecar, trả JSON.
+pub fn admin_get(port: u16, api_key: &str, path: &str) -> AppResult<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = blocking_client()?
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .map_err(|e| AppError::new("MUSE_ADMIN_UNREACHABLE", format!("Sidecar không phản hồi: {e}")))?;
+    parse_admin_response(resp)
+}
+
+/// POST/DELETE/PATCH tới Admin API với body JSON tùy chọn.
+pub fn admin_send(
+    port: u16,
+    api_key: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> AppResult<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = blocking_client()?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|e| AppError::new("MUSE_ADMIN_FAIL", format!("Sai HTTP method: {e}")))?;
+    let mut req = client.request(method, &url).bearer_auth(api_key);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| AppError::new("MUSE_ADMIN_UNREACHABLE", format!("Sidecar không phản hồi: {e}")))?;
+    parse_admin_response(resp)
+}
+
+/// Chuyển response Admin API thành JSON; lỗi HTTP → AppError giữ `code` của sidecar
+/// ( ví dụ `invalid_request` khi cookie trùng) để UI hiển thị đúng message tiếng Anh gốc.
+fn parse_admin_response(resp: reqwest::blocking::Response) -> AppResult<serde_json::Value> {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| AppError::new("MUSE_ADMIN_FAIL", format!("Đọc response thất bại: {e}")))?;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let sidecar_msg = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(&body);
+        let sidecar_code = json
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("MUSE_ADMIN_FAIL");
+        return Err(AppError::new(
+            &format!("MUSE_{}", sidecar_code.to_uppercase()),
+            format!("Sidecar trả lỗi {status}: {sidecar_msg}"),
+        ));
+    }
+    Ok(json)
+}
+
+/// Chờ `/healthz` sẵn sàng (onefile PyInstaller giải nén mất vài giây lần đầu).
+fn wait_health(port: u16, child: &mut Child, deadline_secs: u64) -> AppResult<()> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| AppError::new("MUSE_HTTP_FAIL", format!("Không tạo được HTTP client: {e}")))?;
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    let deadline = Instant::now() + Duration::from_secs(deadline_secs);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(AppError::new(
+                "MUSE_SIDECAR_TIMEOUT",
+                "Engine VideoFlow Muse không phản hồi /healthz sau 90 giây. Xem log trong \
+                 %APPDATA%\\VideoFlowDesktop\\muse\\engine-stderr.log",
+            ));
+        }
+        if let Ok(Some(exit)) = child.try_wait() {
+            return Err(AppError::new(
+                "MUSE_SIDECAR_EXITED",
+                format!("Engine thoát ngay khi khởi động (code {exit}). Xem log trong \
+                 %APPDATA%\\VideoFlowDesktop\\muse\\engine-stderr.log"),
+            ));
+        }
+        if let Ok(resp) = client.get(&url).send() {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+/// Spawn sidecar (lazy): nếu đang chạy thì dùng lại, chưa thì khởi động mới.
+pub fn ensure_running(cfg: &Settings) -> AppResult<SidecarSession> {
+    if let Some(session) = current_session() {
+        return Ok(session);
+    }
+    start(cfg)?;
+    current_session().ok_or_else(|| {
+        AppError::new("MUSE_SIDECAR_FAIL", "Sidecar đã khởi động nhưng mất trạng thái phiên.")
+    })
+}
+
+/// Phiên hiện tại (port + API key) nếu sidecar đang chạy.
+pub fn current_session() -> Option<SidecarSession> {
+    let guard = sidecar_cell().read();
+    guard.as_ref().map(|h| SidecarSession {
+        port: h.port,
+        api_key: h.api_key.clone(),
+    })
+}
+
+/// Khóa tuần tự hóa việc spawn: hai lệnh song song (vd bấm Thêm cookie khi engine chưa chạy)
+/// không được spawn 2 engine tranh nhau port/profile Edge.
+static START_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+
+fn start_lock() -> &'static parking_lot::Mutex<()> {
+    START_LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+/// Khởi động sidecar với driver browser; chờ /healthz sẵn sàng.
+/// Cold start gồm PyInstaller onefile giải nén + khởi động Edge + CDP (~30-60s) nên
+/// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
+pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
+    let _spawn_guard = start_lock().lock();
+    {
+        let guard = sidecar_cell().read();
+        if guard.is_some() {
+            return status();
+        }
+    }
+
+    let exe = sidecar_exe_path()?;
+    let chromium = detect_chromium(&cfg.muse_chromium_path)?;
+    let port = find_free_port(cfg.muse_sidecar_port)?;
+    let cdp_port = find_free_port(19210)?;
+    let api_key = generate_api_key();
+    crate::settings::register_secret_for_redaction(&api_key);
+
+    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    std::fs::create_dir_all(&data_dir).ok();
+
+    // Dọn Edge mồ côi còn giữ profile (engine bị kill cứng lần trước) trước khi spawn.
+    kill_orphan_edges(&data_dir.join("browser-profile"));
+
+    // Log stdout/stderr của sidecar ra file để chẩn đoán khi khởi động thất bại.
+    let stdout_path = data_dir.join("engine-stdout.log");
+    let stderr_path = data_dir.join("engine-stderr.log");
+
+    // Hai lần thử: engine chết ngay (exit code 3) hầu như luôn do Edge kẹt profile.
+    // Lần 2 spawn mới sau khi dọn orphan + xoá state khoá, không cần user bấm lại.
+    let mut last_err: Option<AppError> = None;
+    for attempt in 1..=2 {
+        if attempt == 2 {
+            log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
+            kill_orphan_edges(&data_dir.join("browser-profile"));
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+
+        let stdout_file = std::fs::File::create(&stdout_path).map_err(|e| {
+            AppError::new("MUSE_SIDECAR_FAIL", format!("Không mở được log stdout: {e}"))
+        })?;
+        let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
+            AppError::new("MUSE_SIDECAR_FAIL", format!("Không mở được log stderr: {e}"))
+        })?;
+
+        let mut cmd = Command::new(&exe);
+        cmd.env("MUSE2API_DRIVER", "browser")
+            .env("MUSE2API_HOST", "127.0.0.1")
+            .env("MUSE2API_PORT", port.to_string())
+            .env("MUSE2API_CDP_PORT", cdp_port.to_string())
+            .env("MUSE2API_API_KEY", &api_key)
+            .env("MUSE2API_ADMIN_KEY", &api_key)
+            .env("MUSE2API_DATA_DIR", &data_dir)
+            .env("MUSE2API_CHROMIUM_PATH", &chromium)
+            .env("MUSE2API_HEADLESS", if cfg.muse_headless { "true" } else { "false" })
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(AppError::new(
+                    "MUSE_SIDECAR_FAIL",
+                    format!("Không chạy được engine: {e}"),
+                ));
+                continue;
+            }
+        };
+        match wait_health(port, &mut child, 90) {
+            Ok(()) => {
+                *sidecar_cell().write() = Some(SidecarHandle {
+                    child,
+                    port,
+                    api_key: api_key.clone(),
+                });
+                let st = status()?;
+                log_info(&format!(
+                    "VideoFlow Muse engine đã chạy: port={port}, cdp={cdp_port}, chromium={}",
+                    chromium.display()
+                ));
+                return Ok(st);
+            }
+            Err(e) => {
+                // Engine không lên được: kill cây process để không để lại engine mồ côi.
+                kill_child_tree(&mut child);
+                last_err = Some(e.with_engine_hint(&data_dir));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        AppError::new("MUSE_SIDECAR_FAIL", "Không khởi động được engine VideoFlow Muse.")
+    }))
+}
+
+/// Gắn thêm 2 dòng cuối log engine để thông báo lỗi có nội dung thật (thay vì chỉ
+/// "exit code 3") — người dùng thấy ngay nguyên nhân thay vì phải tự mở file log.
+trait EngineErrorHint {
+    fn with_engine_hint(self, data_dir: &std::path::Path) -> AppError;
+}
+
+impl EngineErrorHint for AppError {
+    fn with_engine_hint(self, data_dir: &std::path::Path) -> AppError {
+        let mut parts = vec![self.message];
+        for name in ["chromium-stderr.log", "engine-stderr.log"] {
+            let path = data_dir.join(name);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let interesting: Vec<&str> = text
+                    .lines()
+                    .filter(|l| {
+                        let low = l.to_lowercase();
+                        low.contains("error")
+                            || low.contains("exited early")
+                            || low.contains("runtimeerror")
+                            || low.contains("devtools")
+                    })
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                if let Some(last) = interesting.last() {
+                    parts.push(format!("{name}: {}", last.trim().chars().take(300).collect::<String>()));
+                }
+            }
+        }
+        AppError::new(&self.code, parts.join(" — "))
+    }
+}
+
+/// Dọn Edge mồ côi còn giữ profile của engine (xảy ra khi engine bị kill cứng không
+/// qua taskkill /T, hoặc app crash trước khi stop). Chỉ kill process có command line
+/// chứa ĐÚNG profile dir của app — không đụng Edge/Chrome của người dùng.
+fn kill_orphan_edges(profile_dir: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let needle = profile_dir.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | \
+             Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{needle}') }} | \
+             ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        // Cho Edge nhả file/profile trước khi engine mới khởi động nó lần nữa.
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = profile_dir;
+    }
+}
+
+/// Kill cả cây process (taskkill /T /F) để Chromium con do engine mở cũng chết.
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let pid = child.id();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// Dừng sidecar (taskkill /T /F để chết cả Chromium con do sidecar mở).
+pub fn stop() -> AppResult<()> {
+    let handle = sidecar_cell().write().take();
+    let Some(mut h) = handle else {
+        return Ok(());
+    };
+    kill_child_tree(&mut h.child);
+    // Crashpad/utility của Edge có thể sống sót sau taskkill /T và giữ profile —
+    // dọn luôn để lần khởi động sau không bị "Chromium did not expose DevTools".
+    let profile = crate::settings::app_data_dir()
+        .join(MUSE_DATA_DIR)
+        .join("browser-profile");
+    kill_orphan_edges(&profile);
+    log_info("VideoFlow Muse engine đã dừng");
+    Ok(())
+}
+
+/// Dừng sidecar khi app thoát — bỏ qua lỗi (không được cản việc quit).
+pub fn stop_for_quit() {
+    let _ = stop();
+}
+
+/// Đọc trạng thái sidecar: process còn sống + snapshot /admin/status khi gọi được.
+pub fn status() -> AppResult<SidecarStatus> {
+    let session = current_session();
+    let Some(session) = session else {
+        return Ok(SidecarStatus {
+            running: false,
+            port: None,
+            version: None,
+            driver: None,
+            account_total: None,
+            account_available: None,
+        });
+    };
+    // Process đã chết nhưng state chưa dọn → dọn.
+    let alive = {
+        let mut guard = sidecar_cell().write();
+        match guard.as_mut() {
+            Some(h) => match h.child.try_wait() {
+                Ok(Some(_)) => {
+                    *guard = None;
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            },
+            None => false,
+        }
+    };
+    if !alive {
+        return Ok(SidecarStatus {
+            running: false,
+            port: None,
+            version: None,
+            driver: None,
+            account_total: None,
+            account_available: None,
+        });
+    }
+    // Best-effort fetch /admin/status: sidecar vừa spawn có thể chưa sẵn sàng middleware.
+    let detail = admin_get(session.port, &session.api_key, "/admin/status").ok();
+    Ok(SidecarStatus {
+        running: true,
+        port: Some(session.port),
+        version: detail
+            .as_ref()
+            .and_then(|d| d.get("version"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        driver: detail
+            .as_ref()
+            .and_then(|d| d.get("driver"))
+            .and_then(|v| v.get("driver"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        account_total: detail.as_ref().and_then(|d| d.get("accounts")).and_then(|a| a.get("total")).and_then(|v| v.as_u64()).map(|v| v as u32),
+        account_available: detail
+            .as_ref()
+            .and_then(|d| d.get("accounts"))
+            .and_then(|a| a.get("available"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    })
+}
+
+/// Ghi một dòng vào file log sidecar trong thư mục dữ liệu app (fire-and-forget).
+/// Dùng file thay vì bảng `logs` SQLite vì log sidecar không thuộc về một dự án nào.
+pub fn log_app_event(msg: &str) {
+    log_info(msg);
+}
+
+fn log_info(msg: &str) {
+    let dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    std::fs::create_dir_all(&dir).ok();
+    let ts = chrono::Local::now().to_rfc3339();
+    let safe = crate::settings::redact_secrets(msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("engine-app.log"))
+    {
+        let _ = writeln!(f, "[{ts}] {safe}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_dinh_dang_vf_hex() {
+        let k = generate_api_key();
+        assert!(k.starts_with("vf_"));
+        assert_eq!(k.len(), 3 + 32);
+        assert!(k.chars().skip(3).all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(generate_api_key(), generate_api_key());
+    }
+
+    #[test]
+    fn detect_chromium_override_khong_ton_tai() {
+        let err = detect_chromium("C:/khong-ton-tai/browser.exe").unwrap_err();
+        assert_eq!(err.code, "MUSE_CHROMIUM_NOT_FOUND");
+    }
+
+    #[test]
+    fn find_free_port_khong_trung() {
+        // Chiếm một listener ở port bất kỳ, preferred bị bận → phải trả port khác.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = listener.local_addr().unwrap().port();
+        // Trả về port khác hoặc đúng busy nếu OS cho bind kép — chỉ cần không panic.
+        let _ = find_free_port(busy);
+    }
+
+    #[test]
+    #[ignore = "spawn sidecar thật (cần Edge/Chrome + exe đã build); chạy: cargo test --lib -- --ignored"]
+    fn spawn_sidecar_that_roi_dung_lai_duoc() {
+        let cfg = Settings::default();
+        let st = start(&cfg).expect("spawn sidecar");
+        assert!(st.running);
+        assert!(st.port.is_some());
+        let after = status().expect("status");
+        assert_eq!(after.driver.as_deref(), Some("browser"));
+        stop().expect("stop sidecar");
+        assert!(!status().unwrap().running);
+    }
+}

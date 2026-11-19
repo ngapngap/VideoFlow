@@ -177,8 +177,18 @@ export interface LogItem {
 export interface Settings {
   endpoint_image_base_url: string;
   endpoint_image_model: string;
+  /** Nguồn sinh ảnh: "gateway" (mặc định) | "internal" (VideoFlow Muse, model muse-image) */
+  image_source: string;
   endpoint_video_base_url: string;
   endpoint_video_model: string;
+  /** Nguồn sinh video: "gateway" (mặc định) | "internal" (VideoFlow Muse nội bộ) */
+  video_source: string;
+  /** Đường dẫn trình duyệt (Edge/Chrome) sidecar điều khiển; rỗng = tự dò */
+  muse_chromium_path: string;
+  /** Sidecar chạy Chromium headless (mặc định true) */
+  muse_headless: boolean;
+  /** Port engine VideoFlow Muse ưa thích (18610) */
+  muse_sidecar_port: number;
   video_size: string;
   video_seconds: number;
   image_timeout_s: number;
@@ -205,6 +215,70 @@ export interface SettingsView {
   video_key_preview: string | null;
   has_image_key: boolean;
   has_video_key: boolean;
+}
+
+// ━━ VideoFlow Muse nội bộ (engine + pool cookie + hạn mức) ━━
+
+export interface SidecarStatus {
+  running: boolean;
+  port: number | null;
+  version: string | null;
+  driver: string | null;
+  account_total: number | null;
+  account_available: number | null;
+}
+
+export interface MuseStatusView {
+  sidecar: SidecarStatus;
+  video_source: string;
+  chromium_path: string;
+  headless: boolean;
+}
+
+export interface MuseAccount {
+  id: string;
+  label: string;
+  enabled: boolean;
+  status: "active" | "cooling" | "invalid";
+  cookies: Record<string, string>;
+  cookie_expires: Record<string, number>;
+  created_at: number;
+  last_used_at: number;
+  cooldown_until: number;
+  last_error: string | null;
+  success_count: number;
+  fail_count: number;
+  meta: {
+    quota?: MuseQuotaSnapshot;
+    [key: string]: unknown;
+  };
+}
+
+/** Snapshot hạn mức đọc từ trang Settings → Usage của muse.ai */
+export interface MuseQuotaSnapshot {
+  /** Gói (vd "free", "pro plan") */
+  plan: string | null;
+  /** % quota hàng tuần đã dùng (0-100) — trường chính của bar hạn mức */
+  weekly_used_pct: number | null;
+  /** Ngày reset quota hàng tuần (chuỗi ngày trên trang muse.ai) */
+  resets_at: string | null;
+  /** Quota bổ sung còn lại (dạng text, vd "1,200 tokens") */
+  extra_left: string | null;
+  /** true chỉ khi đọc được % hàng tuần */
+  found: boolean;
+  /** lỗi khi đọc (settings entry not found...) nếu có */
+  error?: string;
+  /** dạng snapshot đếm (driver mock/format khác) — fallback tính % */
+  messages_used?: number;
+  messages_limit?: number;
+  messages_remaining?: number;
+  media_used?: number;
+  media_limit?: number;
+  media_remaining?: number;
+  /** unix ts lần đọc gần nhất */
+  checked_at?: number;
+  fetched_at?: number;
+  source?: string;
 }
 
 export const api = {
@@ -287,4 +361,49 @@ export const api = {
     invoke<boolean>("open_path_in_explorer", { targetPath, reveal }),
   force_quit_app: (stopFirst: boolean) => invoke<void>("force_quit_app", { stopFirst }),
   hide_to_tray: () => invoke<void>("hide_to_tray"),
+  // ━━ VideoFlow Muse nội bộ ━━
+  muse_sidecar_status: () => invoke<MuseStatusView>("muse_sidecar_status"),
+  muse_start_sidecar: () => invoke<SidecarStatus>("muse_start_sidecar"),
+  muse_stop_sidecar: () => invoke<boolean>("muse_stop_sidecar"),
+  muse_list_accounts: () => invoke<{ data: MuseAccount[] }>("muse_list_accounts"),
+  muse_add_cookie: (label: string, cookies: unknown, allowDuplicate = false) =>
+    invoke<{ account: MuseAccount; missing_cookies: string[] }>("muse_add_cookie", {
+      label,
+      cookies,
+      allowDuplicate,
+    }),
+  muse_update_account: (accountId: string, enabled?: boolean, label?: string) =>
+    invoke<{ account: MuseAccount }>("muse_update_account", {
+      accountId,
+      enabled: enabled ?? null,
+      label: label ?? null,
+    }),
+  muse_delete_account: (accountId: string) =>
+    invoke<{ ok: boolean }>("muse_delete_account", { accountId }),
+  muse_renew_account: (accountId: string) =>
+    invoke<{ account: MuseAccount }>("muse_renew_account", { accountId }),
+  muse_account_quota: (accountId: string, refresh = false) =>
+    invoke<{ account_id: string; quota: MuseQuotaSnapshot }>("muse_account_quota", {
+      accountId,
+      refresh,
+    }),
+  muse_download_extension: () => invoke<string>("muse_download_extension"),
+  // ━━ Cập nhật ứng dụng ━━
+  app_version: () => invoke<string>("app_version"),
+  check_app_update: () => invoke<UpdateInfo>("check_app_update"),
+  install_app_update: () => invoke<boolean>("install_app_update"),
 };
+
+export interface UpdateInfo {
+  available: boolean;
+  current_version: string;
+  version: string | null;
+  notes: string | null;
+  date: string | null;
+}
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+  percent: number | null;
+}

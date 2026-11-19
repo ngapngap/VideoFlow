@@ -6,6 +6,7 @@ pub mod commands;
 pub mod csv_writer;
 pub mod engine;
 pub mod error;
+pub mod muse_sidecar;
 pub mod project;
 pub mod prompts_csv;
 pub mod runtime_services;
@@ -21,6 +22,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .setup(|app| {
             runtime_services::init_tray_and_services(app.handle())?;
@@ -70,6 +73,19 @@ pub fn run() {
             commands::export_logs_txt,
             commands::open_path_in_explorer,
             commands::emit_structure_changed,
+            commands::muse_sidecar_status,
+            commands::muse_start_sidecar,
+            commands::muse_stop_sidecar,
+            commands::muse_list_accounts,
+            commands::muse_add_cookie,
+            commands::muse_update_account,
+            commands::muse_delete_account,
+            commands::muse_renew_account,
+            commands::muse_account_quota,
+            commands::muse_download_extension,
+            commands::app_version,
+            commands::check_app_update,
+            commands::install_app_update,
         ])
         .run(tauri::generate_context!())
         .expect("VideoFlow Desktop chạy thất bại");

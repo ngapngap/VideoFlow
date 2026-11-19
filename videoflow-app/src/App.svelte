@@ -22,7 +22,14 @@
     settingsDirty,
     showToast,
   } from "./lib/store";
-  import { api, type ProbeResult, type RecentProject } from "./lib/api";
+  import { listen } from "@tauri-apps/api/event";
+  import {
+    api,
+    type ProbeResult,
+    type RecentProject,
+    type UpdateInfo,
+    type UpdateProgress,
+  } from "./lib/api";
   import Icons from "./lib/Icons.svelte";
   import Modal from "./lib/Modal.svelte";
   import Toast from "./lib/Toast.svelte";
@@ -321,15 +328,71 @@
     }
   }
 
+  // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
+  let appVersion = "1.4.0";
+  let updateInfo: UpdateInfo | null = null;
+  let updateChecking = false;
+  let updateInstalling = false;
+  let updatePercent: number | null = null;
+  let updateError = "";
+  let updateDismissed = false;
+  let unlistenUpdateProgress: (() => void) | null = null;
+
+  async function checkForUpdates(silent = true) {
+    if (updateChecking || updateInstalling) return;
+    updateChecking = true;
+    updateError = "";
+    try {
+      appVersion = await api.app_version();
+      const info = await api.check_app_update();
+      updateInfo = info;
+      // Lỗi mạng/không có endpoint: chỉ hiện khi người dùng chủ động bấm kiểm tra.
+      if (!info.available && info.notes) {
+        if (!silent) updateError = info.notes;
+      }
+    } catch (e) {
+      if (!silent) updateError = formatApiError(e);
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  async function installUpdate() {
+    if (updateInstalling) return;
+    updateInstalling = true;
+    updateError = "";
+    updatePercent = 0;
+    try {
+      await api.install_app_update();
+      // Thành công thì app tự restart; không chạy tới đây.
+    } catch (e) {
+      updateError = formatApiError(e);
+      updateInstalling = false;
+      updatePercent = null;
+    }
+  }
+
   onMount(() => {
     bootstrapApp();
+    checkForUpdates(true);
+    listen<UpdateProgress>("update_progress", (ev) => {
+      updatePercent = ev.payload.percent;
+    })
+      .then((un) => {
+        unlistenUpdateProgress = un;
+      })
+      .catch(() => {});
+  });
+
+  onDestroy(() => {
+    if (unlistenUpdateProgress) unlistenUpdateProgress();
   });
 </script>
 
 <div class="layout">
   <aside class="sidebar" class:collapsed={sidebarCollapsed}>
     <div class="sidebar-top">
-      <div class="logo" title="VideoFlow Desktop v1.3.1">
+      <div class="logo" title={`VideoFlow Desktop v${appVersion}`}>
         <span class="logo-mark">
           <Icons name="sparkles" size={16} />
         </span>
@@ -536,11 +599,67 @@
       <span>Sẵn sàng</span>
     {/if}
     <span class="sep">·</span>
-    <span class="version-tag">v1.3.1</span>
+    <button
+      type="button"
+      class="version-tag version-btn"
+      title={updateChecking ? "Đang kiểm tra cập nhật..." : "Kiểm tra bản cập nhật"}
+      disabled={updateChecking}
+      on:click={() => checkForUpdates(false)}
+    >
+      v{appVersion}{updateInfo?.available ? " · có bản mới" : ""}
+    </button>
   </span>
 </footer>
 
 <Toast />
+
+{#if updateInfo?.available && !updateDismissed}
+  <div class="update-banner" role="status" aria-live="polite">
+    <div class="update-icon">
+      <Icons name="refresh" size={16} />
+    </div>
+    <div class="update-body">
+      <div class="update-title">
+        Có bản cập nhật <b>v{updateInfo.version}</b>
+        <span class="update-current">(đang dùng v{updateInfo.current_version})</span>
+      </div>
+      {#if updateInfo.notes}
+        <div class="update-notes">{updateInfo.notes}</div>
+      {/if}
+      {#if updateInstalling}
+        <div class="update-progress">
+          <div class="update-rail">
+            <b style="width:{updatePercent ?? 0}%"></b>
+          </div>
+          <span>{updatePercent != null ? `${updatePercent}%` : "Đang tải..."}</span>
+        </div>
+      {/if}
+      {#if updateError}
+        <div class="update-error">{updateError}</div>
+      {/if}
+    </div>
+    <div class="update-actions">
+      <button
+        type="button"
+        class="btn-secondary update-btn"
+        disabled={updateInstalling}
+        on:click={() => (updateDismissed = true)}
+      >
+        Để sau
+      </button>
+      <button
+        type="button"
+        class="btn-primary update-btn"
+        disabled={updateInstalling || $running}
+        title={$running ? "Dừng pipeline trước khi cập nhật" : "Tải và cài, sau đó app tự khởi động lại"}
+        on:click={installUpdate}
+      >
+        <Icons name="refresh" size={14} />
+        <span>{updateInstalling ? "Đang cập nhật..." : "Cập nhật & khởi động lại"}</span>
+      </button>
+    </div>
+  </div>
+{/if}
 
 <!-- Modal Đổi dự án nhanh 420px (Phụ lục v1.3.1 Q4) -->
 <Modal open={switcherOpen} title="Đổi dự án gần đây" width="420px" on:close={() => (switcherOpen = false)}>
@@ -1354,5 +1473,106 @@
   .unsaved-msg {
     line-height: 1.5;
     color: var(--c-text);
+  }
+  /* ━━ Banner cập nhật ứng dụng ━━ */
+  .version-btn {
+    background: none;
+    border: none;
+    padding: 0 4px;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .version-btn:hover:not(:disabled) {
+    background: var(--c-surface-subtle);
+    color: var(--c-teal);
+  }
+  .version-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .update-banner {
+    position: fixed;
+    right: 16px;
+    bottom: 40px;
+    z-index: 900;
+    width: min(560px, calc(100vw - 32px));
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 14px;
+    border: 1px solid var(--c-teal);
+    border-radius: 12px;
+    background: var(--c-card);
+    box-shadow: 0 8px 28px rgba(15, 40, 50, 0.18);
+  }
+  .update-icon {
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--c-teal-light);
+    color: var(--c-teal);
+  }
+  .update-body {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .update-title {
+    font-size: var(--fs-label);
+    font-weight: 600;
+  }
+  .update-current {
+    font-weight: 400;
+    color: var(--c-muted);
+  }
+  .update-notes {
+    margin-top: 4px;
+    font-size: var(--fs-hint);
+    color: var(--c-muted);
+    max-height: 72px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .update-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: var(--fs-hint);
+    color: var(--c-muted);
+  }
+  .update-rail {
+    flex: 1 1 auto;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--c-surface-subtle);
+    border: 1px solid var(--c-border);
+    overflow: hidden;
+  }
+  .update-rail b {
+    display: block;
+    height: 100%;
+    background: var(--c-teal);
+    transition: width 0.25s;
+  }
+  .update-error {
+    margin-top: 6px;
+    font-size: var(--fs-hint);
+    color: var(--c-danger);
+    overflow-wrap: anywhere;
+  }
+  .update-actions {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .update-btn {
+    white-space: nowrap;
   }
 </style>

@@ -67,6 +67,7 @@ pub fn init_tray_and_services(app: &AppHandle) -> Result<(), Box<dyn std::error:
                         let _ = crate::state_db::recover_interrupted_runs(&conn);
                     }
                 }
+                crate::muse_sidecar::stop_for_quit();
                 app_handle.exit(0);
             }
             _ => {}
