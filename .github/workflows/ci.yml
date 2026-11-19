@@ -57,6 +57,7 @@ jobs:
       - name: Stub sidecar binary
         shell: bash
         run: |
+          mkdir -p binaries
           touch binaries/videoflow-muse-x86_64-pc-windows-msvc.exe
 
       - name: Clippy

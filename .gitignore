@@ -31,3 +31,7 @@ Thumbs.db
 
 # Updater signing key (never commit)
 .updater-key.*
+
+# Giữ thư mục binaries/ (sidecar build local, *.exe bị ignore)
+!videoflow-app/src-tauri/binaries/
+videoflow-app/src-tauri/binaries/*.exe
