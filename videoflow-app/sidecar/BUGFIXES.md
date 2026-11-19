@@ -102,3 +102,12 @@ curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/admin/status
 # Browser driver — cần Edge/Chrome
 $env:MUSE2API_DRIVER="browser"; $env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 ```
+
+## Build & phát hành
+
+Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`).
+Trên GitHub runner môi trường Python sạch nên exe ~17.6 MB (máy dev local cài nhiều
+package nên ~43 MB) — cả hai đều chạy được; release job có smoke test exe thật
+(mock driver + `/healthz` + `/v1/models`) trước khi bundle.
+
+Chi tiết quy trình phát hành + secrets: `videoflow-app/docs/RELEASE.md`.

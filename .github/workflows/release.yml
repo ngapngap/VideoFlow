@@ -84,6 +84,37 @@ jobs:
           $mb = [math]::Round((Get-Item $f).Length / 1MB, 1)
           Write-Host "sidecar: $mb MB"
 
+      # Chạy thử exe PyInstaller thật (mock driver) — bắt lỗi thiếu hidden import
+      # trước khi bundle vào bộ cài.
+      - name: Smoke test sidecar exe
+        shell: pwsh
+        run: |
+          $exe = "videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
+          $env:MUSE2API_DRIVER = "mock"
+          $env:MUSE2API_PORT = "18701"
+          $env:MUSE2API_DATA_DIR = "$env:TEMP\m2a-rel"
+          $env:MUSE2API_API_KEY = "relkey"
+          $env:MUSE2API_ADMIN_KEY = "relkey"
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
+          $ok = $false
+          foreach ($i in 1..60) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18701/healthz" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            if ($p.HasExited) { throw "sidecar exe thoát sớm (exit $($p.ExitCode))" }
+          }
+          if (-not $ok) { throw "sidecar exe không phản hồi /healthz" }
+          $h = @{ Authorization = "Bearer relkey" }
+          $st = Invoke-RestMethod -Uri "http://127.0.0.1:18701/admin/status" -Headers $h
+          Write-Host "sidecar exe OK: driver=$($st.driver.driver) version=$($st.version)"
+          if ($st.driver.driver -ne "mock") { throw "driver sai" }
+          # endpoint ảnh + video phải tồn tại (contract VideoFlow gọi)
+          $models = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/models" -Headers $h
+          Write-Host "models: $($models.data.id -join ', ')"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
       - name: Install frontend deps
         working-directory: videoflow-app
         run: npm ci
