@@ -21,3 +21,6 @@ rustup-init.exe
 .DS_Store
 Thumbs.db
 *.log
+
+# PDF tài liệu thiết kế — giữ local
+*.pdf
