@@ -1486,6 +1486,8 @@
             </div>
           </div>
 
+          <div class="muse-cols">
+            <div class="muse-col">
           {#if museStatus?.sidecar.running}
             <!-- Tổng quan pool -->
             <div class="muse-summary">
@@ -1611,7 +1613,8 @@
               ngay bên dưới: engine sẽ tự khởi động khi bấm "Thêm cookie".
             </div>
           {/if}
-
+            </div>
+            <div class="muse-col">
           <!-- Thêm cookie: LUÔN hiển thị — không phụ thuộc trạng thái engine -->
           <div class="muse-add">
             <label class="label" for="muse-add-label">Tên tài khoản (nhãn)</label>
@@ -1696,6 +1699,8 @@
             {#if museAddErr}
               <div class="feedback-line bad selectable">{museAddErr}</div>
             {/if}
+          </div>
+            </div>
           </div>
         </div>
         {/if}
@@ -2114,7 +2119,7 @@
   .settings-screen {
     display: flex;
     flex-direction: column;
-    max-width: 720px;
+    width: 100%;
   }
   .loading {
     color: var(--c-muted);
@@ -2161,7 +2166,6 @@
   }
 
   .form {
-    max-width: 720px;
     width: 100%;
     display: flex;
     flex-direction: column;
@@ -2372,11 +2376,10 @@
     font-weight: 500;
   }
 
-  /* Thanh Lưu thẳng hàng max-width 720px với thẻ .form, ẩn sạch .dirty-text khi chưa sửa */
+  /* Thanh Lưu thẳng hàng với thẻ .form, ẩn sạch .dirty-text khi chưa sửa */
   .savebar {
     position: sticky;
     bottom: 0;
-    max-width: 720px;
     width: 100%;
     background: var(--c-card);
     border: 1px solid var(--c-border);
@@ -2522,6 +2525,26 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+  /* Màn hình rộng: pool tài khoản và form thêm cookie nằm 2 cột để hết khoảng trống bên phải */
+  .muse-cols {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .muse-col {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+  @media (min-width: 1400px) {
+    .muse-cols {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
   }
   .muse-head {
     display: flex;
