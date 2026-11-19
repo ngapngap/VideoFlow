@@ -635,8 +635,15 @@ mod tests {
     /// Bỏ qua (skip, không fail) khi thiếu exe để `cargo test` trên máy dev trống vẫn xanh.
     #[test]
     fn spawn_sidecar_that_roi_dung_lai_duoc() {
-        if sidecar_exe_path().is_err() {
+        // CI verify job chỉ tạo stub rỗng để build script hài lòng; engine thật do job
+        // `build` tạo ra và được smoke test riêng. Bỏ qua khi exe không phải engine thật.
+        let Ok(exe) = sidecar_exe_path() else {
             eprintln!("skip: chưa build engine exe (binaries/videoflow-muse-*.exe)");
+            return;
+        };
+        let size = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+        if size < 8 * 1024 * 1024 {
+            eprintln!("skip: {} là stub rỗng ({size} bytes)", exe.display());
             return;
         }
         let cfg = Settings {
