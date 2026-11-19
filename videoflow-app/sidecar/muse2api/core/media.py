@@ -37,7 +37,18 @@ class MediaStore:
     def save(self, data: bytes, mime: str, prefix: str = "m") -> str:
         ext = _EXT_BY_MIME.get(mime.split(";")[0].strip().lower(), ".bin")
         name = f"{prefix}_{uuid.uuid4().hex[:16]}{ext}"
-        (self.root / name).write_bytes(data)
+        partial_path = self.root / f"{name}.partial"
+        final_path = self.root / name
+        try:
+            partial_path.write_bytes(data)
+            partial_path.replace(final_path)
+        except Exception:
+            if partial_path.is_file():
+                try:
+                    partial_path.unlink()
+                except OSError:
+                    pass
+            raise
         return name
 
     def path_of(self, name: str) -> Path:

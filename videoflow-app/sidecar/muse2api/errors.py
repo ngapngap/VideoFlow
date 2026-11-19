@@ -96,3 +96,12 @@ class UpstreamRefused(UpstreamError):
 
     code = "upstream_refused"
     retryable = False
+
+
+class UpstreamVideoLocked(UpstreamError):
+    """muse.ai locked video generation for this account. Fail-over/retry won't work on this account."""
+
+    status_code = 403
+    code = "upstream_video_locked"
+    retryable = False
+

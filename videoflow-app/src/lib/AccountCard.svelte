@@ -1,0 +1,684 @@
+<script lang="ts">
+  import { createEventDispatcher } from "svelte";
+  import { api, type MuseAccount, type MuseQuotaSnapshot } from "./api";
+  import Icons from "./Icons.svelte";
+  import { showToast } from "./store";
+
+  export let account: MuseAccount;
+  export let running: boolean = false;
+
+  const dispatch = createEventDispatcher<{
+    refresh: { id: string };
+    deleted: { id: string };
+    updated: { id: string };
+    openLogin: { id: string };
+    openView: { id: string };
+  }>();
+
+  let actionBusy = false;
+  let quotaBusy = false;
+  let quotaErr = "";
+  let proxyValue = account.proxy || "";
+  let proxyDirty = false;
+  let proxySaving = false;
+
+  $: if (account.proxy !== undefined && !proxyDirty) {
+    proxyValue = account.proxy || "";
+  }
+
+  function museAccState(a: MuseAccount): { key: string; label: string; cls: string } {
+    const now = Date.now() / 1000;
+    const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
+      a.last_error || ""
+    );
+    if (!a.enabled) return { key: "disabled", label: "Tắt", cls: "mute" };
+    if (a.status === "video_locked") return { key: "video_locked", label: "Khóa video", cls: "err" };
+    if (a.status === "invalid") return { key: "invalid", label: "Lỗi phiên", cls: "err" };
+    if (a.status === "cooling" && a.cooldown_until > now) {
+      return isQuota
+        ? { key: "quota", label: "Hết hạn mức", cls: "warn" }
+        : { key: "cooling", label: "Tạm chờ", cls: "info" };
+    }
+    return { key: "active", label: "Hoạt động", cls: "ok" };
+  }
+
+  function museQuotaPct(q: MuseQuotaSnapshot | undefined): number | null {
+    if (!q) return null;
+    if (q.weekly_used_pct != null) return q.weekly_used_pct;
+    if (q.messages_used != null && q.messages_limit) {
+      return Math.round((q.messages_used / q.messages_limit) * 100);
+    }
+    return null;
+  }
+
+  function museQuotaBarClass(pct: number | null): string {
+    if (pct == null) return "";
+    if (pct >= 100) return "full";
+    if (pct >= 80) return "high";
+    return "";
+  }
+
+  function museTimeAgo(ts: number | undefined): string {
+    if (!ts) return "";
+    const diff = Date.now() / 1000 - ts;
+    if (diff < 60) return "vừa xong";
+    if (diff < 3600) return `${Math.floor(diff / 60)} phút trước`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} giờ trước`;
+    return `${Math.floor(diff / 86400)} ngày trước`;
+  }
+
+  function museCookieExpiry(a: MuseAccount): { txt: string; cls: string } | null {
+    const exp = a.cookie_expires;
+    if (!exp || Object.keys(exp).length === 0) return null;
+    const ts =
+      exp["hatch_vml"] != null
+        ? exp["hatch_vml"]
+        : Math.min(...Object.values(exp));
+    const days = (ts - Date.now() / 1000) / 86400;
+    if (days <= 0) return { txt: "Cookie hết hạn", cls: "err" };
+    if (days < 1) return { txt: `Hết hạn trong ${Math.max(1, Math.floor(days * 24))}h`, cls: "err" };
+    if (days < 3) return { txt: `Còn ${days.toFixed(1)} ngày`, cls: "warn" };
+    return { txt: `Còn ${Math.round(days)} ngày`, cls: "info" };
+  }
+
+  async function handleToggle() {
+    if (actionBusy || running) return;
+    actionBusy = true;
+    try {
+      await api.muse_update_account(account.id, !account.enabled);
+      dispatch("updated", { id: account.id });
+    } catch (e) {
+      showToast("error", `Lỗi cập nhật: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function handleSaveProxy() {
+    if (proxySaving || running) return;
+    proxySaving = true;
+    try {
+      await api.muse_update_account(account.id, undefined, undefined, proxyValue.trim());
+      proxyDirty = false;
+      showToast("success", "Đã lưu proxy riêng cho tài khoản.");
+      dispatch("updated", { id: account.id });
+    } catch (e) {
+      showToast("error", `Lỗi lưu proxy: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      proxySaving = false;
+    }
+  }
+
+  async function handleRefreshQuota() {
+    if (quotaBusy || running) return;
+    quotaBusy = true;
+    quotaErr = "";
+    try {
+      await api.muse_account_quota(account.id, true);
+      showToast("success", "Đã làm mới hạn mức.");
+      dispatch("refresh", { id: account.id });
+    } catch (e) {
+      quotaErr = e instanceof Error ? e.message : String(e);
+      showToast("error", `Lỗi đọc hạn mức: ${quotaErr}`);
+    } finally {
+      quotaBusy = false;
+    }
+  }
+
+  async function handleRenew() {
+    if (actionBusy || running) return;
+    actionBusy = true;
+    try {
+      await api.muse_renew_account(account.id);
+      showToast("success", "Đã gia hạn phiên thành công.");
+      dispatch("updated", { id: account.id });
+    } catch (e) {
+      showToast("error", `Lỗi gia hạn: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function handleOpenLogin() {
+    if (actionBusy || running) return;
+    actionBusy = true;
+    try {
+      const res = await api.muse_open_login(account.id);
+      showToast("info", res.message || "Đang mở trình duyệt đăng nhập...");
+      dispatch("openLogin", { id: account.id });
+    } catch (e) {
+      showToast("error", `Không thể mở trình duyệt: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function handleOpenView() {
+    if (actionBusy || running) return;
+    actionBusy = true;
+    try {
+      const res = await api.muse_open_view(account.id);
+      showToast("info", res.message || "Đang mở trình duyệt xem hội thoại...");
+      dispatch("openView", { id: account.id });
+    } catch (e) {
+      showToast("error", `Không thể mở xem web: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function handleDelete() {
+    if (actionBusy || running) return;
+    if (!window.confirm(`Xóa tài khoản "${account.label || account.id}" khỏi danh sách?`)) return;
+    actionBusy = true;
+    try {
+      await api.muse_delete_account(account.id);
+      showToast("success", "Đã xóa tài khoản.");
+      dispatch("deleted", { id: account.id });
+    } catch (e) {
+      showToast("error", `Lỗi xóa tài khoản: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  $: st = museAccState(account);
+  $: q = account.meta?.quota;
+  $: pct = museQuotaPct(q);
+  $: exp = museCookieExpiry(account);
+</script>
+
+<article class="acc-card s-{st.key}">
+  <!-- Top header -->
+  <div class="acc-header">
+    <div class="acc-identity">
+      <div class="acc-title-line">
+        <h3 class="acc-name" title={account.label || account.id}>{account.label || account.id}</h3>
+        <span class="acc-badge {st.cls}">{st.label}</span>
+      </div>
+      <div class="acc-id">{account.id}</div>
+    </div>
+
+    <label class="acc-switch" title={account.enabled ? "Đang bật — bấm để tắt" : "Đang tắt — bấm để bật"}>
+      <input
+        type="checkbox"
+        checked={account.enabled}
+        disabled={actionBusy || running}
+        on:change={handleToggle}
+      />
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <!-- Quota section -->
+  {#if q && (q.found || pct != null || q.plan)}
+    <div class="acc-quota">
+      <div class="qrail">
+        <b class={museQuotaBarClass(pct)} style="width:{pct != null ? Math.min(100, Math.max(0, pct)) : 0}%"></b>
+      </div>
+      <div class="qmeta">
+        <span>
+          {q.plan ? q.plan.replace(/\s*plan\s*$/i, "") : "Gói chuẩn"}{pct != null ? ` · ${pct}% đã dùng` : ""}
+        </span>
+        <span>
+          reset {q.resets_at || "—"}{q.checked_at ? ` · ${museTimeAgo(q.checked_at)}` : ""}
+        </span>
+      </div>
+      {#if q.extra_left}
+        <div class="qextra">
+          Quota bổ sung còn: <b>{q.extra_left}</b>
+        </div>
+      {/if}
+      {#if q.error}
+        <div class="qerr selectable">{q.error}</div>
+      {/if}
+    </div>
+  {:else}
+    <div class="acc-quota empty">Chưa có dữ liệu hạn mức — bấm "Làm mới quota" để đọc.</div>
+  {/if}
+
+  {#if quotaErr}
+    <div class="acc-error-line selectable">{quotaErr}</div>
+  {/if}
+
+  <!-- Proxy settings row (P2-3 individual proxy) -->
+  <div class="acc-proxy-row">
+    <div class="proxy-icon-wrap" title="Proxy riêng của tài khoản">
+      <Icons name="globe" size={14} />
+    </div>
+    <input
+      type="text"
+      class="proxy-input"
+      placeholder="Proxy riêng: http://user:pass@ip:port hoặc socks5://..."
+      bind:value={proxyValue}
+      on:input={() => (proxyDirty = true)}
+      on:keydown={(e) => { if (e.key === 'Enter') handleSaveProxy(); }}
+      disabled={proxySaving || running}
+      spellcheck="false"
+      autocomplete="off"
+    />
+    {#if proxyDirty}
+      <button
+        type="button"
+        class="btn-save-proxy"
+        disabled={proxySaving || running}
+        on:click={handleSaveProxy}
+        title="Lưu cấu hình proxy"
+      >
+        <span>{proxySaving ? "Lưu..." : "Lưu"}</span>
+      </button>
+    {/if}
+  </div>
+
+  <!-- Meta indicators -->
+  <div class="acc-meta">
+    {#if exp}
+      <span class="acc-meta-item plain {exp.cls}">{exp.txt}</span>
+    {/if}
+    <span class="acc-meta-item">Thành công {account.success_count}</span>
+    {#if account.fail_count > 0}
+      <span class="acc-meta-item bad">Lỗi {account.fail_count}</span>
+    {/if}
+    {#if account.last_used_at > 0}
+      <span class="acc-meta-item">Dùng {museTimeAgo(account.last_used_at)}</span>
+    {/if}
+  </div>
+
+  {#if account.last_error}
+    <div class="acc-last-error selectable" title="Chi tiết lỗi">{account.last_error}</div>
+  {/if}
+
+  <!-- Actions toolbar -->
+  <div class="acc-actions">
+    <!-- P1-5: Login button opens headed browser with profile -->
+    <button
+      type="button"
+      class="btn-action primary"
+      disabled={actionBusy || running}
+      on:click={handleOpenLogin}
+      title="Mở trình duyệt có giao diện để đăng nhập tài khoản Muse và tự động bắt token"
+    >
+      <Icons name="log-in" size={14} />
+      <span>Đăng nhập</span>
+    </button>
+
+    <!-- P1-5: View chat history on web -->
+    <button
+      type="button"
+      class="btn-action"
+      disabled={actionBusy || running}
+      on:click={handleOpenView}
+      title="Mở trình duyệt xem lịch sử hội thoại trên web của tài khoản này"
+    >
+      <Icons name="eye" size={14} />
+      <span>Xem trên web</span>
+    </button>
+
+    <button
+      type="button"
+      class="btn-action"
+      disabled={quotaBusy || running}
+      on:click={handleRefreshQuota}
+      title="Đọc lại hạn mức từ trang Settings → Usage của muse.ai"
+    >
+      <Icons name="refresh" size={14} />
+      <span>{quotaBusy ? "Đang đọc..." : "Làm mới quota"}</span>
+    </button>
+
+    <button
+      type="button"
+      class="btn-action"
+      disabled={actionBusy || running}
+      on:click={handleRenew}
+      title="Gia hạn phiên muse.ai và làm mới cookie"
+    >
+      <Icons name="check" size={14} />
+      <span>Gia hạn</span>
+    </button>
+
+    <button
+      type="button"
+      class="btn-action danger"
+      disabled={actionBusy || running}
+      on:click={handleDelete}
+      title="Xóa tài khoản khỏi danh sách"
+    >
+      <Icons name="trash" size={14} />
+      <span>Xóa</span>
+    </button>
+  </div>
+</article>
+
+<style>
+  .acc-card {
+    border: 1px solid var(--c-border);
+    border-radius: 10px;
+    background: #fff;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .acc-card:hover {
+    border-color: var(--c-teal);
+    box-shadow: 0 2px 8px rgba(14, 124, 134, 0.1);
+  }
+  .acc-card.s-err,
+  .acc-card.s-video_locked,
+  .acc-card.s-invalid {
+    border-left: 4px solid var(--c-danger);
+  }
+  .acc-card.s-warn,
+  .acc-card.s-quota {
+    border-left: 4px solid var(--c-warn);
+  }
+  .acc-card.s-ok,
+  .acc-card.s-active {
+    border-left: 4px solid var(--c-teal);
+  }
+  .acc-card.s-mute,
+  .acc-card.s-disabled {
+    border-left: 4px solid var(--c-border);
+    opacity: 0.85;
+  }
+
+  .acc-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .acc-identity {
+    min-width: 0;
+    flex: 1;
+  }
+  .acc-title-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .acc-name {
+    margin: 0;
+    font-size: var(--fs-label, 14px);
+    font-weight: 700;
+    color: var(--c-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .acc-id {
+    font-size: 11px;
+    color: var(--c-muted);
+    font-family: var(--font-mono, monospace);
+    margin-top: 2px;
+  }
+
+  /* Badge styling */
+  .acc-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .acc-badge.ok {
+    background: #e6f6f1;
+    color: #0b7c52;
+  }
+  .acc-badge.warn {
+    background: #fff4e5;
+    color: #b76400;
+  }
+  .acc-badge.info {
+    background: #e8f4fc;
+    color: #1769aa;
+  }
+  .acc-badge.err {
+    background: #fde8e8;
+    color: #c5221f;
+  }
+  .acc-badge.mute {
+    background: var(--c-surface-subtle);
+    color: var(--c-muted);
+  }
+
+  /* Toggle Switch */
+  .acc-switch {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+  .acc-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+  .slider {
+    position: absolute;
+    inset: 0;
+    background-color: var(--c-border);
+    border-radius: 20px;
+    transition: 0.2s;
+  }
+  .slider::before {
+    position: absolute;
+    content: "";
+    height: 14px;
+    width: 14px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    border-radius: 50%;
+    transition: 0.2s;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  }
+  input:checked + .slider {
+    background-color: var(--c-teal);
+  }
+  input:checked + .slider::before {
+    transform: translateX(16px);
+  }
+  input:disabled + .slider {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Quota Rail */
+  .acc-quota {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: var(--c-surface-subtle, #f8fafb);
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--c-border-subtle, #edf2f4);
+  }
+  .acc-quota.empty {
+    font-size: 11px;
+    color: var(--c-muted);
+    font-style: italic;
+  }
+  .qrail {
+    height: 6px;
+    border-radius: 999px;
+    background: #e2e8f0;
+    overflow: hidden;
+  }
+  .qrail b {
+    display: block;
+    height: 100%;
+    background: var(--c-teal);
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+  .qrail b.high {
+    background: var(--c-warn);
+  }
+  .qrail b.full {
+    background: var(--c-danger);
+  }
+  .qmeta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--c-muted);
+  }
+  .qextra {
+    font-size: 11px;
+    color: var(--c-teal-dark, #0a5f67);
+  }
+  .qerr {
+    font-size: 11px;
+    color: var(--c-danger);
+  }
+  .acc-error-line {
+    font-size: 11px;
+    color: var(--c-danger);
+    background: #fff0f0;
+    padding: 4px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+  }
+
+  /* Proxy input row */
+  .acc-proxy-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #fff;
+    border: 1px solid var(--c-border);
+    border-radius: 6px;
+    padding: 2px 8px;
+  }
+  .acc-proxy-row:focus-within {
+    border-color: var(--c-teal);
+  }
+  .proxy-icon-wrap {
+    color: var(--c-muted);
+    display: flex;
+    align-items: center;
+  }
+  .proxy-input {
+    border: none;
+    outline: none;
+    background: transparent;
+    font-size: 12px;
+    color: var(--c-text);
+    flex: 1;
+    min-width: 0;
+    padding: 4px 0;
+  }
+  .proxy-input::placeholder {
+    color: var(--c-muted);
+    font-size: 11px;
+  }
+  .btn-save-proxy {
+    background: var(--c-teal);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-save-proxy:hover:not(:disabled) {
+    background: var(--c-teal-dark, #0a5f67);
+  }
+
+  /* Meta items */
+  .acc-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--c-muted);
+  }
+  .acc-meta-item.bad {
+    color: var(--c-danger);
+    font-weight: 600;
+  }
+  .acc-meta-item.plain.err {
+    color: var(--c-danger);
+  }
+  .acc-meta-item.plain.warn {
+    color: var(--c-warn);
+  }
+  .acc-meta-item.plain.info {
+    color: var(--c-teal);
+  }
+
+  .acc-last-error {
+    font-size: 11px;
+    color: var(--c-danger);
+    background: #fdf2f2;
+    padding: 6px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    max-height: 48px;
+    overflow-y: auto;
+  }
+
+  /* Actions */
+  .acc-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding-top: 4px;
+    border-top: 1px solid var(--c-border-subtle, #f0f4f6);
+  }
+  .btn-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    background: var(--c-surface-subtle, #f3f6f8);
+    border: 1px solid var(--c-border);
+    color: var(--c-text);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .btn-action:hover:not(:disabled) {
+    background: var(--c-teal-light, #eaf6f7);
+    border-color: var(--c-teal);
+    color: var(--c-teal);
+  }
+  .btn-action.primary {
+    background: var(--c-teal-light, #eaf6f7);
+    border-color: rgba(14, 124, 134, 0.35);
+    color: var(--c-teal-dark, #0e7c86);
+    font-weight: 600;
+  }
+  .btn-action.primary:hover:not(:disabled) {
+    background: var(--c-teal);
+    color: #fff;
+  }
+  .btn-action.danger {
+    margin-left: auto;
+    color: var(--c-danger);
+  }
+  .btn-action.danger:hover:not(:disabled) {
+    background: #fdf2f2;
+    border-color: var(--c-danger);
+    color: var(--c-danger);
+  }
+  .btn-action:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+</style>

@@ -35,32 +35,32 @@ def find_chromium(configured: str = "") -> str:
     )
 
 
-def _kill_stale_browsers(profile_dir: Path) -> int:
+def _build_wmi_filter(profile_dir: Path, port: int | None = None) -> str:
+    """Build the PowerShell boolean filter expression matching only processes of this profile/port."""
+    full = str(profile_dir).replace("'", "''")
+    prof_name = profile_dir.name.replace("'", "''")
+    cond_parts: list[str] = [f"$_.CommandLine.Contains('{full}')"]
+    if port:
+        cond_parts.append(f"$_.CommandLine.Contains('--remote-debugging-port={port}')")
+    cond_parts.append(
+        f"($_.CommandLine.Contains('VideoFlowDesktop') -and "
+        f"$_.CommandLine.Contains('{prof_name}'))"
+    )
+    return " -or ".join(cond_parts)
+
+
+def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:
     """Reap Chromium/Edge processes still holding ``profile_dir``.
 
-    A browser already owning the same ``--user-data-dir`` makes a new launch hand
-    the URL off to that instance and exit 0 immediately, so the requested DevTools
-    port never opens ("Chromium did not expose a DevTools endpoint" / exit code 0).
-
-    Matching is deliberately broad: child processes of Edge may report the profile
-    in 8.3 short form (``C:\\Users\\NAMDM~1.DAN\\...``), so the full path alone
-    misses them. We match on the app-specific pair ``VideoFlowDesktop`` +
-    ``browser-profile`` instead, which never matches the user's own browser.
+    Cleanup is strictly isolated to the specified profile directory and port,
+    preventing any cross-account process termination in multi-account environments.
     """
     if os.name != "nt":
         return 0
-    full = str(profile_dir)
-    parent = profile_dir.parent.name or "muse"
-    # Two needles: exact profile path, and the app-data marker pair.
-    conditions = (
-        f"$_.CommandLine.Contains('{full}') -or "
-        f"($_.CommandLine.Contains('VideoFlowDesktop') -and "
-        f"$_.CommandLine.Contains('{parent}') -and "
-        f"$_.CommandLine.Contains('browser-profile'))"
-    )
+    conditions = _build_wmi_filter(profile_dir, port)
     try:
         script = (
-            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | "
             f"Where-Object {{ $_.CommandLine -and ({conditions}) }} | "
             "ForEach-Object { $_.ProcessId }"
         )
@@ -116,7 +116,7 @@ class ChromiumProcess:
         # Attempt 3 wipes the profile directory outright: it only holds the browser
         # session cache, while the accounts themselves live in data/accounts.json.
         for attempt in (1, 2, 3):
-            _kill_stale_browsers(self.profile_dir)
+            _kill_stale_browsers(self.profile_dir, self.port)
             if attempt == 3:
                 log.warning("resetting browser profile %s after repeated CDP failures",
                             self.profile_dir)

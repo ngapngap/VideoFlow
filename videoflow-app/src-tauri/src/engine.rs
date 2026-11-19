@@ -9,7 +9,7 @@ use crate::settings::Settings;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -256,7 +256,7 @@ pub fn latest_job_info(conn: &Connection, row_key: &str) -> Option<LatestJobInfo
 
 pub fn start_steps(status: RowStatus) -> Vec<Step> {
     match status {
-        RowStatus::Cho | RowStatus::LoiImage => vec![Step::B2, Step::B3],
+        RowStatus::Cho | RowStatus::LoiImage | RowStatus::LoiTamThoi => vec![Step::B2, Step::B3],
         RowStatus::DaTaoImage | RowStatus::LoiVideo => vec![Step::B3],
         RowStatus::DaTaoVideo => vec![],
     }
@@ -269,6 +269,7 @@ pub fn status_to_db(s: RowStatus) -> &'static str {
         RowStatus::DaTaoVideo => "da_tao_video",
         RowStatus::LoiImage => "loi_tao_image",
         RowStatus::LoiVideo => "loi_tao_video",
+        RowStatus::LoiTamThoi => "loi_tam_thoi",
     }
 }
 
@@ -279,6 +280,7 @@ pub fn row_status_to_label(s: RowStatus) -> &'static str {
         RowStatus::DaTaoVideo => "Đã tạo video",
         RowStatus::LoiImage => "Lỗi tạo image",
         RowStatus::LoiVideo => "Lỗi tạo video",
+        RowStatus::LoiTamThoi => "Lỗi tạm thời",
     }
 }
 
@@ -288,6 +290,7 @@ pub fn db_status_to_label(db_status: &str) -> &'static str {
         "da_tao_video" => "Đã tạo video",
         "loi_tao_image" => "Lỗi tạo image",
         "loi_tao_video" => "Lỗi tạo video",
+        "loi_tam_thoi" => "Lỗi tạm thời",
         "bo_qua" => "Bỏ qua",
         _ => "Đang chờ",
     }
@@ -315,6 +318,7 @@ pub fn effective_row_status(
             "da_tao_video" => Some(RowStatus::DaTaoVideo),
             "loi_tao_image" => Some(RowStatus::LoiImage),
             "loi_tao_video" => Some(RowStatus::LoiVideo),
+            "loi_tam_thoi" => Some(RowStatus::LoiTamThoi),
             _ => Some(RowStatus::Cho),
         }
     } else {
@@ -556,7 +560,7 @@ pub struct RowPlan {
 pub fn plan_row(
     row: &prompts_csv::Row,
     prev: Option<&LatestJobInfo>,
-    cfg: &Settings,
+    _cfg: &Settings,
     engine_cfg: &EngineConfig,
     image_out: &Path,
     latest_current_image_in_db: Option<&str>,
@@ -615,16 +619,7 @@ pub fn plan_row(
     }
 
     let (img_changed, vid_changed) = detect_prompt_change(row, prev);
-    let prompt_changed = img_changed || vid_changed;
     let prev_attempts = prev.map(|p| p.attempts_count).unwrap_or(0);
-
-    // Đủ số lần thử lỗi tối đa và prompt chưa đổi -> khóa an toàn (trừ khi rerun_error_rows đặt reset_error_attempts)
-    if !engine_cfg.reset_error_attempts
-        && !prompt_changed
-        && prev_attempts >= cfg.max_attempts as i64
-    {
-        return None;
-    }
 
     let base_status = effective_row_status(row, prev).unwrap_or_else(|| row.status());
 
@@ -645,7 +640,7 @@ pub fn plan_row(
     if vid_changed {
         let has_valid_img = matches!(
             base_status,
-            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo
+            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
         ) && !row.anh_da_tao.is_empty()
             && image_out.join(&row.anh_da_tao).is_file();
 
@@ -674,7 +669,16 @@ pub fn plan_row(
         };
     }
 
-    let steps = start_steps(base_status);
+    let steps = if base_status == RowStatus::LoiTamThoi {
+        let has_valid_img = !row.anh_da_tao.is_empty() && image_out.join(&row.anh_da_tao).is_file();
+        if has_valid_img {
+            vec![Step::B3]
+        } else {
+            vec![Step::B2, Step::B3]
+        }
+    } else {
+        start_steps(base_status)
+    };
     if steps.is_empty() {
         return None;
     }
@@ -727,6 +731,38 @@ pub struct FailureResolution {
     pub last_error: Option<String>,
     pub count_as_run_error: bool,
     pub trigger_stop: bool,
+}
+
+pub fn is_transient_error(fail: &ApiFail) -> bool {
+    match fail.kind {
+        ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return false,
+        ApiFailKind::TamThoi { .. } => {}
+    }
+    if let Some(status) = fail.http_status {
+        if status == 429 || (500..=599).contains(&status) {
+            return true;
+        }
+    }
+    let code_low = fail.code.to_lowercase();
+    let msg_low = fail.message.to_lowercase();
+    let transient_keywords = [
+        "cdp",
+        "cdperror",
+        "connection closed",
+        "timeout",
+        "timed out",
+        "rate_limit",
+        "overloaded",
+        "502",
+        "503",
+        "504",
+        "poll_timeout",
+        "task_transient_error",
+        "task_gone",
+        "tam_thoi",
+    ];
+    transient_keywords.iter().any(|kw| code_low.contains(kw) || msg_low.contains(kw))
+        || matches!(fail.kind, ApiFailKind::TamThoi { .. })
 }
 
 pub fn resolve_step_failure(
@@ -783,25 +819,49 @@ pub fn resolve_step_failure(
         };
     }
 
-    match step {
-        Step::B2 => FailureResolution {
-            db_status: "loi_tao_image",
-            csv_label: "Lỗi tạo image",
-            image_status: "loi",
-            video_status: "chua_chay",
-            last_error: Some(fail.message.clone()),
-            count_as_run_error: true,
-            trigger_stop: fail.kind == ApiFailKind::HetQuota,
-        },
-        Step::B3 => FailureResolution {
-            db_status: "loi_tao_video",
-            csv_label: "Lỗi tạo video",
-            image_status: "xong",
-            video_status: "loi",
-            last_error: Some(fail.message.clone()),
-            count_as_run_error: true,
-            trigger_stop: fail.kind == ApiFailKind::HetQuota,
-        },
+    let is_transient = is_transient_error(fail);
+    if is_transient {
+        match step {
+            Step::B2 => FailureResolution {
+                db_status: "loi_tam_thoi",
+                csv_label: "Lỗi tạm thời",
+                image_status: "chua_chay",
+                video_status: "chua_chay",
+                last_error: Some(fail.message.clone()),
+                count_as_run_error: true,
+                trigger_stop: false,
+            },
+            Step::B3 => FailureResolution {
+                db_status: "loi_tam_thoi",
+                csv_label: "Lỗi tạm thời",
+                image_status: "xong",
+                video_status: "loi",
+                last_error: Some(fail.message.clone()),
+                count_as_run_error: true,
+                trigger_stop: false,
+            },
+        }
+    } else {
+        match step {
+            Step::B2 => FailureResolution {
+                db_status: "loi_tao_image",
+                csv_label: "Lỗi tạo image",
+                image_status: "loi",
+                video_status: "chua_chay",
+                last_error: Some(fail.message.clone()),
+                count_as_run_error: true,
+                trigger_stop: fail.kind == ApiFailKind::HetQuota,
+            },
+            Step::B3 => FailureResolution {
+                db_status: "loi_tao_video",
+                csv_label: "Lỗi tạo video",
+                image_status: "xong",
+                video_status: "loi",
+                last_error: Some(fail.message.clone()),
+                count_as_run_error: true,
+                trigger_stop: fail.kind == ApiFailKind::HetQuota,
+            },
+        }
     }
 }
 
@@ -994,6 +1054,7 @@ pub fn sync_rows_from_state_db(
                 "da_tao_video" => Some("Đã tạo video"),
                 "loi_tao_image" => Some("Lỗi tạo image"),
                 "loi_tao_video" => Some("Lỗi tạo video"),
+                "loi_tam_thoi" => Some("Lỗi tạm thời"),
                 _ => None,
             };
             if let Some(lbl) = csv_label {
@@ -1284,7 +1345,7 @@ pub fn run_with_emitter_and_hook(
                     let init_img_status = if !plan.force_new_image
                         && matches!(
                             base_st,
-                            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo
+                            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
                         )
                         && !row.anh_da_tao.is_empty()
                         && img_ref.join(&row.anh_da_tao).is_file()
@@ -1480,7 +1541,7 @@ pub fn run_with_emitter_and_hook(
                                     },
                                 );
 
-                                if fail.kind == ApiFailKind::HetQuota {
+                                if fail.kind == ApiFailKind::HetQuota || fail.code == "VIDEO_LOCKED" {
                                     emit(
                                         emitter,
                                         "run_error",
@@ -1492,6 +1553,41 @@ pub fn run_with_emitter_and_hook(
                                             message: fail.message.clone(),
                                         },
                                     );
+                                    if fail.code == "VIDEO_LOCKED" {
+                                        let mut account_id = None;
+                                        let mut account_label = None;
+                                        let acc_file = crate::settings::app_data_dir()
+                                            .join(crate::muse_sidecar::MUSE_DATA_DIR)
+                                            .join("accounts.json");
+                                        if let Ok(content) = std::fs::read_to_string(&acc_file) {
+                                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                                                if let Some(arr) = val.as_array() {
+                                                    if let Some(locked) = arr.iter().find(|a| {
+                                                        a.get("status").and_then(|s| s.as_str()) == Some("video_locked")
+                                                    }) {
+                                                        account_id = locked.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                                        account_label = locked.get("label").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                                    } else if arr.len() == 1 {
+                                                        account_id = arr[0].get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                                        account_label = arr[0].get("label").and_then(|s| s.as_str()).map(|s| s.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let acc_id_val = account_id.clone().unwrap_or_default();
+                                        let acc_lbl_val = account_label.or(account_id).unwrap_or_default();
+                                        emit(
+                                            emitter,
+                                            "account_video_locked",
+                                            &serde_json::json!({
+                                                "code": "VIDEO_LOCKED",
+                                                "message": fail.message.clone(),
+                                                "account_id": acc_id_val,
+                                                "id": acc_id_val,
+                                                "label": acc_lbl_val,
+                                            }),
+                                        );
+                                    }
                                     stop_ref.store(true, Ordering::SeqCst);
                                 }
 
@@ -1545,6 +1641,19 @@ pub fn run_with_emitter_and_hook(
 
     if cfg.auto_cleanup_days > 0 {
         let _ = crate::state_db::cleanup_old_history(&conn, cfg.auto_cleanup_days);
+    }
+
+    if cfg.auto_merge && !was_stopped {
+        if let Err(e) = auto_merge_batch(project_path, Some(run_id), Some(&conn), cfg) {
+            crate::settings::log(
+                &conn,
+                "warn",
+                Some(run_id),
+                None,
+                Some("auto_merge"),
+                &format!("Tự động ghép nối video thất bại: {e}. Toàn bộ các clip lẻ thành phẩm vẫn được giữ nguyên."),
+            );
+        }
     }
 
     emit(
@@ -1643,6 +1752,7 @@ fn run_b2(
         match adapters::create_image(ctx.cfg, &ref_path, &row.promt_tao_image) {
             Ok(res) => break res.png_bytes,
             Err(fail) => {
+                let transient = is_transient_error(&fail);
                 let total_attempts = record_attempt(
                     ctx.conn,
                     ctx.job_id,
@@ -1653,13 +1763,13 @@ fn run_b2(
                         http_status: fail.http_status.map(|s| s as i64),
                         error_code: &fail.code,
                         error_message: &fail.message,
-                        count_toward_limit: true,
+                        count_toward_limit: !transient,
                     },
                 );
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if total_attempts >= max_attempts {
+                        if local_try >= max_attempts as u32 || total_attempts >= max_attempts {
                             return Err(fail);
                         }
                         let wait = compute_retry_wait_s(ctx.cfg, local_try, retry_after_s);
@@ -1823,6 +1933,7 @@ fn create_video_task_with_retry(
                 return Ok(t.task_id);
             }
             Err(fail) => {
+                let transient = is_transient_error(&fail);
                 let total_attempts = record_attempt(
                     ctx.conn,
                     ctx.job_id,
@@ -1833,13 +1944,13 @@ fn create_video_task_with_retry(
                         http_status: fail.http_status.map(|s| s as i64),
                         error_code: &fail.code,
                         error_message: &fail.message,
-                        count_toward_limit: true,
+                        count_toward_limit: !transient,
                     },
                 );
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if total_attempts >= max_attempts {
+                        if local_try >= max_attempts as u32 || total_attempts >= max_attempts {
                             return Err(fail);
                         }
                         let wait = compute_retry_wait_s(ctx.cfg, local_try, retry_after_s);
@@ -1967,6 +2078,494 @@ fn download_and_commit_video(
     Ok(())
 }
 
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+pub fn find_previous_scene_video_impl(
+    csv_path: &Path,
+    video_out: &Path,
+    conn: &rusqlite::Connection,
+    run_id: i64,
+    job_id: i64,
+    row: &prompts_csv::Row,
+) -> Option<PathBuf> {
+    // 1. Tìm dòng dữ liệu liền trước trong prompts.csv
+    if let Ok(rows) = prompts_csv::read_all(csv_path) {
+        let cur_key = prompts_csv::row_key_of(&row.anh_tham_chieu, &row.promt_tao_image, &row.promt_tao_video);
+        let pos = rows
+            .iter()
+            .position(|r| r.row_no == row.row_no)
+            .or_else(|| prompts_csv::find_row_position(&rows, &cur_key));
+
+        if let Some(p) = pos {
+            for prev_r in rows[..p].iter().rev() {
+                if prev_r.is_empty_content() || prev_r.is_example() {
+                    continue;
+                }
+                // Kiểm tra nếu video_da_tao đã có tên file và file tồn tại trên đĩa
+                let candidate = prev_r.video_da_tao.trim();
+                if !candidate.is_empty() {
+                    let vid_path = video_out.join(candidate);
+                    if vid_path.is_file() {
+                        return Some(vid_path);
+                    }
+                }
+                // Tra cứu file_refs trong SQLite cho dòng liền trước này
+                let prev_key = prompts_csv::row_key_of(
+                    &prev_r.anh_tham_chieu,
+                    &prev_r.promt_tao_image,
+                    &prev_r.promt_tao_video,
+                );
+                if let Ok(file_name) = conn.query_row(
+                    "SELECT file_name FROM file_refs WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video' ORDER BY is_current DESC, version DESC, id DESC LIMIT 1",
+                    rusqlite::params![prev_key],
+                    |r| r.get::<_, String>(0),
+                ) {
+                    let vid_path = video_out.join(file_name.trim());
+                    if vid_path.is_file() {
+                        return Some(vid_path);
+                    }
+                }
+                // Chỉ duyệt đúng dòng cảnh liền trước
+                break;
+            }
+        }
+    }
+
+    // 2. Dự phòng: Tìm job liền trước trong cùng đợt chạy (run_id) trong SQLite
+    if let Ok(prev_key) = conn.query_row(
+        "SELECT row_key FROM jobs WHERE run_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT 1",
+        rusqlite::params![run_id, job_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        if let Ok(file_name) = conn.query_row(
+            "SELECT file_name FROM file_refs WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video' ORDER BY is_current DESC, version DESC, id DESC LIMIT 1",
+            rusqlite::params![prev_key],
+            |r| r.get::<_, String>(0),
+        ) {
+            let vid_path = video_out.join(file_name.trim());
+            if vid_path.is_file() {
+                return Some(vid_path);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_previous_scene_video(ctx: &WorkerRowCtx<'_>, row: &prompts_csv::Row) -> Option<PathBuf> {
+    find_previous_scene_video_impl(ctx.csv_path, ctx.video_out, ctx.conn, ctx.run_id, ctx.job_id, row)
+}
+
+pub fn extract_last_frame_ffmpeg(video_path: &Path, output_frame_path: &Path) -> Result<(), String> {
+    if !video_path.is_file() {
+        return Err(format!("File video nguồn không tồn tại: {}", video_path.display()));
+    }
+    if let Some(parent) = output_frame_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("-y")
+        .arg("-sseof")
+        .arg("-0.5")
+        .arg("-i")
+        .arg(video_path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg(output_frame_path);
+
+    let output = cmd.output().map_err(|e| format!("Không thể thực thi lệnh FFmpeg: {e}"))?;
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Lệnh FFmpeg thất bại (code {:?}): {}", output.status.code(), err_msg.trim()));
+    }
+    if !output_frame_path.is_file() {
+        return Err("FFmpeg không tạo được file ảnh đầu ra".into());
+    }
+    let len = std::fs::metadata(output_frame_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if len == 0 {
+        return Err("File frame trích xuất có kích thước 0 byte".into());
+    }
+    Ok(())
+}
+
+// ━━ P2-2: Tự động ghép nối video sau batch (Auto-Merge FFmpeg) ━━
+
+/// Thu thập danh sách các file video thành phẩm theo đúng thứ tự tuần tự của các dòng trong prompts.csv.
+pub fn collect_batch_video_paths(csv_path: &Path, video_out_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    collect_batch_video_paths_filtered(csv_path, video_out_dir, None)
+}
+
+/// Thu thập danh sách các file video thành phẩm theo đúng thứ tự dòng CSV (có hỗ trợ lọc tập dòng nếu cần).
+pub fn collect_batch_video_paths_filtered(
+    csv_path: &Path,
+    video_out_dir: &Path,
+    filter_keys: Option<&std::collections::HashSet<String>>,
+) -> Result<Vec<PathBuf>, String> {
+    if !csv_path.is_file() {
+        return Err(format!("File CSV không tồn tại: {}", csv_path.display()));
+    }
+    let rows = prompts_csv::read_all(csv_path)
+        .map_err(|e| format!("Không đọc được prompts.csv: {e}"))?;
+
+    let mut videos = Vec::new();
+    for row in rows {
+        let key = prompts_csv::row_key_of(&row.anh_tham_chieu, &row.promt_tao_image, &row.promt_tao_video);
+        if let Some(keys) = filter_keys {
+            if !keys.contains(&key) && !keys.contains(&row.anh_tham_chieu) {
+                continue;
+            }
+        }
+        let vname = row.video_da_tao.trim();
+        if !vname.is_empty() {
+            let vpath = video_out_dir.join(vname);
+            if vpath.is_file() {
+                videos.push(vpath);
+            }
+        }
+    }
+    Ok(videos)
+}
+
+/// Chuẩn hóa tên dự án an toàn theo chuẩn hệ thống file Windows NTFS (loại bỏ < > : " / \ | ? * và ký tự điều khiển).
+pub fn sanitize_ntfs_filename(raw: &str) -> String {
+    let forbidden = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || forbidden.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim().trim_matches('.').trim();
+    trimmed.to_string()
+}
+
+/// Tạo tên file tổng hợp đầu ra: `<project_name>_merged_<timestamp>.mp4` (hoặc `merged_<timestamp>.mp4` nếu tên dự án rỗng).
+pub fn generate_merged_output_filename(project_name: &str, timestamp: &str) -> String {
+    let clean_name = sanitize_ntfs_filename(project_name);
+    if clean_name.is_empty() {
+        format!("merged_{timestamp}.mp4")
+    } else {
+        format!("{clean_name}_merged_{timestamp}.mp4")
+    }
+}
+
+/// Kiểm tra xem file video có chứa luồng âm thanh hay không bằng FFmpeg (CREATE_NO_WINDOW trên Windows).
+pub fn probe_has_audio_ffmpeg(video_path: &Path) -> Result<bool, String> {
+    if !video_path.is_file() {
+        return Err(format!("File video không tồn tại: {}", video_path.display()));
+    }
+
+    let mut cmd = std::process::Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.args(["-hide_banner", "-i"]).arg(video_path);
+
+    let output = cmd.output().map_err(|e| format!("Không thể thực thi lệnh FFmpeg: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let has_audio = stderr.lines().any(|line| line.contains("Stream #") && line.contains("Audio:"));
+    Ok(has_audio)
+}
+
+/// Tách độ phân giải video từ chuỗi cấu hình `video_size` (mặc định 720x1280).
+pub fn parse_video_dimensions(size_str: &str) -> (u32, u32) {
+    let parts: Vec<&str> = size_str.split(['x', 'X', ':']).collect();
+    if parts.len() == 2 {
+        if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) {
+            if w > 0 && h > 0 {
+                return (w, h);
+            }
+        }
+    }
+    (720, 1280)
+}
+
+/// Xây dựng tham số dòng lệnh FFmpeg để chuẩn hóa một clip:
+/// - Chuẩn hóa khung hình về cùng tỷ lệ & độ phân giải bằng filter scale & pad.
+/// - Đồng bộ FPS (30fps).
+/// - Nếu clip thiếu âm thanh: bù track âm thanh câm bằng `anullsrc=channel_layout=stereo:sample_rate=44100` với `-shortest`.
+pub fn build_normalize_clip_args(
+    input_path: &Path,
+    output_path: &Path,
+    has_audio: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-i".into(),
+        input_path.to_string_lossy().to_string(),
+    ];
+
+    if !has_audio {
+        args.push("-f".into());
+        args.push("lavfi".into());
+        args.push("-i".into());
+        args.push("anullsrc=channel_layout=stereo:sample_rate=44100".into());
+    }
+
+    let vf = format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+    );
+    args.push("-vf".into());
+    args.push(vf);
+
+    args.push("-c:v".into());
+    args.push("libx264".into());
+    args.push("-pix_fmt".into());
+    args.push("yuv420p".into());
+
+    args.push("-c:a".into());
+    args.push("aac".into());
+    args.push("-b:a".into());
+    args.push("128k".into());
+    args.push("-ar".into());
+    args.push("44100".into());
+    args.push("-ac".into());
+    args.push("2".into());
+
+    if !has_audio {
+        args.push("-shortest".into());
+    }
+
+    args.push(output_path.to_string_lossy().to_string());
+    args
+}
+
+/// Xây dựng tham số FFmpeg concat demuxer ghép nối nhanh các clip đã chuẩn hóa.
+pub fn build_concat_demuxer_args(list_path: &Path, output_path: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        list_path.to_string_lossy().to_string(),
+        "-c".into(),
+        "copy".into(),
+        output_path.to_string_lossy().to_string(),
+    ]
+}
+
+/// Xây dựng tham số FFmpeg filter_complex concat thay thế khi ghép nối luồng trực tiếp.
+pub fn build_filter_complex_concat_args(
+    inputs: &[PathBuf],
+    output_path: &Path,
+    input_has_audio: &[bool],
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Vec<String> {
+    let mut args = vec!["-y".into(), "-hide_banner".into()];
+    for inp in inputs {
+        args.push("-i".into());
+        args.push(inp.to_string_lossy().to_string());
+    }
+
+    let count = inputs.len();
+    let mut filter_parts = Vec::new();
+    let mut concat_inputs = String::new();
+
+    for i in 0..count {
+        let v_label = format!("v{i}");
+        let a_label = format!("a{i}");
+        filter_parts.push(format!(
+            "[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[{v_label}]"
+        ));
+        let has_a = input_has_audio.get(i).copied().unwrap_or(true);
+        if has_a {
+            filter_parts.push(format!("[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo[{a_label}]"));
+        } else {
+            filter_parts.push(format!("anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=10[silent{i}];[silent{i}]aformat=sample_rates=44100:channel_layouts=stereo[{a_label}]"));
+        }
+        concat_inputs.push_str(&format!("[{v_label}][{a_label}]"));
+    }
+
+    filter_parts.push(format!("{concat_inputs}concat=n={count}:v=1:a=1[outv][outa]"));
+    let full_filter = filter_parts.join(";");
+
+    args.push("-filter_complex".into());
+    args.push(full_filter);
+    args.push("-map".into());
+    args.push("[outv]".into());
+    args.push("-map".into());
+    args.push("[outa]".into());
+    args.push("-c:v".into());
+    args.push("libx264".into());
+    args.push("-pix_fmt".into());
+    args.push("yuv420p".into());
+    args.push("-c:a".into());
+    args.push("aac".into());
+    args.push(output_path.to_string_lossy().to_string());
+
+    args
+}
+
+/// Thực hiện ghép nối tự động các video thành phẩm của batch bằng FFmpeg.
+/// Báo lỗi an toàn (fail-safe) để không làm hỏng dữ liệu gốc hoặc crash batch.
+pub fn auto_merge_batch(
+    project_path: &Path,
+    run_id: Option<i64>,
+    conn: Option<&Connection>,
+    cfg: &Settings,
+) -> Result<Option<PathBuf>, String> {
+    let video_out = project_path.join("video_out");
+    let csv_path = project_path.join("prompts.csv");
+
+    if !video_out.is_dir() || !csv_path.is_file() {
+        return Ok(None);
+    }
+
+    let video_paths = collect_batch_video_paths(&csv_path, &video_out)?;
+    if video_paths.len() < 2 {
+        if let Some(c) = conn {
+            crate::settings::log(
+                c,
+                "info",
+                run_id,
+                None,
+                Some("auto_merge"),
+                &format!("Số lượng video thành phẩm ({}) ít hơn 2 clip, bỏ qua tự động ghép nối.", video_paths.len()),
+            );
+        }
+        return Ok(None);
+    }
+
+    let project_name = crate::project::project_display_name(project_path);
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let out_filename = generate_merged_output_filename(&project_name, &timestamp);
+    let final_output = video_out.join(&out_filename);
+
+    let cache_dir = project_path
+        .join(".cache")
+        .join(format!("merge_{}_{}", timestamp, std::process::id()));
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| format!("Không tạo được thư mục tạm cho ghép nối video: {e}"))?;
+
+    let (w, h) = parse_video_dimensions(&cfg.video_size);
+    let fps = 30;
+
+    // Bước 1: Chuẩn hóa từng clip (độ phân giải, fps, âm thanh câm nếu thiếu)
+    let mut normalized_clips = Vec::new();
+    for (i, vpath) in video_paths.iter().enumerate() {
+        let norm_path = cache_dir.join(format!("norm_{i:04}.mp4"));
+        let has_audio = probe_has_audio_ffmpeg(vpath).unwrap_or(false);
+        let args = build_normalize_clip_args(vpath, &norm_path, has_audio, w, h, fps);
+
+        let mut cmd = std::process::Command::new("ffmpeg");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.args(&args);
+
+        let output = cmd
+            .output()
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&cache_dir);
+                format!("Không thể thực thi lệnh FFmpeg: {e}")
+            })?;
+
+        if !output.status.success() || !norm_path.is_file() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            return Err(format!(
+                "FFmpeg chuẩn hóa clip thất bại cho {}: {}",
+                vpath.display(),
+                err_msg.trim()
+            ));
+        }
+        normalized_clips.push(norm_path);
+    }
+
+    // Bước 2: Ghi file danh sách concat demuxer
+    let list_file = cache_dir.join("concat_list.txt");
+    let mut list_content = String::new();
+    for norm_path in &normalized_clips {
+        let safe_path = norm_path.to_string_lossy().replace('\\', "/");
+        list_content.push_str(&format!("file '{safe_path}'\n"));
+    }
+    if let Err(e) = std::fs::write(&list_file, list_content.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        return Err(format!("Không thể ghi file concat_list.txt: {e}"));
+    }
+
+    // Bước 3: Ghép nối bằng FFmpeg concat demuxer
+    let concat_args = build_concat_demuxer_args(&list_file, &final_output);
+    let mut cmd = std::process::Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.args(&concat_args);
+
+    let output = cmd
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            format!("Không thể thực thi lệnh FFmpeg concat: {e}")
+        })?;
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+
+    if !output.status.success() || !final_output.is_file() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFmpeg ghép nối thất bại: {}", err_msg.trim()));
+    }
+
+    let len = std::fs::metadata(&final_output)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if len == 0 {
+        return Err("File video sau ghép rỗng (0 bytes)".into());
+    }
+
+    if let Some(c) = conn {
+        crate::settings::log(
+            c,
+            "info",
+            run_id,
+            None,
+            Some("auto_merge"),
+            &format!(
+                "Đã tự động ghép nối {} video thành công -> {}",
+                video_paths.len(),
+                out_filename
+            ),
+        );
+    }
+
+    Ok(Some(final_output))
+}
+
 fn run_b3(
     ctx: &WorkerRowCtx<'_>,
     row: &mut prompts_csv::Row,
@@ -1977,24 +2576,6 @@ fn run_b3(
         &row.promt_tao_image,
         &row.promt_tao_video,
     );
-
-    if row.anh_da_tao.is_empty() {
-        return Err(ApiFail {
-            kind: ApiFailKind::NghiepVu,
-            http_status: None,
-            code: "NO_IMAGE".into(),
-            message: "Chưa có ảnh sản phẩm - không thể tạo video (6.12)".into(),
-        });
-    }
-    let img_path = ctx.image_out.join(&row.anh_da_tao);
-    if !img_path.is_file() {
-        return Err(ApiFail {
-            kind: ApiFailKind::NghiepVu,
-            http_status: None,
-            code: "IMAGE_MISSING".into(),
-            message: format!("Ảnh sản phẩm '{}' không còn trong image_out/", row.anh_da_tao),
-        });
-    }
 
     if !force_new
         && matches!(row.status(), RowStatus::DaTaoVideo)
@@ -2009,6 +2590,101 @@ fn run_b3(
         );
         return Ok(RowStatus::DaTaoVideo);
     }
+
+    // Xác định ảnh tham chiếu gốc (fallback)
+    let orig_img_path = if !row.anh_da_tao.is_empty() && ctx.image_out.join(&row.anh_da_tao).is_file() {
+        Some(ctx.image_out.join(&row.anh_da_tao))
+    } else {
+        let in_ref = ctx
+            .csv_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("input")
+            .join(&row.anh_tham_chieu);
+        if in_ref.is_file() {
+            Some(in_ref)
+        } else {
+            None
+        }
+    };
+
+    let mut chosen_img_path = orig_img_path.clone();
+
+    // [P2-1]: Nếu noi_canh bật, tìm video cảnh trước để trích xuất frame cuối
+    if row.noi_canh {
+        ctx.emit_step_progress(
+            &row_key,
+            "B3",
+            "Nối cảnh (noi_canh=1): đang tìm video cảnh trước để trích xuất frame cuối...".to_string(),
+        );
+
+        let prev_video_opt = find_previous_scene_video(ctx, row);
+        match prev_video_opt {
+            Some(prev_video_path) => {
+                let project_dir = ctx.csv_path.parent().unwrap_or(Path::new("."));
+                let cache_dir = project_dir.join(".cache");
+                let safe_key = sanitize_filename(&row_key);
+                let extracted_frame_path = cache_dir.join(format!("last_frame_{}.png", safe_key));
+
+                match extract_last_frame_ffmpeg(&prev_video_path, &extracted_frame_path) {
+                    Ok(()) => {
+                        crate::settings::log(
+                            ctx.conn,
+                            "info",
+                            Some(ctx.run_id),
+                            Some(&row_key),
+                            Some("B3"),
+                            &format!(
+                                "Đã trích xuất frame cuối từ video trước '{}' làm ảnh tham chiếu nối cảnh",
+                                prev_video_path.display()
+                            ),
+                        );
+                        chosen_img_path = Some(extracted_frame_path);
+                    }
+                    Err(err) => {
+                        crate::settings::log(
+                            ctx.conn,
+                            "warn",
+                            Some(ctx.run_id),
+                            Some(&row_key),
+                            Some("B3"),
+                            &format!(
+                                "Lỗi trích xuất frame cuối video trước ({err}) - tự động fallback về ảnh tham chiếu gốc"
+                            ),
+                        );
+                        // chosen_img_path giữ nguyên orig_img_path (Fail-safe)
+                    }
+                }
+            }
+            None => {
+                crate::settings::log(
+                    ctx.conn,
+                    "warn",
+                    Some(ctx.run_id),
+                    Some(&row_key),
+                    Some("B3"),
+                    "Không tìm thấy video thành phẩm của cảnh liền trước - tự động fallback về ảnh tham chiếu gốc",
+                );
+                // chosen_img_path giữ nguyên orig_img_path (Fail-safe)
+            }
+        }
+    }
+
+    let img_path = match chosen_img_path {
+        Some(p) if p.is_file() => p,
+        _ => {
+            return Err(ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "NO_IMAGE".into(),
+                message: if row.anh_da_tao.is_empty() {
+                    "Chưa có ảnh sản phẩm - không thể tạo video (6.12)".into()
+                } else {
+                    format!("Ảnh sản phẩm '{}' không còn trong image_out/", row.anh_da_tao)
+                },
+            });
+        }
+    };
 
     let _ = ctx.conn.execute(
         "UPDATE jobs SET video_status = 'dang_chay' WHERE id = ?1",
@@ -2165,7 +2841,7 @@ fn run_b3(
                             http_status: None,
                             error_code: "POLL_TIMEOUT",
                             error_message: &msg,
-                            count_toward_limit: true,
+                            count_toward_limit: false,
                         },
                     );
                     crate::settings::log(
@@ -2206,6 +2882,7 @@ fn run_b3(
                     code: code.clone(),
                     message: format!("Endpoint báo task lỗi: {message}"),
                 };
+                let transient = is_transient_error(&fail);
                 let total_attempts = record_attempt(
                     ctx.conn,
                     ctx.job_id,
@@ -2216,14 +2893,14 @@ fn run_b3(
                         http_status: None,
                         error_code: &code,
                         error_message: &message,
-                        count_toward_limit: true,
+                        count_toward_limit: !transient,
                     },
                 );
                 match kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
                         local_transient_try += 1;
-                        if total_attempts >= max_attempts {
+                        if local_transient_try >= max_attempts as u32 || total_attempts >= max_attempts {
                             return Err(fail);
                         }
                         let wait =
@@ -2295,7 +2972,7 @@ fn run_b3(
                             http_status: Some(404),
                             error_code: "TASK_GONE",
                             error_message: msg,
-                            count_toward_limit: true,
+                            count_toward_limit: false,
                         },
                     );
                     return Err(ApiFail {
@@ -2308,6 +2985,7 @@ fn run_b3(
             }
             Err(fail) => {
                 local_transient_try += 1;
+                let transient = is_transient_error(&fail);
                 let total_attempts = record_attempt(
                     ctx.conn,
                     ctx.job_id,
@@ -2318,13 +2996,13 @@ fn run_b3(
                         http_status: fail.http_status.map(|s| s as i64),
                         error_code: &fail.code,
                         error_message: &fail.message,
-                        count_toward_limit: true,
+                        count_toward_limit: !transient,
                     },
                 );
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if total_attempts >= max_attempts {
+                        if local_transient_try >= max_attempts as u32 || total_attempts >= max_attempts {
                             return Err(fail);
                         }
                         let wait =
@@ -2576,10 +3254,10 @@ mod tests {
             attempts_count: 3,
             ..prev_skipped.clone()
         };
-        // Start đơn lẻ (run_row) hoặc batch da_chon đều KHÔNG vượt rào 3/3
-        assert!(plan_row(&row, Some(&prev_maxed), &cfg, &single_or_batch_cfg, &img_out, None).is_none());
+        // Issue #6 [P0-6]: Bỏ khóa cứng, dòng 3/3 lỗi vẫn được plan để chạy lại (không bị chặn)
+        assert!(plan_row(&row, Some(&prev_maxed), &cfg, &single_or_batch_cfg, &img_out, None).is_some());
 
-        // rerun_error_rows (reset_error_attempts: true) mở khóa các dòng lỗi 3/3 của lượt trước và reset attempts = 0!
+        // rerun_error_rows (reset_error_attempts: true) mở khóa các dòng lỗi của lượt trước và reset carried_attempts = 0!
         let rerun_err_cfg = EngineConfig {
             kind: "lam_lai",
             row_keys: vec!["item.png".into()],
@@ -2587,7 +3265,7 @@ mod tests {
             reset_error_attempts: true,
         };
         let unlocked = plan_row(&row, Some(&prev_maxed), &cfg, &rerun_err_cfg, &img_out, None)
-            .expect("rerun_error_rows must unlock 3/3 error rows");
+            .expect("rerun_error_rows must plan error rows");
         assert_eq!(unlocked.carried_attempts, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2613,8 +3291,18 @@ mod tests {
             message: "bad gateway".into(),
         };
         let b3_res = resolve_step_failure(Step::B3, &b3_fail, true, false);
-        assert_eq!(b3_res.db_status, "loi_tao_video");
+        assert_eq!(b3_res.db_status, "loi_tam_thoi");
         assert_eq!(b3_res.image_status, "xong");
+
+        let b3_biz_fail = ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "POLICY_VIOLATION".into(),
+            message: "prompt rejected".into(),
+        };
+        let b3_biz_res = resolve_step_failure(Step::B3, &b3_biz_fail, true, false);
+        assert_eq!(b3_biz_res.db_status, "loi_tao_video");
+        assert_eq!(b3_biz_res.image_status, "xong");
     }
 
     #[test]
@@ -3141,25 +3829,25 @@ mod tests {
         assert!(out_stop.stopped);
         assert_eq!(out_stop.errors, 0);
 
-        // 2) POLL_TIMEOUT -> attempts = 1
+        // 2) POLL_TIMEOUT -> transient error: ghi attempts nhưng attempts_count = 0, status = loi_tam_thoi
         trigger_stop_on_poll.store(false, Ordering::SeqCst);
         stop_flag.store(false, Ordering::SeqCst);
         let _ = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag).unwrap();
         {
             let conn = crate::state_db::open(&dir).unwrap();
-            assert_eq!(latest_job_info(&conn, &bag_key).unwrap().attempts_count, 1);
+            let job = latest_job_info(&conn, &bag_key).unwrap();
+            assert_eq!(job.status, "loi_tam_thoi");
+            assert_eq!(job.attempts_count, 0, "transient error must not increment attempts_count");
         }
 
-        // 3) Poll gặp HTTP 502 liên tiếp khi đang carried_attempts = 1 -> phải dừng đúng ở 3/3 (KHÔNG bao giờ lên 4/3 hay 5/3!)
+        // 3) Poll gặp HTTP 502 liên tiếp -> transient error dừng sau local retry, attempts_count = 0
         phase.store(99, Ordering::SeqCst);
         let _ = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag).unwrap();
         {
             let conn = crate::state_db::open(&dir).unwrap();
-            assert_eq!(
-                latest_job_info(&conn, &bag_key).unwrap().attempts_count,
-                3,
-                "row-wide attempts_count must be capped strictly at max_attempts (3/3)!"
-            );
+            let job = latest_job_info(&conn, &bag_key).unwrap();
+            assert_eq!(job.status, "loi_tam_thoi");
+            assert_eq!(job.attempts_count, 0, "transient 502 error must not increment attempts_count");
         }
 
         // 4) Chạy lại bằng `reset_error_attempts: true` (TC-45 rerun_error_rows) ở Phase 2 (DOWNLOAD_FAIL) rồi Phase 3 (OK)
@@ -3202,6 +3890,662 @@ mod tests {
         stop_b.store(true, Ordering::SeqCst);
         let _ = join_a.join();
         let _ = join_b.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p0_6_is_transient_error_classification() {
+        let t_502 = ApiFail {
+            kind: ApiFailKind::TamThoi { retry_after_s: None },
+            http_status: Some(502),
+            code: "502".into(),
+            message: "Bad gateway".into(),
+        };
+        assert!(is_transient_error(&t_502));
+
+        let t_429 = ApiFail {
+            kind: ApiFailKind::TamThoi { retry_after_s: Some(10) },
+            http_status: Some(429),
+            code: "RATE_LIMIT".into(),
+            message: "Too many requests".into(),
+        };
+        assert!(is_transient_error(&t_429));
+
+        let t_cdp = ApiFail {
+            kind: ApiFailKind::TamThoi { retry_after_s: None },
+            http_status: None,
+            code: "CDP_CLOSED".into(),
+            message: "cdp connection closed".into(),
+        };
+        assert!(is_transient_error(&t_cdp));
+
+        let t_timeout = ApiFail {
+            kind: ApiFailKind::TamThoi { retry_after_s: None },
+            http_status: None,
+            code: "POLL_TIMEOUT".into(),
+            message: "poll timed out".into(),
+        };
+        assert!(is_transient_error(&t_timeout));
+
+        let business_refused = ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: Some(502),
+            code: "UPSTREAM_REFUSED".into(),
+            message: "Prompt refused by safety policy".into(),
+        };
+        assert!(!is_transient_error(&business_refused));
+
+        let quota_err = ApiFail {
+            kind: ApiFailKind::HetQuota,
+            http_status: Some(429),
+            code: "QUOTA_EXHAUSTED".into(),
+            message: "Quota out".into(),
+        };
+        assert!(!is_transient_error(&quota_err));
+    }
+
+    #[test]
+    fn test_p0_6_resolve_step_failure_sets_loi_tam_thoi() {
+        let transient_fail = ApiFail {
+            kind: ApiFailKind::TamThoi { retry_after_s: None },
+            http_status: Some(502),
+            code: "502".into(),
+            message: "Gateway Error".into(),
+        };
+        let res_b2 = resolve_step_failure(Step::B2, &transient_fail, false, false);
+        assert_eq!(res_b2.db_status, "loi_tam_thoi");
+        assert_eq!(res_b2.csv_label, "Lỗi tạm thời");
+
+        let res_b3 = resolve_step_failure(Step::B3, &transient_fail, true, false);
+        assert_eq!(res_b3.db_status, "loi_tam_thoi");
+        assert_eq!(res_b3.csv_label, "Lỗi tạm thời");
+
+        let business_fail = ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "UPSTREAM_REFUSED".into(),
+            message: "Refused".into(),
+        };
+        let res_biz_b2 = resolve_step_failure(Step::B2, &business_fail, false, false);
+        assert_eq!(res_biz_b2.db_status, "loi_tao_image");
+        assert_eq!(res_biz_b2.csv_label, "Lỗi tạo image");
+
+        let res_biz_b3 = resolve_step_failure(Step::B3, &business_fail, true, false);
+        assert_eq!(res_biz_b3.db_status, "loi_tao_video");
+        assert_eq!(res_biz_b3.csv_label, "Lỗi tạo video");
+    }
+
+    #[test]
+    fn test_p0_6_record_attempt_transient_vs_business() {
+        let dir = make_temp_project("p06_record_attempt");
+        let conn = crate::state_db::open(&dir).unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-01-01', 1)",
+            [],
+        ).unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, attempts_count)
+             VALUES (?1, 'row1.png', 1, 'dang_cho', 'chua_chay', 'chua_chay', 0)",
+            rusqlite::params![run_id],
+        ).unwrap();
+        let job_id = conn.last_insert_rowid();
+
+        // 1. Transient attempt: count_toward_limit = false
+        let total_after_transient = record_attempt(
+            &conn,
+            job_id,
+            AttemptRecord {
+                step: "B2",
+                fallback_attempt_no: 1,
+                result: "loi_tam_thoi",
+                http_status: Some(502),
+                error_code: "502",
+                error_message: "Gateway Error",
+                count_toward_limit: false,
+            },
+        );
+        assert_eq!(total_after_transient, 0);
+        assert_eq!(current_job_attempts(&conn, job_id), 0);
+
+        // 2. Business attempt: count_toward_limit = true
+        let total_after_biz = record_attempt(
+            &conn,
+            job_id,
+            AttemptRecord {
+                step: "B2",
+                fallback_attempt_no: 2,
+                result: "loi_nghiep_vu",
+                http_status: None,
+                error_code: "POLICY_VIOLATION",
+                error_message: "Prompt refused",
+                count_toward_limit: true,
+            },
+        );
+        assert_eq!(total_after_biz, 1);
+        assert_eq!(current_job_attempts(&conn, job_id), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p0_6_reset_row_status_at_legacy_fallback() {
+        let dir = make_temp_project("p06_reset_legacy");
+        let conn = crate::state_db::open(&dir).unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-01-01', 1)",
+            [],
+        ).unwrap();
+        let run_id = conn.last_insert_rowid();
+        // Insert job with legacy row_key (image name without hash)
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, attempts_count, last_error)
+             VALUES (?1, 'photo.png', 1, 'loi_tao_image', 'loi', 'chua_chay', 3, 'Old error')",
+            rusqlite::params![run_id],
+        ).unwrap();
+
+        // CSV has the row with full key
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[Row {
+                row_no: 1,
+                anh_tham_chieu: "photo.png".into(),
+                promt_tao_image: "prompt img".into(),
+                promt_tao_video: "prompt vid".into(),
+                trang_thai: "Lỗi tạo image".into(),
+                ghi_chu_loi: "Old error".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        let full_key = crate::prompts_csv::row_key_of("photo.png", "prompt img", "prompt vid");
+        let detail = crate::commands::reset_row_status_at(&dir, &full_key).expect("reset should succeed");
+
+        assert_eq!(detail.row.status, "Đang chờ");
+        assert_eq!(detail.row.attempts_count, 0);
+
+        // Verify SQLite was updated via legacy key fallback
+        let job = latest_job_info(&conn, "photo.png").unwrap();
+        assert_eq!(job.status, "dang_cho");
+        assert_eq!(job.attempts_count, 0);
+        assert!(job.last_error.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_p0_6_loi_tam_thoi_with_valid_image_plans_b3_and_inits_as_xong() {
+        let dir = make_temp_project("loi_tam_thoi_init_img");
+        let img_out = dir.join("image_out");
+        std::fs::write(img_out.join("valid_gen.png"), b"image_data").unwrap();
+        let cfg = Settings::default();
+        let eng_cfg = EngineConfig {
+            kind: "chung",
+            row_keys: vec![],
+            force_step: None,
+            reset_error_attempts: false,
+        };
+
+        let row = Row {
+            row_no: 1,
+            anh_tham_chieu: "ref.png".into(),
+            promt_tao_image: "p_img".into(),
+            promt_tao_video: "p_vid".into(),
+            trang_thai: "Lỗi tạm thời".into(),
+            anh_da_tao: "valid_gen.png".into(),
+            video_da_tao: "".into(),
+            ..Default::default()
+        };
+
+        let plan = plan_row(&row, None, &cfg, &eng_cfg, &img_out, Some("valid_gen.png"))
+            .expect("must plan B3 for LoiTamThoi with valid image");
+        assert_eq!(plan.steps, vec![Step::B3]);
+        assert!(!plan.force_new_image);
+
+        // Pattern match logic at engine.rs:1346
+        let base_st = row.status();
+        let init_img_status = if !plan.force_new_image
+            && matches!(
+                base_st,
+                RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
+            )
+            && !row.anh_da_tao.is_empty()
+            && img_out.join(&row.anh_da_tao).is_file()
+        {
+            "xong"
+        } else {
+            "chua_chay"
+        };
+        assert_eq!(init_img_status, "xong");
+
+        let init_db_status = if init_img_status == "xong" {
+            "da_tao_image"
+        } else {
+            "dang_cho"
+        };
+        assert_eq!(init_db_status, "da_tao_image");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_find_previous_scene_video_found_and_missing() {
+        let dir = make_temp_project("p2_1_find_prev");
+        let csv_path = dir.join("prompts.csv");
+        let video_out = dir.join("video_out");
+        std::fs::create_dir_all(&video_out).unwrap();
+
+        let conn = crate::state_db::open(&dir).unwrap();
+
+        // 3 rows: row 1 (done), row 2 (noi_canh = 1), row 3 (noi_canh = 1)
+        let row1 = Row {
+            row_no: 2,
+            anh_tham_chieu: "scene1.png".into(),
+            promt_tao_image: "img1".into(),
+            promt_tao_video: "vid1".into(),
+            anh_da_tao: "scene1_gen.png".into(),
+            video_da_tao: "scene1_v1.mp4".into(),
+            trang_thai: "Đã tạo video".into(),
+            noi_canh: false,
+            ..Default::default()
+        };
+        let row2 = Row {
+            row_no: 3,
+            anh_tham_chieu: "scene2.png".into(),
+            promt_tao_image: "img2".into(),
+            promt_tao_video: "vid2".into(),
+            anh_da_tao: "scene2_gen.png".into(),
+            video_da_tao: "".into(),
+            trang_thai: "Đang chờ".into(),
+            noi_canh: true,
+            ..Default::default()
+        };
+        let row3 = Row {
+            row_no: 4,
+            anh_tham_chieu: "scene3.png".into(),
+            promt_tao_image: "img3".into(),
+            promt_tao_video: "vid3".into(),
+            anh_da_tao: "scene3_gen.png".into(),
+            video_da_tao: "".into(),
+            trang_thai: "Đang chờ".into(),
+            noi_canh: true,
+            ..Default::default()
+        };
+        prompts_csv::write_all(&csv_path, &[row1.clone(), row2.clone(), row3.clone()]).unwrap();
+
+        // Create the video file for row 1 in video_out/
+        let row1_vid = video_out.join("scene1_v1.mp4");
+        std::fs::write(&row1_vid, b"fake-mp4-data").unwrap();
+
+        // 1. row 1 is the first row -> has no previous scene
+        let prev_for_row1 = find_previous_scene_video_impl(&csv_path, &video_out, &conn, 1, 1, &row1);
+        assert!(prev_for_row1.is_none(), "first row should have no previous scene video");
+
+        // 2. row 2 has row 1 preceding it with finished video -> finds scene1_v1.mp4
+        let prev_for_row2 = find_previous_scene_video_impl(&csv_path, &video_out, &conn, 1, 2, &row2);
+        assert_eq!(prev_for_row2, Some(row1_vid.clone()));
+
+        // 3. row 3 has row 2 preceding it, but row 2 has NO video -> returns None (fail-safe)
+        let prev_for_row3 = find_previous_scene_video_impl(&csv_path, &video_out, &conn, 1, 3, &row3);
+        assert!(prev_for_row3.is_none(), "preceding row without video should return None");
+
+        // 4. If row 1's video file is deleted from disk -> row 2 returns None
+        std::fs::remove_file(&row1_vid).unwrap();
+        let prev_after_delete = find_previous_scene_video_impl(&csv_path, &video_out, &conn, 1, 2, &row2);
+        assert!(prev_after_delete.is_none(), "missing video on disk should return None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_last_frame_ffmpeg_error_handling() {
+        let dir = make_temp_project("p2_1_ffmpeg");
+        let non_existent_video = dir.join("not_found.mp4");
+        let out_frame = dir.join(".cache").join("last_frame.png");
+
+        // Non-existent source video must return Err
+        let res = extract_last_frame_ffmpeg(&non_existent_video, &out_frame);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("không tồn tại"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_auto_merge_collect_video_paths_order_and_filtering() {
+        let dir = make_temp_project("p2_2_collect");
+        let csv_path = dir.join("prompts.csv");
+        let video_out = dir.join("video_out");
+        std::fs::create_dir_all(&video_out).unwrap();
+
+        let row1 = prompts_csv::Row {
+            anh_tham_chieu: "scene1.png".into(),
+            video_da_tao: "scene1_v1.mp4".into(),
+            ..Default::default()
+        };
+        let row2 = prompts_csv::Row {
+            anh_tham_chieu: "scene2.png".into(),
+            video_da_tao: "".into(), // Chưa có video
+            ..Default::default()
+        };
+        let row3 = prompts_csv::Row {
+            anh_tham_chieu: "scene3.png".into(),
+            video_da_tao: "scene3_v1.mp4".into(),
+            ..Default::default()
+        };
+        let row4 = prompts_csv::Row {
+            anh_tham_chieu: "scene4.png".into(),
+            video_da_tao: "scene4_missing.mp4".into(), // Có tên file nhưng file không tồn tại trên đĩa
+            ..Default::default()
+        };
+        prompts_csv::write_all(&csv_path, &[row1.clone(), row2.clone(), row3.clone(), row4.clone()]).unwrap();
+
+        // Tạo file thực tế cho row1 và row3
+        let vid1 = video_out.join("scene1_v1.mp4");
+        let vid3 = video_out.join("scene3_v1.mp4");
+        std::fs::write(&vid1, b"mp4-content-1").unwrap();
+        std::fs::write(&vid3, b"mp4-content-3").unwrap();
+
+        // Thu thập toàn bộ: phải đúng thứ tự CSV và chỉ chứa các file thực sự tồn tại
+        let collected = collect_batch_video_paths(&csv_path, &video_out).expect("collect videos");
+        assert_eq!(collected.len(), 2, "chỉ 2 video tồn tại thực tế được thu thập");
+        assert_eq!(collected[0], vid1, "video dòng 1 phải đứng đầu tiên");
+        assert_eq!(collected[1], vid3, "video dòng 3 phải đứng thứ hai");
+
+        // Thu thập có lọc filter_keys
+        let mut filter = std::collections::HashSet::new();
+        filter.insert("scene1.png".to_string());
+        let filtered = collect_batch_video_paths_filtered(&csv_path, &video_out, Some(&filter)).expect("filtered collect");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], vid1);
+
+        // Lỗi khi csv không tồn tại
+        let non_csv = dir.join("non_existent.csv");
+        assert!(collect_batch_video_paths(&non_csv, &video_out).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_auto_merge_command_formulation_and_silent_audio() {
+        let input = Path::new("test_in.mp4");
+        let output = Path::new("test_out.mp4");
+
+        // 1. Trường hợp thiếu audio: phải có anullsrc và cờ -shortest
+        let args_no_audio = build_normalize_clip_args(input, output, false, 720, 1280, 30);
+        let joined_no_audio = args_no_audio.join(" ");
+        assert!(joined_no_audio.contains("anullsrc=channel_layout=stereo:sample_rate=44100"), "phải bù anullsrc khi thiếu audio");
+        assert!(joined_no_audio.contains("-shortest"), "phải có -shortest khi bù anullsrc");
+        assert!(joined_no_audio.contains("scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280"));
+        assert!(joined_no_audio.contains("fps=30"));
+        assert!(joined_no_audio.contains("-c:a aac"));
+
+        // 2. Trường hợp đã có audio: KHÔNG được chứa anullsrc và KHÔNG chứa -shortest
+        let args_has_audio = build_normalize_clip_args(input, output, true, 1080, 1920, 24);
+        let joined_has_audio = args_has_audio.join(" ");
+        assert!(!joined_has_audio.contains("anullsrc"), "không bù anullsrc khi đã có audio");
+        assert!(!joined_has_audio.contains("-shortest"), "không có -shortest khi không dùng infinite filter source");
+        assert!(joined_has_audio.contains("scale=1080:1920"));
+        assert!(joined_has_audio.contains("fps=24"));
+
+        // 3. Concat demuxer command formulation
+        let list_file = Path::new("list.txt");
+        let concat_args = build_concat_demuxer_args(list_file, output);
+        assert_eq!(concat_args[0], "-y");
+        assert_eq!(concat_args[1], "-hide_banner");
+        assert_eq!(concat_args[2], "-f");
+        assert_eq!(concat_args[3], "concat");
+        assert_eq!(concat_args[4], "-safe");
+        assert_eq!(concat_args[5], "0");
+        assert_eq!(concat_args[6], "-i");
+        assert_eq!(concat_args[7], "list.txt");
+        assert_eq!(concat_args[8], "-c");
+        assert_eq!(concat_args[9], "copy");
+
+        // 4. Filter complex concat command formulation
+        let inps = vec![PathBuf::from("clip0.mp4"), PathBuf::from("clip1.mp4")];
+        let has_a = vec![true, false];
+        let fc_args = build_filter_complex_concat_args(&inps, output, &has_a, 720, 1280, 30);
+        let joined_fc = fc_args.join(" ");
+        assert!(joined_fc.contains("-filter_complex"));
+        assert!(joined_fc.contains("concat=n=2:v=1:a=1"));
+        assert!(joined_fc.contains("[outv]"));
+        assert!(joined_fc.contains("[outa]"));
+    }
+
+    #[test]
+    fn test_auto_merge_ntfs_filename_sanitization_and_output_naming() {
+        // Sanitize forbidden NTFS characters
+        let dirty = "Project: <Special> \"Name\" / Path \\ With | Illegal * Chars ?";
+        let clean = sanitize_ntfs_filename(dirty);
+        assert!(!clean.contains(':'));
+        assert!(!clean.contains('<'));
+        assert!(!clean.contains('>'));
+        assert!(!clean.contains('"'));
+        assert!(!clean.contains('/'));
+        assert!(!clean.contains('\\'));
+        assert!(!clean.contains('|'));
+        assert!(!clean.contains('*'));
+        assert!(!clean.contains('?'));
+        assert_eq!(clean, "Project_ _Special_ _Name_ _ Path _ With _ Illegal _ Chars _");
+
+        // Output naming with valid project name
+        let name1 = generate_merged_output_filename("MyStory", "20261120_120000");
+        assert_eq!(name1, "MyStory_merged_20261120_120000.mp4");
+
+        // Output naming with empty or whitespace project name
+        let name2 = generate_merged_output_filename("", "20261120_120000");
+        assert_eq!(name2, "merged_20261120_120000.mp4");
+
+        let name3 = generate_merged_output_filename("   ", "20261120_120000");
+        assert_eq!(name3, "merged_20261120_120000.mp4");
+
+        // Dimensions parser
+        assert_eq!(parse_video_dimensions("720x1280"), (720, 1280));
+        assert_eq!(parse_video_dimensions("1080x1920"), (1080, 1920));
+        assert_eq!(parse_video_dimensions("1280:720"), (1280, 720));
+        assert_eq!(parse_video_dimensions("invalid"), (720, 1280));
+        assert_eq!(parse_video_dimensions(""), (720, 1280));
+    }
+
+    #[test]
+    fn test_auto_merge_batch_fail_safe_and_clip_preservation() {
+        let dir = make_temp_project("p2_2_failsafe");
+        let csv_path = dir.join("prompts.csv");
+        let video_out = dir.join("video_out");
+        std::fs::create_dir_all(&video_out).unwrap();
+
+        let row1 = prompts_csv::Row {
+            anh_tham_chieu: "scene1.png".into(),
+            video_da_tao: "clip1.mp4".into(),
+            ..Default::default()
+        };
+        let row2 = prompts_csv::Row {
+            anh_tham_chieu: "scene2.png".into(),
+            video_da_tao: "clip2.mp4".into(),
+            ..Default::default()
+        };
+        prompts_csv::write_all(&csv_path, &[row1.clone(), row2.clone()]).unwrap();
+
+        let vid1 = video_out.join("clip1.mp4");
+        let vid2 = video_out.join("clip2.mp4");
+        std::fs::write(&vid1, b"original-content-1").unwrap();
+        std::fs::write(&vid2, b"original-content-2").unwrap();
+
+        let cfg = Settings {
+            auto_merge: true,
+            video_size: "720x1280".into(),
+            ..Default::default()
+        };
+
+        // Khi các file video không phải là stream MP4 hợp lệ hoặc FFmpeg không chạy được trên dữ liệu giả lập,
+        // auto_merge_batch trả về Err, nhưng toàn bộ các clip gốc trong video_out/ phải hoàn toàn nguyên vẹn!
+        let merge_res = auto_merge_batch(&dir, Some(1), None, &cfg);
+        // Có thể trả về Err do FFmpeg thất bại khi decode "original-content" giả
+        if merge_res.is_err() {
+            // Xác nhận clips lẻ vẫn nguyên vẹn 100%
+            assert!(vid1.is_file(), "clip1 phải luôn được bảo toàn");
+            assert!(vid2.is_file(), "clip2 phải luôn được bảo toàn");
+            assert_eq!(std::fs::read(&vid1).unwrap(), b"original-content-1");
+            assert_eq!(std::fs::read(&vid2).unwrap(), b"original-content-2");
+        }
+
+        // Kiểm tra trường hợp chỉ có 1 video thành phẩm -> auto_merge_batch trả về Ok(None) bỏ qua an toàn
+        let dir_single = make_temp_project("p2_2_single");
+        let csv_single = dir_single.join("prompts.csv");
+        let vout_single = dir_single.join("video_out");
+        std::fs::create_dir_all(&vout_single).unwrap();
+        prompts_csv::write_all(&csv_single, &[row1]).unwrap();
+        std::fs::write(vout_single.join("clip1.mp4"), b"single-clip").unwrap();
+
+        let single_res = auto_merge_batch(&dir_single, Some(1), None, &cfg);
+        assert_eq!(single_res, Ok(None), "ít hơn 2 video phải trả về Ok(None)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_single);
+    }
+
+    #[test]
+    fn test_auto_merge_probe_has_audio_error_on_missing_file() {
+        let missing = Path::new("non_existent_video_file.mp4");
+        let res = probe_has_audio_ffmpeg(missing);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("không tồn tại"));
+    }
+
+    #[test]
+    fn test_p0_2_rerun_row_step_isolation_for_multi_rows_sharing_same_image() {
+        let dir = make_temp_project("p0_2_row_isolation");
+        let img_out = dir.join("image_out");
+        let cfg = Settings::default();
+
+        // 2 dòng trong cùng CSV có cùng ảnh tham chiếu `anh_tham_chieu` nhưng prompt khác nhau
+        let row1 = Row {
+            row_no: 1,
+            anh_tham_chieu: "shared_product.png".into(),
+            promt_tao_image: "Prompt image 1 for shared product".into(),
+            promt_tao_video: "Prompt video 1 for shared product".into(),
+            trang_thai: "Đã tạo video".into(),
+            anh_da_tao: "shared_product_gen1.png".into(),
+            video_da_tao: "shared_product_gen1.mp4".into(),
+            ..Default::default()
+        };
+
+        let row2 = Row {
+            row_no: 2,
+            anh_tham_chieu: "shared_product.png".into(),
+            promt_tao_image: "Prompt image 2 for shared product (variant B)".into(),
+            promt_tao_video: "Prompt video 2 for shared product (variant B)".into(),
+            trang_thai: "Đã tạo video".into(),
+            anh_da_tao: "shared_product_gen2.png".into(),
+            video_da_tao: "shared_product_gen2.mp4".into(),
+            ..Default::default()
+        };
+
+        let key1 = prompts_csv::row_key_of(
+            &row1.anh_tham_chieu,
+            &row1.promt_tao_image,
+            &row1.promt_tao_video,
+        );
+        let key2 = prompts_csv::row_key_of(
+            &row2.anh_tham_chieu,
+            &row2.promt_tao_image,
+            &row2.promt_tao_video,
+        );
+
+        assert_ne!(key1, key2, "Các dòng có prompt khác nhau phải có row_key phân biệt");
+        assert!(key1.starts_with("shared_product.png#"));
+        assert!(key2.starts_with("shared_product.png#"));
+
+        // 1. Kiểm chứng lỗi chạy chùm (buggy legacy behavior):
+        // Nếu truyền `row.anh_tham_chieu` vào `row_keys`, CẢ HAI dòng đều bị khớp
+        let cfg_buggy = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec![row1.anh_tham_chieu.clone()],
+            force_step: Some(Step::B3),
+            reset_error_attempts: false,
+        };
+        assert!(
+            plan_row(&row1, None, &cfg, &cfg_buggy, &img_out, None).is_some(),
+            "Buggy config: row 1 matches"
+        );
+        assert!(
+            plan_row(&row2, None, &cfg, &cfg_buggy, &img_out, None).is_some(),
+            "Buggy config: row 2 also matches because row_keys had unhashed image name (chạy chùm!)"
+        );
+
+        // 2. Kiểm chứng sau khi sửa: rerun_row_step truyền `key_of_row` (chứa hash)
+        // Khi chạy lại dòng 1 (Step::B3):
+        let cfg_isolated_b3 = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec![key1.clone()],
+            force_step: Some(Step::B3),
+            reset_error_attempts: false,
+        };
+
+        let plan1_b3 = plan_row(&row1, None, &cfg, &cfg_isolated_b3, &img_out, None);
+        assert!(plan1_b3.is_some(), "Dòng 1 được chọn chính xác");
+        let p1 = plan1_b3.unwrap();
+        assert_eq!(p1.steps, vec![Step::B3]);
+        assert!(!p1.force_new_image);
+        assert!(p1.force_new_video);
+
+        let plan2_b3 = plan_row(&row2, None, &cfg, &cfg_isolated_b3, &img_out, None);
+        assert!(
+            plan2_b3.is_none(),
+            "Dòng 2 KHÔNG được chạy khi người dùng bấm chạy lại dòng 1 (đã triệt tiêu lỗi chạy chùm!)"
+        );
+
+        // Khi chạy lại dòng 1 (Step::B2):
+        let cfg_isolated_b2 = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec![key1.clone()],
+            force_step: Some(Step::B2),
+            reset_error_attempts: false,
+        };
+
+        let plan1_b2 = plan_row(&row1, None, &cfg, &cfg_isolated_b2, &img_out, None);
+        assert!(plan1_b2.is_some(), "Dòng 1 được chọn chạy B2+B3");
+        let p1_b2 = plan1_b2.unwrap();
+        assert_eq!(p1_b2.steps, vec![Step::B2, Step::B3]);
+        assert!(p1_b2.force_new_image);
+        assert!(p1_b2.force_new_video);
+
+        let plan2_b2 = plan_row(&row2, None, &cfg, &cfg_isolated_b2, &img_out, None);
+        assert!(
+            plan2_b2.is_none(),
+            "Dòng 2 KHÔNG được chạy khi người dùng bấm chạy lại B2 dòng 1"
+        );
+
+        // 3. Khi chạy lại dòng 2 với `key2`:
+        let cfg_target_row2 = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec![key2.clone()],
+            force_step: Some(Step::B3),
+            reset_error_attempts: false,
+        };
+
+        assert!(
+            plan_row(&row1, None, &cfg, &cfg_target_row2, &img_out, None).is_none(),
+            "Dòng 1 KHÔNG được chạy khi mục tiêu là dòng 2"
+        );
+        let plan2 = plan_row(&row2, None, &cfg, &cfg_target_row2, &img_out, None);
+        assert!(plan2.is_some(), "Dòng 2 được chọn chính xác");
+        assert_eq!(plan2.unwrap().steps, vec![Step::B3]);
+
+        // 4. Lập kế hoạch duyệt toàn bộ CSV rows chỉ chọn đúng 1 dòng mục tiêu
+        let all_rows = vec![row1.clone(), row2.clone()];
+        let planned_for_key1: Vec<_> = all_rows
+            .iter()
+            .filter_map(|r| plan_row(r, None, &cfg, &cfg_isolated_b3, &img_out, None))
+            .collect();
+        assert_eq!(
+            planned_for_key1.len(),
+            1,
+            "Chỉ duy nhất 1 dòng được lên lịch thực thi khi rerun_row_step dùng key_of_row"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

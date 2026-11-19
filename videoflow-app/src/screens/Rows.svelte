@@ -186,6 +186,27 @@
     ? toAssetUrl(lightboxAbsPath, $assetCacheBust)
     : "";
 
+  // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
+  let videoModalOpen = false;
+  let videoModalDetail: RowDetail | null = null;
+  let videoModalAbsPath: string | null = null;
+  let videoModalFileName = "";
+  let videoModalTitle = "";
+  let videoModalPromptImage = "";
+  let videoModalPromptVideo = "";
+  let videoModalDurationSec: number | null = null;
+  let videoModalWidth: number | null = null;
+  let videoModalHeight: number | null = null;
+  let videoModalAccount = "";
+  let videoPlayerEl: HTMLVideoElement | null = null;
+  let copiedImagePrompt = false;
+  let copiedVideoPrompt = false;
+  let copyFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $: videoModalUrl = videoModalAbsPath
+    ? toAssetUrl(videoModalAbsPath, $assetCacheBust)
+    : "";
+
   $: anyModalOpen =
     deleteConfirmOpen ||
     resetConfirmOpen ||
@@ -193,7 +214,8 @@
     batchConfirmOpen ||
     scanModalOpen ||
     compareModalOpen ||
-    lightboxOpen;
+    lightboxOpen ||
+    videoModalOpen;
 
   function syncUiState(): void {
     rowsUiState.set({
@@ -238,6 +260,12 @@
 
   onDestroy(() => {
     if (searchTimer) clearTimeout(searchTimer);
+    if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+    if (videoPlayerEl) {
+      try {
+        videoPlayerEl.pause();
+      } catch {}
+    }
   });
 
   // Đọc bộ lọc chuyển tiếp từ Dashboard (ví dụ bấm thẻ "Dòng lỗi cần xem" -> chip = "Lỗi")
@@ -989,6 +1017,103 @@
     }
   }
 
+  // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
+  function formatSecs(sec?: number | null): string {
+    if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0) return "—";
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    const ms = Math.floor((sec % 1) * 10);
+    if (m > 0) {
+      return `${m}:${s.toString().padStart(2, "0")}s`;
+    }
+    return `${s}.${ms}s`;
+  }
+
+  function openVideoModal(d: RowDetail | null | undefined): void {
+    if (!d) return;
+    videoModalDetail = d;
+    videoModalAbsPath = activeVideoVersion?.abs_path ?? d.video_abs_path ?? null;
+    videoModalFileName = activeVideoVersion?.file_name ?? d.row.video_file ?? "";
+    videoModalTitle = d.row.image_name || d.row.row_key;
+    videoModalPromptImage = d.prompt_image ?? "";
+    videoModalPromptVideo = d.prompt_video ?? "";
+    videoModalDurationSec = d.video_duration ?? null;
+    videoModalWidth = null;
+    videoModalHeight = null;
+    if (d.video_resolution) {
+      const parts = d.video_resolution.split("x");
+      if (parts.length === 2) {
+        videoModalWidth = parseInt(parts[0], 10) || null;
+        videoModalHeight = parseInt(parts[1], 10) || null;
+      }
+    }
+    videoModalAccount = d.account_used || "";
+    copiedImagePrompt = false;
+    copiedVideoPrompt = false;
+    videoModalOpen = true;
+  }
+
+  async function openVideoModalByKey(rowKey: string): Promise<void> {
+    if (detail && detail.row.row_key === rowKey && (detail.video_abs_path || activeVideoVersion)) {
+      openVideoModal(detail);
+      return;
+    }
+    try {
+      const d = await api.get_row_detail(rowKey);
+      openVideoModal(d);
+    } catch (e) {
+      showToast("error", formatApiError(e));
+    }
+  }
+
+  function closeVideoModal(): void {
+    if (videoPlayerEl) {
+      try {
+        videoPlayerEl.pause();
+      } catch {}
+    }
+    videoModalOpen = false;
+  }
+
+  function handleModalVideoMetadata(e: Event): void {
+    const el = e.currentTarget as HTMLVideoElement | null;
+    if (!el) return;
+    if (Number.isFinite(el.duration) && el.duration > 0) {
+      videoModalDurationSec = el.duration;
+    }
+    if (el.videoWidth > 0 && el.videoHeight > 0) {
+      videoModalWidth = el.videoWidth;
+      videoModalHeight = el.videoHeight;
+    }
+  }
+
+  async function copyModalPrompt(kind: "image" | "video"): Promise<void> {
+    const text = kind === "image" ? videoModalPromptImage : videoModalPromptVideo;
+    if (!text || !text.trim()) {
+      showToast("warn", `Prompt ${kind === "image" ? "tạo ảnh" : "tạo video"} đang trống.`);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      if (kind === "image") {
+        copiedImagePrompt = true;
+        if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+        copyFeedbackTimer = setTimeout(() => {
+          copiedImagePrompt = false;
+        }, 2000);
+      } else {
+        copiedVideoPrompt = true;
+        if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+        copyFeedbackTimer = setTimeout(() => {
+          copiedVideoPrompt = false;
+        }, 2000);
+      }
+      showToast("success", `Đã sao chép prompt ${kind === "image" ? "tạo ảnh" : "tạo video"}.`);
+    } catch (e) {
+      showToast("error", `Không thể sao chép vào clipboard: ${String(e)}`);
+    }
+  }
+
   function projectFileUrl(
     subDir: "input" | "image_out" | "video_out",
     fileName: string,
@@ -1023,6 +1148,7 @@
     if (s === "Đã tạo video") return "badge-video";
     if (s === "Lỗi tạo image") return "badge-loi-image";
     if (s === "Lỗi tạo video") return "badge-loi-video";
+    if (s === "Lỗi tạm thời") return "badge-loi-tam-thoi";
     if (s === "Bỏ qua") return "badge-bo-qua";
     return "badge-cho";
   }
@@ -1273,7 +1399,7 @@
                         <span class="ref-mini">
                           {#if !orphanRow}
                             <img
-                              src={projectFileUrl("input", r.row_key, $assetCacheBust)}
+                              src={projectFileUrl("input", r.image_name, $assetCacheBust)}
                               alt=""
                               loading="lazy"
                               on:error={() => markThumbBroken(refThumbKey)}
@@ -1290,6 +1416,9 @@
                           <span class="key-sub-badges">
                             {#if r.prompt_modified}
                               <span class="badge badge-sua-prompt mini-badge">Đã sửa prompt</span>
+                            {/if}
+                            {#if r.noi_canh}
+                              <span class="badge badge-noi-canh mini-badge" title="Nối cảnh liên tục từ frame cuối video trước (P2-1)">Nối cảnh</span>
                             {/if}
                             {#if orphanRow}
                               <span class="orphan-tag">Thiếu ảnh gốc</span>
@@ -1360,8 +1489,9 @@
                       <button
                         type="button"
                         class="video-pill"
-                        title={`Video đã tạo: ${r.video_file} (nhấn để phát)`}
+                        title={`Video đã tạo: ${r.video_file} (nhấn để mở xem, nhấn đúp mở modal lớn)`}
                         on:click={() => requestOpenDetail(r.row_key, "video")}
+                        on:dblclick|stopPropagation={() => openVideoModalByKey(r.row_key)}
                       >
                         <Icons name="video" size={14} />
                         <span>MP4</span>
@@ -1491,6 +1621,11 @@
                           r.row_key,
                           r.video_file ? "video" : r.image_file ? "generated" : "ref"
                         )}
+                      on:dblclick={() => {
+                        if (r.video_file) {
+                          openVideoModalByKey(r.row_key);
+                        }
+                      }}
                     >
                       {#if r.image_file && !brokenThumbs[genThumbKey]}
                         <img
@@ -1501,7 +1636,7 @@
                         />
                       {:else if !orphanRow}
                         <img
-                          src={projectFileUrl("input", r.row_key, $assetCacheBust)}
+                          src={projectFileUrl("input", r.image_name, $assetCacheBust)}
                           alt={`Ảnh gốc ${r.image_name}`}
                           loading="lazy"
                           on:error={() => markThumbBroken(refThumbKey)}
@@ -1518,8 +1653,9 @@
                       <button
                         type="button"
                         class="grid-vid-badge"
-                        title={`Phát video ${r.video_file}`}
+                        title={`Phát video ${r.video_file} (nhấn đúp mở lớn)`}
                         on:click={() => requestOpenDetail(r.row_key, "video")}
+                        on:dblclick|stopPropagation={() => openVideoModalByKey(r.row_key)}
                       >
                         <Icons name="video" size={12} />
                         MP4
@@ -1674,6 +1810,9 @@
             {#if detail.row.prompt_modified}
               <span class="badge badge-sua-prompt">Đã sửa prompt</span>
             {/if}
+            {#if detail.row.noi_canh}
+              <span class="badge badge-noi-canh" title="Nối cảnh liên tục từ frame cuối video trước (P2-1)">Nối cảnh</span>
+            {/if}
             <span class="meta-chip">
               Dòng #{detail.row.row_no} · Thử {detail.row.attempts_count}/{$maxAttemptsStore}
             </span>
@@ -1702,7 +1841,7 @@
               <span>Thiếu ảnh tham chiếu trong thư mục <code>input/</code></span>
             </div>
             <p class="orphan-desc">
-              Không tìm thấy file <strong>{detail.row.row_key}</strong>. Chọn lại ảnh mới để ánh xạ giữ nguyên lịch sử sản phẩm, hoặc xóa dòng này khỏi CSV.
+              Không tìm thấy file <strong>{detail.row.image_name}</strong>. Chọn lại ảnh mới để ánh xạ giữ nguyên lịch sử sản phẩm, hoặc xóa dòng này khỏi CSV.
             </p>
             <div class="orphan-actions">
               <button
@@ -1823,24 +1962,24 @@
                   class="stage-img-btn"
                   title="Nhấn để phóng lớn ảnh tham chiếu (hỗ trợ zoom 25%-400%)"
                   on:click={() =>
-                    openImageLightbox(detail?.ref_abs_path, `Ảnh tham chiếu: ${detail?.row.row_key}`)}
+                    openImageLightbox(detail?.ref_abs_path, `Ảnh tham chiếu: ${detail?.row.image_name}`)}
                 >
                   <img
                     class="stage-img"
                     src={toAssetUrl(detail.ref_abs_path, $assetCacheBust)}
-                    alt={`Ảnh tham chiếu ${detail.row.row_key}`}
+                    alt={`Ảnh tham chiếu ${detail.row.image_name}`}
                   />
                 </button>
                 <div class="media-bar">
                   <span class="media-filename selectable" title={detail.ref_abs_path}>
-                    input/{detail.row.row_key}
+                    input/{detail.row.image_name}
                   </span>
                   <div class="media-bar-btns">
                     <button
                       type="button"
                       class="btn-ghost tiny-btn"
                       on:click={() =>
-                        openImageLightbox(detail?.ref_abs_path, `Ảnh tham chiếu: ${detail?.row.row_key}`)}
+                        openImageLightbox(detail?.ref_abs_path, `Ảnh tham chiếu: ${detail?.row.image_name}`)}
                     >
                       <Icons name="zoom-in" size={13} />
                       Phóng lớn
@@ -1924,6 +2063,8 @@
                     controls
                     preload="metadata"
                     src={toAssetUrl(previewVideoAbsPath, $assetCacheBust)}
+                    title="Nhấn đúp để phóng lớn video kèm prompt & metadata"
+                    on:dblclick={() => openVideoModal(detail)}
                   >
                     <track kind="captions" />
                   </video>
@@ -1943,6 +2084,15 @@
                         So sánh
                       </button>
                     {/if}
+                    <button
+                      type="button"
+                      class="btn-ghost tiny-btn"
+                      title="Phóng lớn video kèm prompt & metadata (UI-3)"
+                      on:click={() => openVideoModal(detail)}
+                    >
+                      <Icons name="zoom-in" size={13} />
+                      Phóng lớn
+                    </button>
                     <button
                       type="button"
                       class="btn-ghost tiny-btn"
@@ -2781,6 +2931,144 @@
       type="button"
       class="btn-primary"
       on:click={() => (lightboxOpen = false)}
+    >
+      Đóng
+    </button>
+  </div>
+</Modal>
+
+<!-- (E) Modal xem video lớn trong màn Dòng việc kèm prompt và metadata (UI-3) -->
+<Modal
+  open={videoModalOpen}
+  title={`Chi tiết video — ${videoModalTitle}`}
+  width="880px"
+  on:close={closeVideoModal}
+>
+  <div class="video-modal-layout">
+    <div class="video-player-pane">
+      {#if videoModalUrl}
+        <div class="video-frame-9-16">
+          <video
+            bind:this={videoPlayerEl}
+            class="large-video-player"
+            controls
+            autoplay
+            playsinline
+            src={videoModalUrl}
+            on:loadedmetadata={handleModalVideoMetadata}
+          >
+            <track kind="captions" />
+          </video>
+        </div>
+      {:else}
+        <div class="video-missing-box">
+          <Icons name="alert" size={32} />
+          <span>Không tìm thấy file video trên ổ đĩa</span>
+        </div>
+      {/if}
+    </div>
+
+    <div class="video-meta-pane">
+      <!-- Thẻ thông số video (Metadata) -->
+      <div class="video-meta-card">
+        <h3 class="meta-card-title">Thông số video</h3>
+        <dl class="meta-grid">
+          <div class="meta-grid-row">
+            <dt class="meta-key">Tên file</dt>
+            <dd class="meta-val file-val selectable" title={videoModalAbsPath ?? videoModalFileName}>
+              {videoModalFileName || "—"}
+            </dd>
+          </div>
+          <div class="meta-grid-row">
+            <dt class="meta-key">Thời lượng</dt>
+            <dd class="meta-val">
+              {videoModalDurationSec ? formatSecs(videoModalDurationSec) : "—"}
+            </dd>
+          </div>
+          <div class="meta-grid-row">
+            <dt class="meta-key">Độ phân giải</dt>
+            <dd class="meta-val">
+              {#if videoModalWidth && videoModalHeight}
+                {videoModalWidth}×{videoModalHeight} (9:16)
+              {:else}
+                —
+              {/if}
+            </dd>
+          </div>
+          <div class="meta-grid-row">
+            <dt class="meta-key">Tài khoản tạo</dt>
+            <dd class="meta-val">
+              {videoModalAccount || "Tài khoản Muse mặc định"}
+            </dd>
+          </div>
+        </dl>
+      </div>
+
+      <!-- Ô hiển thị nguyên văn "Prompt tạo ảnh" kèm nút copy -->
+      <div class="prompt-box-card">
+        <div class="prompt-box-head">
+          <span class="prompt-box-label">Prompt tạo ảnh</span>
+          <button
+            type="button"
+            class="btn-ghost copy-prompt-btn"
+            title="Sao chép prompt tạo ảnh"
+            on:click={() => copyModalPrompt("image")}
+          >
+            {#if copiedImagePrompt}
+              <Icons name="check" size={13} />
+              <span class="copy-status-text">Đã sao chép</span>
+            {:else}
+              <Icons name="copy" size={13} />
+              <span>Sao chép</span>
+            {/if}
+          </button>
+        </div>
+        <div class="prompt-box-body selectable">
+          {videoModalPromptImage || "(trống)"}
+        </div>
+      </div>
+
+      <!-- Ô hiển thị nguyên văn "Prompt tạo video" kèm nút copy -->
+      <div class="prompt-box-card">
+        <div class="prompt-box-head">
+          <span class="prompt-box-label">Prompt tạo video</span>
+          <button
+            type="button"
+            class="btn-ghost copy-prompt-btn"
+            title="Sao chép prompt tạo video"
+            on:click={() => copyModalPrompt("video")}
+          >
+            {#if copiedVideoPrompt}
+              <Icons name="check" size={13} />
+              <span class="copy-status-text">Đã sao chép</span>
+            {:else}
+              <Icons name="copy" size={13} />
+              <span>Sao chép</span>
+            {/if}
+          </button>
+        </div>
+        <div class="prompt-box-body selectable">
+          {videoModalPromptVideo || "(trống)"}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div slot="footer" class="modal-footer-bar">
+    {#if videoModalAbsPath}
+      <button
+        type="button"
+        class="btn-secondary"
+        on:click={() => revealInExplorer(videoModalAbsPath)}
+      >
+        <Icons name="folder-open" size={15} />
+        Hiện trong thư mục
+      </button>
+    {/if}
+    <button
+      type="button"
+      class="btn-primary"
+      on:click={closeVideoModal}
     >
       Đóng
     </button>
@@ -4252,10 +4540,161 @@
     user-select: none;
   }
 
+  /* (E) Modal xem video lớn (UI-3) */
+  .video-modal-layout {
+    display: grid;
+    grid-template-columns: 310px 1fr;
+    gap: 20px;
+    align-items: start;
+    min-height: 480px;
+  }
+  .video-player-pane {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    background: #090e17;
+    border: 1px solid var(--c-border);
+    border-radius: var(--r-card);
+    padding: 10px;
+  }
+  .video-frame-9-16 {
+    width: 100%;
+    max-width: 280px;
+    aspect-ratio: 9 / 16;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+  .large-video-player {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
+  .video-missing-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 260px;
+    color: var(--c-text-muted);
+    font-size: var(--fs-caption);
+    text-align: center;
+    padding: 20px;
+  }
+  .video-meta-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+  }
+  .video-meta-card {
+    background: var(--c-surface-subtle);
+    border: 1px solid var(--c-border);
+    border-radius: var(--r-card);
+    padding: 14px 16px;
+  }
+  .meta-card-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--c-text);
+    margin: 0 0 10px 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px 16px;
+    margin: 0;
+  }
+  .meta-grid-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .meta-key {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--c-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .meta-val {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--c-text);
+    margin: 0;
+    word-break: break-all;
+  }
+  .file-val {
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .prompt-box-card {
+    background: var(--c-surface-subtle);
+    border: 1px solid var(--c-border);
+    border-radius: var(--r-card);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .prompt-box-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--c-border);
+    background: var(--c-card);
+  }
+  .prompt-box-label {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--c-text);
+  }
+  .copy-prompt-btn {
+    padding: 3px 8px;
+    height: 24px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 4px;
+    gap: 4px;
+  }
+  .copy-status-text {
+    color: var(--c-green);
+    font-weight: 700;
+  }
+  .prompt-box-body {
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--c-text);
+    max-height: 115px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--c-card);
+  }
+
   @media (max-width: 820px) {
     .scan-prompts,
     .compare-grid {
       grid-template-columns: 1fr;
+    }
+    .video-modal-layout {
+      grid-template-columns: 1fr;
+    }
+    .video-frame-9-16 {
+      max-width: 240px;
     }
   }
 </style>

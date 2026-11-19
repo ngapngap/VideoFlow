@@ -63,6 +63,7 @@ pub struct Settings {
     pub schedule_enabled: bool,      // tự chạy theo lịch (6.6 Thẻ 4)
     pub schedule_hours: u64,         // chu kỳ N giờ
     pub auto_cleanup_days: u32,      // 30
+    pub auto_merge: bool,            // tự động ghép nối video sau batch (P2-2)
     pub confirm_start: bool,         // hộp xác nhận Start "Không hỏi lại"
     pub notify_on_finish: bool,
     pub minimize_to_tray: bool,
@@ -95,6 +96,7 @@ impl Default for Settings {
             schedule_enabled: false,
             schedule_hours: 3,
             auto_cleanup_days: 30,
+            auto_merge: false,
             confirm_start: true,
             notify_on_finish: true,
             minimize_to_tray: false,
@@ -682,6 +684,52 @@ mod tests {
         assert_eq!(loaded.backoff_s, [1, 1, 5]);
         assert_eq!(loaded.recent_projects.len(), 5);
         assert_eq!(loaded.recent_projects[0], "p1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_settings_auto_merge_default_and_backward_compatibility() {
+        let def = Settings::default();
+        assert!(!def.auto_merge, "auto_merge default must be false");
+
+        // Backward compatibility: old settings.json without auto_merge
+        let legacy_json = r#"{
+            "endpoint_image_base_url": "https://api.example.com/v1",
+            "concurrency": 2
+        }"#;
+        let loaded_legacy: Settings = serde_json::from_str(legacy_json).expect("deserialize legacy json");
+        assert!(!loaded_legacy.auto_merge, "missing auto_merge in json must default to false");
+
+        // Explicitly enabled auto_merge
+        let enabled_json = r#"{
+            "auto_merge": true
+        }"#;
+        let loaded_enabled: Settings = serde_json::from_str(enabled_json).expect("deserialize enabled json");
+        assert!(loaded_enabled.auto_merge, "explicit auto_merge true must be parsed");
+
+        // SettingsStore persistence
+        let idx = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "videoflow_settings_automerge_{}_{}",
+            std::process::id(),
+            idx
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store_file = dir.join("settings.json");
+        let store = SettingsStore::with_path(store_file);
+
+        let mut custom = Settings::default();
+        custom.auto_merge = true;
+        store.save(&custom).expect("save settings with auto_merge = true");
+
+        let reloaded = store.load();
+        assert!(reloaded.auto_merge, "reloaded settings must preserve auto_merge = true");
+
+        custom.auto_merge = false;
+        store.save(&custom).expect("save settings with auto_merge = false");
+        let reloaded_false = store.load();
+        assert!(!reloaded_false.auto_merge, "reloaded settings must preserve auto_merge = false");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

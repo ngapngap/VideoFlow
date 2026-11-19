@@ -289,6 +289,7 @@
     if (s === "Đã tạo video") return "badge-video";
     if (s === "Bỏ qua") return "badge-bo-qua";
     if (s === "Lỗi tạo image") return "badge-loi-image";
+    if (s === "Lỗi tạm thời") return "badge-loi-tam-thoi";
     if (s.startsWith("Lỗi")) return "badge-loi-video";
     return "badge-cho";
   }

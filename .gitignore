@@ -31,6 +31,9 @@ videoflow-app/sidecar/.venv/
 *.msi
 *.appx
 *.nsis.zip
+*.o
+videoflow-app/src-tauri/app.manifest
+videoflow-app/src-tauri/manifest.rc
 
 # Workspace cục bộ (không thuộc mã nguồn)
 _build/

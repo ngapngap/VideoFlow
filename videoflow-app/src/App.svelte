@@ -1,5 +1,5 @@
 <script context="module" lang="ts">
-  export type Screen = "dash" | "rows" | "history" | "folder" | "settings";
+  export type Screen = "dash" | "rows" | "accounts" | "history" | "folder" | "settings";
 </script>
 
 <script lang="ts">
@@ -25,6 +25,7 @@
   import { listen } from "@tauri-apps/api/event";
   import {
     api,
+    type MuseAccount,
     type ProbeResult,
     type RecentProject,
     type UpdateInfo,
@@ -35,6 +36,7 @@
   import Toast from "./lib/Toast.svelte";
   import Dashboard from "./screens/Dashboard.svelte";
   import Rows from "./screens/Rows.svelte";
+  import Accounts from "./screens/Accounts.svelte";
   import History from "./screens/History.svelte";
   import LocalFolder from "./screens/LocalFolder.svelte";
   import Settings from "./screens/Settings.svelte";
@@ -47,6 +49,7 @@
   const navItems: { key: Screen; label: string; icon: string }[] = [
     { key: "dash", label: "Tổng quan", icon: "dashboard" },
     { key: "rows", label: "Dòng việc", icon: "rows" },
+    { key: "accounts", label: "Tài khoản", icon: "video-source" },
     { key: "history", label: "Lịch sử", icon: "history" },
     { key: "folder", label: "Thư mục Local", icon: "folder" },
   ];
@@ -54,6 +57,7 @@
   const screenTitles: Record<Screen, string> = {
     dash: "Tổng quan vận hành",
     rows: "Quản lý dòng việc",
+    accounts: "Quản lý tài khoản Muse",
     history: "Lịch sử & Nhật ký",
     folder: "Thư mục dự án Local",
     settings: "Cài đặt hệ thống",
@@ -329,7 +333,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.4.1";
+  let appVersion = "1.5.0";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;
@@ -372,9 +376,78 @@
     }
   }
 
+  // ━━ Quản lý Proxy Statusbar & Khóa tính năng Video (P2-3 & UI-2) ━━
+  let museAccounts: MuseAccount[] = [];
+  let eventLockedAccount: { id: string; label?: string } | null = null;
+  let unlistenVideoLocked: (() => void) | null = null;
+  let accountsPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  function formatProxyIp(proxy: string | null | undefined): string {
+    if (!proxy || !proxy.trim()) {
+      return "IP: trực tiếp";
+    }
+    const raw = proxy.trim();
+    let hostPort = raw.replace(/^[a-zA-Z0-9]+:\/\//, "");
+    if (hostPort.includes("@")) {
+      hostPort = hostPort.split("@").pop() || hostPort;
+    }
+    hostPort = hostPort.split("/")[0];
+    return `IP: ${hostPort}`;
+  }
+
+  async function refreshMuseAccounts() {
+    try {
+      const res = await api.muse_list_accounts();
+      museAccounts = res.data ?? [];
+    } catch {
+      // sidecar offline
+    }
+  }
+
+  $: lockedAccount =
+    museAccounts.find((a) => a.status === "video_locked") ||
+    eventLockedAccount ||
+    null;
+
+  $: activeExecutingAccount =
+    museAccounts.find((a) => a.enabled && a.status === "active") ||
+    museAccounts.find((a) => a.enabled) ||
+    museAccounts[0] ||
+    null;
+
+  $: activeProxyValue = activeExecutingAccount?.proxy || null;
+  $: statusbarIpText = formatProxyIp(activeProxyValue);
+
+  async function handleSwitchLockedAccount(accountId: string) {
+    if (accountId) {
+      try {
+        await api.muse_update_account(accountId, false);
+        showToast("info", "Đã tạm dừng tài khoản bị khóa video.");
+      } catch (e) {
+        console.error("Lỗi tạm dừng tài khoản:", e);
+      }
+    }
+    eventLockedAccount = null;
+    await refreshMuseAccounts();
+    requestNavigate("accounts");
+  }
+
   onMount(() => {
     bootstrapApp();
     checkForUpdates(true);
+    refreshMuseAccounts();
+    accountsPollTimer = setInterval(refreshMuseAccounts, 5000);
+    listen<{ account_id?: string; id?: string; label?: string }>("account_video_locked", (ev) => {
+      const accId = ev.payload.account_id || ev.payload.id || "";
+      if (accId) {
+        eventLockedAccount = { id: accId, label: ev.payload.label || accId };
+      }
+      refreshMuseAccounts();
+    })
+      .then((un) => {
+        unlistenVideoLocked = un;
+      })
+      .catch(() => {});
     listen<UpdateProgress>("update_progress", (ev) => {
       updatePercent = ev.payload.percent;
     })
@@ -386,6 +459,8 @@
 
   onDestroy(() => {
     if (unlistenUpdateProgress) unlistenUpdateProgress();
+    if (accountsPollTimer) clearInterval(accountsPollTimer);
+    if (unlistenVideoLocked) unlistenVideoLocked();
   });
 </script>
 
@@ -530,17 +605,40 @@
       </div>
     </header>
 
+    {#if lockedAccount}
+      <div class="video-lock-banner" role="alert">
+        <div class="video-lock-left">
+          <span class="video-lock-icon">
+            <Icons name="alert-triangle" size={16} />
+          </span>
+          <span class="video-lock-msg">
+            Tài khoản <b>{lockedAccount.label || lockedAccount.id}</b> bị khóa tính năng video
+          </span>
+        </div>
+        <button
+          type="button"
+          class="btn-switch-account"
+          on:click={() => handleSwitchLockedAccount(lockedAccount.id)}
+          title="Tạm dừng tài khoản và mở màn hình Tài khoản để chọn tài khoản khác"
+        >
+          Đổi tài khoản
+        </button>
+      </div>
+    {/if}
+
     <main class="content">
       {#if screen === "dash"}
         <Dashboard on:navigate={handleDashboardNavigate} />
       {:else if screen === "rows"}
         <Rows />
+      {:else if screen === "accounts"}
+        <Accounts />
       {:else if screen === "history"}
         <History />
       {:else if screen === "folder"}
         <LocalFolder />
       {:else}
-        <Settings />
+        <Settings on:navigate={handleDashboardNavigate} />
       {/if}
     </main>
   </div>
@@ -582,6 +680,13 @@
       class:warn={!$endpointStatus.videoConfigured}
     ></span>
     <span>{$endpointStatus.videoConfigured ? "có key" : "chưa có key"}</span>
+  </span>
+
+  <span class="status-divider"></span>
+
+  <span class="status-section ip-section" title="Địa chỉ IP / Proxy kết nối của tài khoản Muse">
+    <Icons name="globe" size={13} />
+    <span>{statusbarIpText}</span>
   </span>
 
   <span class="status-spacer"></span>
@@ -1574,5 +1679,62 @@
   }
   .update-btn {
     white-space: nowrap;
+  }
+
+  /* P2-3 & UI-2: Statusbar IP & Video Lock Banner */
+  .ip-section {
+    color: var(--c-text);
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    gap: 4px;
+  }
+
+  .video-lock-banner {
+    background: #fdf2f2;
+    border-bottom: 1px solid #f8b4b4;
+    color: #9b1c1c;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 13px;
+    z-index: 50;
+    box-shadow: 0 1px 3px rgba(155, 28, 28, 0.08);
+  }
+  .video-lock-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .video-lock-icon {
+    display: flex;
+    align-items: center;
+    color: #c5221f;
+    flex-shrink: 0;
+  }
+  .video-lock-msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .video-lock-msg b {
+    font-weight: 600;
+  }
+  .btn-switch-account {
+    background: #c5221f;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .btn-switch-account:hover {
+    background: #9b1c1c;
   }
 </style>

@@ -210,6 +210,16 @@ pub fn admin_send(
     parse_admin_response(resp)
 }
 
+pub fn open_login(port: u16, api_key: &str, account_id: &str) -> AppResult<serde_json::Value> {
+    let path = format!("/admin/accounts/{account_id}/open-login");
+    admin_send(port, api_key, "POST", &path, None)
+}
+
+pub fn open_view(port: u16, api_key: &str, account_id: &str) -> AppResult<serde_json::Value> {
+    let path = format!("/admin/accounts/{account_id}/open-view");
+    admin_send(port, api_key, "POST", &path, None)
+}
+
 /// Chuyển response Admin API thành JSON; lỗi HTTP → AppError giữ `code` của sidecar
 /// ( ví dụ `invalid_request` khi cookie trùng) để UI hiển thị đúng message tiếng Anh gốc.
 fn parse_admin_response(resp: reqwest::blocking::Response) -> AppResult<serde_json::Value> {
@@ -434,9 +444,10 @@ impl EngineErrorHint for AppError {
     }
 }
 
-/// Dọn Edge mồ côi còn giữ profile của engine (xảy ra khi engine bị kill cứng không
-/// qua taskkill /T, hoặc app crash trước khi stop). Chỉ kill process có command line
-/// chứa ĐÚNG profile dir của app — không đụng Edge/Chrome của người dùng.
+/// Dọn Edge/Chrome mồ côi còn giữ profile của engine hoặc cờ debugging port 19210
+/// (xảy ra khi engine bị kill cứng không qua taskkill /T, hoặc app crash trước khi stop).
+/// Chỉ kill process có command line chứa ĐÚNG profile dir của app hoặc port 19210 —
+/// không đụng Edge/Chrome của người dùng.
 fn kill_orphan_edges(profile_dir: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
@@ -444,8 +455,8 @@ fn kill_orphan_edges(profile_dir: &std::path::Path) {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let needle = profile_dir.to_string_lossy().replace('\'', "''");
         let script = format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | \
-             Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{needle}') }} | \
+            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | \
+             Where-Object {{ $_.CommandLine -and ($_.CommandLine.Contains('{needle}') -or $_.CommandLine.Contains('--remote-debugging-port=19210')) }} | \
              ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
         let _ = Command::new("powershell")
@@ -670,5 +681,14 @@ mod tests {
 
         stop().expect("stop sidecar");
         assert!(!status(&cfg).unwrap().running);
+    }
+
+    #[test]
+    fn open_login_va_view_offline_tra_loi_unreachable() {
+        let err_login = open_login(65530, "vf_test", "acc_123").unwrap_err();
+        assert_eq!(err_login.code, "MUSE_ADMIN_UNREACHABLE");
+
+        let err_view = open_view(65530, "vf_test", "acc_123").unwrap_err();
+        assert_eq!(err_view.code, "MUSE_ADMIN_UNREACHABLE");
     }
 }

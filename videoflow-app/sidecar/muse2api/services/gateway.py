@@ -10,6 +10,7 @@ from typing import TypeVar
 from ..accounts.model import Account
 from ..accounts.pool import AccountPool, Lease
 from ..drivers.base import ChatRequest, ImageRequest, MediaResult, MuseDriver, VideoRequest
+from ..drivers.browser.cdp import CDPError
 from ..errors import UpstreamError
 from .request_log import note_account
 
@@ -53,7 +54,24 @@ class Gateway:
                         emitted = True
                         yield delta
                     return
+                except CDPError as exc:
+                    log.warning("CDP error during chat on account %s (%s)", lease.account.id, exc)
+                    if not emitted and attempt < self.max_failover:
+                        continue
+                    err = UpstreamError(f"browser CDP error: {exc}")
+                    err.retryable = True
+                    lease.fail(err)
+                    raise err from exc
                 except UpstreamError as exc:
+                    is_cdp = (
+                        isinstance(exc.__cause__, CDPError)
+                        or "browser error" in str(exc).lower()
+                        or "cdp" in str(exc).lower()
+                    )
+                    if is_cdp and not emitted and attempt < self.max_failover:
+                        log.warning("CDP UpstreamError during chat on account %s (%s), retrying",
+                                    lease.account.id, exc)
+                        continue
                     lease.fail(exc)
                     tried.append(lease.account.id)
                     # Once text reached the client we cannot transparently switch accounts.
@@ -68,7 +86,24 @@ class Gateway:
             async with self._lease(tried, hint, kind) as lease:
                 try:
                     return await fn(lease.account)
+                except CDPError as exc:
+                    log.warning("CDP error on account %s (%s), attempting retry", lease.account.id, exc)
+                    if attempt < self.max_failover:
+                        continue
+                    err = UpstreamError(f"browser CDP error: {exc}")
+                    err.retryable = True
+                    lease.fail(err)
+                    raise err from exc
                 except UpstreamError as exc:
+                    is_cdp = (
+                        isinstance(exc.__cause__, CDPError)
+                        or "browser error" in str(exc).lower()
+                        or "cdp" in str(exc).lower()
+                    )
+                    if is_cdp and attempt < self.max_failover:
+                        log.warning("CDP UpstreamError on account %s (%s), attempting retry",
+                                    lease.account.id, exc)
+                        continue
                     lease.fail(exc)
                     tried.append(lease.account.id)
                     if not self._should_retry(exc, attempt, tried, kind):

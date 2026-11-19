@@ -16,6 +16,8 @@ class AccountStatus(str, Enum):
     """Temporarily unavailable (quota exhausted or transient errors); returns after cooldown."""
     INVALID = "invalid"
     """Session rejected by upstream; needs fresh cookies."""
+    VIDEO_LOCKED = "video_locked"
+    """Video generation feature is locked for this account."""
 
 
 def _now() -> float:
@@ -27,6 +29,7 @@ class Account(BaseModel):
     label: str = ""
     enabled: bool = True
     status: AccountStatus = AccountStatus.ACTIVE
+    proxy: str | None = None
 
     cookies: dict[str, str] = Field(default_factory=dict)
     cookie_expires: dict[str, int] = Field(
@@ -63,10 +66,12 @@ class Account(BaseModel):
         if isinstance(extra, str) and extra.strip() and not _extra_is_zero(extra):
             return False
         reset_in = _reset_deadline(q.get("resets_at"), now or _now())
-        return reset_in is None or reset_in > 0
+        if reset_in is None:
+            return False
+        return reset_in > 0
 
     def is_available(self, now: float | None = None) -> bool:
-        if not self.enabled or self.status == AccountStatus.INVALID:
+        if not self.enabled or self.status in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
             return False
         # Quota cạn chặn cả account đang cooling đã hết hạn cooldown — nếu chỉ xét
         # cooldown thì account bị chặn do hết quota sẽ được lease lại ngay khi hết
@@ -128,6 +133,11 @@ _RESET_FORMATS = (
     "%d/%m/%Y",
 )
 
+_RESET_NO_YEAR_FORMATS = (
+    "%b %d",
+    "%B %d",
+)
+
 
 def _reset_deadline(resets_at: Any, now: float) -> float | None:
     """Seconds from ``now`` until the weekly quota resets, or None when unknown.
@@ -155,6 +165,22 @@ def _reset_deadline(resets_at: Any, now: float) -> float | None:
                 hour=23, minute=59, second=59
             ).timestamp()
             return when - now
+        except ValueError:
+            continue
+    now_dt = datetime.fromtimestamp(now)
+    for fmt in _RESET_NO_YEAR_FORMATS:
+        try:
+            dt = datetime.strptime(text, fmt)
+            try:
+                cand = dt.replace(year=now_dt.year, hour=23, minute=59, second=59)
+            except ValueError:
+                cand = dt.replace(year=now_dt.year, day=28, hour=23, minute=59, second=59)
+            if cand.timestamp() < now:
+                try:
+                    cand = cand.replace(year=now_dt.year + 1)
+                except ValueError:
+                    cand = cand.replace(year=now_dt.year + 1, day=28)
+            return cand.timestamp() - now
         except ValueError:
             continue
     return None

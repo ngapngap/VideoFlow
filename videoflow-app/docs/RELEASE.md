@@ -8,8 +8,8 @@ cd D:/VideoFlow
 #    videoflow-app/package.json, src-tauri/Cargo.toml, src-tauri/tauri.conf.json
 git add -A && git commit -m "feat: mô tả thay đổi"
 git push origin main
-git tag -a v1.4.1 -m "VideoFlow Desktop v1.4.1"
-git push origin v1.4.1        # ← trigger Release workflow
+git tag -a v1.5.0 -m "VideoFlow Desktop v1.5.0"
+git push origin v1.5.0        # ← trigger Release workflow
 ```
 
 `release.yml` sẽ trên runner `windows-latest`:

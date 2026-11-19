@@ -18,9 +18,13 @@ import base64
 import contextlib
 import logging
 import os
+import socket
+import tempfile
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -34,6 +38,7 @@ from ...errors import (
     UpstreamQuotaError,
     UpstreamRefused,
     UpstreamTimeout,
+    UpstreamVideoLocked,
     UpstreamVmDisabled,
 )
 from ...upstream import muse
@@ -49,9 +54,58 @@ from ..base import (
 )
 from . import dom
 from .cdp import CDPError, CDPSession
-from .chromium import ChromiumProcess, find_chromium
+from .chromium import ChromiumProcess, _kill_stale_browsers, find_chromium
 
 log = logging.getLogger(__name__)
+
+
+def _is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.1)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+_USED_PORTS: set[int] = set()
+
+
+def resolve_proxy(account: Account | None, global_proxy: str = "") -> str:
+    """Return proxy to use:
+    1. account.proxy if set and non-empty.
+    2. fallback to global browser_proxy if set and non-empty.
+    3. fallback to direct connection (empty string).
+    """
+    if account and account.proxy and account.proxy.strip():
+        return account.proxy.strip()
+    if global_proxy and global_proxy.strip():
+        return global_proxy.strip()
+    return ""
+
+
+def resolve_account_profile_dir(settings: Settings, account_id: str | None) -> Path:
+    """Return isolated profile directory muse/profiles/<account_id> for the account."""
+    if not account_id:
+        return settings.profile_dir
+    if hasattr(settings, "account_profile_dir"):
+        return settings.account_profile_dir(account_id)
+    if settings.browser_profile_dir:
+        return settings.browser_profile_dir.parent / "profiles" / account_id
+    return settings.data_dir / "muse" / "profiles" / account_id
+
+
+def allocate_cdp_port(base_port: int) -> int:
+    for port in range(base_port, base_port + 200):
+        if port not in _USED_PORTS and not _is_port_in_use(port):
+            _USED_PORTS.add(port)
+            return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        p = int(s.getsockname()[1])
+    _USED_PORTS.add(p)
+    return p
+
+
+def release_cdp_port(port: int) -> None:
+    _USED_PORTS.discard(port)
 
 POLL_INTERVAL = 0.15
 STABLE_POLLS_DONE = 4
@@ -85,6 +139,107 @@ def is_thread_url(url: str) -> bool:
     return path.startswith("/thread/") and path != "/thread/new"
 
 
+def verify_magic_bytes(data: bytes, kind: str) -> bool:
+    """Verify file magic bytes according to P1-1 specification."""
+    if not data or len(data) < 3:
+        return False
+    if kind == "image":
+        # PNG: 89 50 4E 47
+        if data.startswith(b"\x89PNG") or data.startswith(b"\x89\x50\x4e\x47"):
+            return True
+        # JPEG: FF D8 FF
+        if data.startswith(b"\xff\xd8\xff"):
+            return True
+        # WebP: 52 49 46 46 (RIFF)
+        if data.startswith(b"RIFF") and (len(data) < 12 or b"WEBP" in data[8:12]):
+            return True
+        return False
+    elif kind == "video":
+        # MP4: 00 00 00 ... ftyp
+        if len(data) >= 8 and data[4:8] == b"ftyp":
+            return True
+        if len(data) >= 12 and data.startswith(b"\x00\x00\x00") and b"ftyp" in data[:16]:
+            return True
+        return False
+    return True
+
+
+async def verify_and_save_download(data: bytes, kind: str) -> bytes:
+    """Verify download integrity using .partial file, magic bytes, and FFmpeg decode verify (P1-1).
+
+    1. Check 0-bytes / empty data.
+    2. Write temporary .partial file.
+    3. Verify magic bytes: PNG (89 50 4E 47), JPEG (FF D8 FF), WebP (52 49 46 46), MP4 (00 00 00 ... ftyp).
+    4. For video (.mp4): run ffmpeg -v error -i file.partial -f null -
+       If FFmpeg is not available, fallback to minimum size (>= 16 bytes) and valid magic bytes.
+    5. If decode succeeds: atomic rename to verified file.
+    6. If error: delete temporary file, raise UpstreamError to trigger automatic retry.
+    """
+    if not data or len(data) == 0:
+        raise UpstreamError(f"downloaded data is empty (0 bytes) for {kind}")
+
+    temp_dir = Path(tempfile.gettempdir()) / "videoflow_downloads"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    file_id = uuid.uuid4().hex
+    partial_path = temp_dir / f"download_{file_id}.partial"
+    verified_path = temp_dir / f"download_{file_id}.{'mp4' if kind == 'video' else 'verified'}"
+
+    try:
+        partial_path.write_bytes(data)
+
+        if partial_path.stat().st_size == 0:
+            raise UpstreamError(f"downloaded {kind} file on disk is 0 bytes")
+
+        if not verify_magic_bytes(data, kind):
+            raise UpstreamError(f"file integrity check failed: invalid magic bytes for {kind}")
+
+        if kind == "video":
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-v", "error", "-i", str(partial_path), "-f", "null", "-",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                if proc.returncode != 0:
+                    err_msg = (stderr or b"").decode(errors="replace").strip()
+                    raise UpstreamError(f"FFmpeg decode verification failed: {err_msg}")
+            except (FileNotFoundError, OSError) as exc:
+                log.warning("FFmpeg not available or cannot run (%s); falling back to minimum size and magic bytes check", exc)
+                if len(data) < 16 or not verify_magic_bytes(data, "video"):
+                    raise UpstreamError("video failed fallback integrity check: file too small or invalid magic bytes")
+            except asyncio.TimeoutError:
+                raise UpstreamError("FFmpeg decode verification timed out")
+
+        # Atomic rename to official verified file
+        partial_path.replace(verified_path)
+        verified_data = verified_path.read_bytes()
+        return verified_data
+    except Exception:
+        if partial_path.is_file():
+            try:
+                partial_path.unlink()
+            except OSError:
+                pass
+        if verified_path.is_file():
+            try:
+                verified_path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        if partial_path.is_file():
+            try:
+                partial_path.unlink()
+            except OSError:
+                pass
+        if verified_path.is_file():
+            try:
+                verified_path.unlink()
+            except OSError:
+                pass
+
+
 @dataclass
 class _Tab:
     account_id: str
@@ -116,8 +271,24 @@ class BrowserDriver(MuseDriver):
         quota=True,
     )
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        account: Account | None = None,
+        port: int | None = None,
+        profile_dir: Path | None = None,
+        proxy: str | None = None,
+    ) -> None:
         self.settings = settings
+        self.account = account
+        self.account_id = account.id if account else None
+        self.port = port or settings.cdp_port
+        self.profile_dir = profile_dir or (
+            resolve_account_profile_dir(settings, account.id) if account else settings.profile_dir
+        )
+        self.proxy = proxy if proxy is not None else resolve_proxy(account, settings.browser_proxy)
+
         self._chromium: ChromiumProcess | None = None
         self._browser: CDPSession | None = None
         # One browser context (cookie jar) per account, holding up to
@@ -131,19 +302,107 @@ class BrowserDriver(MuseDriver):
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_locks: dict[str, asyncio.Lock] = {}
         self._warming: dict[str, asyncio.Task] = {}
+        self._recovery_lock = asyncio.Lock()
+
+        # Multi-driver registry per account (when self.account is None)
+        self._account_drivers: dict[str, BrowserDriver] = {}
+
+    @property
+    def account_drivers(self) -> dict[str, BrowserDriver]:
+        return self._account_drivers
+
+    def get_account_driver(self, account: Account) -> BrowserDriver:
+        if self.account is not None:
+            return self
+        expected_proxy = resolve_proxy(account, self.settings.browser_proxy)
+        drv = self._account_drivers.get(account.id)
+        if drv is not None and drv.proxy != expected_proxy:
+            log.info("account %s proxy changed from '%s' to '%s'; replacing driver",
+                     account.id, drv.proxy, expected_proxy)
+            asyncio.create_task(drv.shutdown())
+            drv = None
+        if drv is None:
+            port = allocate_cdp_port(self.settings.cdp_port + len(self._account_drivers) + 1)
+            pdir = resolve_account_profile_dir(self.settings, account.id)
+            drv = BrowserDriver(
+                self.settings,
+                account=account,
+                port=port,
+                profile_dir=pdir,
+                proxy=expected_proxy,
+            )
+            self._account_drivers[account.id] = drv
+        return drv
 
     # ------------------------------------------------------------ lifecycle
+    @property
+    def browser_alive(self) -> bool:
+        if self._browser is not None and not self._browser.closed:
+            return True
+        if self.account is None and self._account_drivers:
+            return any(d.browser_alive for d in self._account_drivers.values())
+        return False
+
+    async def _recover_browser(self) -> None:
+        async with self._recovery_lock:
+            if self.browser_alive:
+                return
+            log.warning("CDP disconnect detected on driver (account=%s); recovering browser and restarting Chromium...",
+                        self.account_id or "default")
+            for task in self._warming.values():
+                task.cancel()
+            self._warming.clear()
+
+            for tabs in list(self._tabs.values()):
+                for t in list(tabs):
+                    t.closed = True
+                    with contextlib.suppress(Exception):
+                        await t.session.close()
+            self._tabs.clear()
+            self._contexts.clear()
+
+            if self._browser:
+                with contextlib.suppress(Exception):
+                    await self._browser.close()
+                self._browser = None
+
+            if self._chromium:
+                with contextlib.suppress(Exception):
+                    await self._chromium.stop()
+                self._chromium = None
+
+            _kill_stale_browsers(self.profile_dir, self.port)
+
+            for lock in ("SingletonLock", "SingletonCookie", "DevToolsActivePort",
+                         "SingletonSocket", "lockfile"):
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    (self.profile_dir / lock).unlink()
+
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if not _is_port_in_use(self.port):
+                    break
+                await asyncio.sleep(0.2)
+
+            await self.startup()
+            log.info("browser recovery complete on driver (account=%s)", self.account_id or "default")
+
     async def startup(self) -> None:
         exe = find_chromium(self.settings.chromium_path)
         self._chromium = ChromiumProcess(
-            exe, self.settings.cdp_port, self.settings.profile_dir, self.settings.headless,
-            proxy=self.settings.browser_proxy,
+            exe, self.port, self.profile_dir, self.settings.headless,
+            proxy=self.proxy,
         )
         ws_url = await self._chromium.start()
         self._browser = await CDPSession.connect(ws_url)
-        log.info("browser driver ready")
+        log.info("browser driver ready (account=%s, profile=%s, proxy=%s, port=%d)",
+                 self.account_id or "default", self.profile_dir, self.proxy or "direct", self.port)
 
     async def shutdown(self) -> None:
+        if self.account is None:
+            for d in list(self._account_drivers.values()):
+                await d.shutdown()
+            self._account_drivers.clear()
         for task in self._warming.values():
             task.cancel()
         for tabs in list(self._tabs.values()):
@@ -153,12 +412,49 @@ class BrowserDriver(MuseDriver):
             await self._browser.close()
         if self._chromium:
             await self._chromium.stop()
+        if self.port != self.settings.cdp_port:
+            release_cdp_port(self.port)
 
     async def health(self) -> dict[str, Any]:
-        ok = self._browser is not None and not self._browser.closed
+        if self.account is None and self._account_drivers:
+            sub_healths = [await d.health() for d in self._account_drivers.values()]
+            alive = any(h.get("browser_alive", False) for h in sub_healths)
+            tabs = sum(h.get("tabs", 0) for h in sub_healths)
+            busy = sum(h.get("busy_tabs", 0) for h in sub_healths)
+            active_acc = None
+            active_prx = None
+            for acc_id, drv in self._account_drivers.items():
+                if drv.is_account_busy(acc_id):
+                    active_acc = acc_id
+                    active_prx = drv.proxy
+                    break
+            return {
+                "driver": self.name,
+                "ok": alive or self.browser_alive,
+                "browser_alive": alive or self.browser_alive,
+                "tabs": tabs + len([t for ts in self._tabs.values() for t in ts]),
+                "busy_tabs": busy + sum(t.busy for ts in self._tabs.values() for t in ts),
+                "account_drivers": len(self._account_drivers),
+                "active_account_id": active_acc,
+                "active_proxy": active_prx,
+            }
+        ok = self.browser_alive
         tabs = [t for ts in self._tabs.values() for t in ts]
-        return {"driver": self.name, "ok": ok, "tabs": len(tabs),
-                "busy_tabs": sum(t.busy for t in tabs)}
+        return {
+            "driver": self.name,
+            "ok": ok,
+            "browser_alive": ok,
+            "tabs": len(tabs),
+            "busy_tabs": sum(t.busy for t in tabs),
+            "active_account_id": self.account_id if any(t.busy for t in tabs) else None,
+            "active_proxy": self.proxy if any(t.busy for t in tabs) else None,
+        }
+
+    def is_account_busy(self, account_id: str) -> bool:
+        if self.account is None and account_id in self._account_drivers:
+            return self._account_drivers[account_id].is_account_busy(account_id)
+        tabs = self._tabs.get(account_id, [])
+        return any(getattr(t, "busy", False) for t in tabs)
 
     # ------------------------------------------------------------ tabs
     async def _checkout(self, account: Account,
@@ -197,6 +493,10 @@ class BrowserDriver(MuseDriver):
             return tab
         try:
             tab = await self._open_tab(account)
+        except CDPError as exc:
+            log.warning("CDP error in _checkout: %s; recovering browser", exc)
+            await self._recover_browser()
+            tab = await self._open_tab(account)
         finally:
             async with self._tab_cond:
                 self._opening[account.id] -= 1
@@ -223,32 +523,54 @@ class BrowserDriver(MuseDriver):
         async with self._ctx_lock:
             if ctx := self._contexts.get(account.id):
                 return ctx
-            assert self._browser
-            res = await self._browser.send("Target.createBrowserContext", {"disposeOnDetach": False})
-            self._contexts[account.id] = res["browserContextId"]
-            return res["browserContextId"]
+            for attempt in (1, 2):
+                if not self._browser or self._browser.closed:
+                    await self._recover_browser()
+                assert self._browser
+                try:
+                    res = await self._browser.send("Target.createBrowserContext", {"disposeOnDetach": False})
+                    self._contexts[account.id] = res["browserContextId"]
+                    return res["browserContextId"]
+                except CDPError as exc:
+                    log.warning("CDP error in _context (attempt %d): %s", attempt, exc)
+                    if attempt == 1:
+                        await self._recover_browser()
+                    else:
+                        raise
+            raise RuntimeError("unreachable in _context")
 
     async def _open_tab(self, account: Account) -> _Tab:
         if missing := muse.missing_session_cookies(account.cookies):
             raise UpstreamAuthError(f"account is missing session cookies: {', '.join(missing)}")
-        assert self._browser and self._chromium
-        context_id = await self._context(account)
-        # A window per tab: Chromium throttles background tabs of a shared window,
-        # which made parallel requests on one account run one after another.
-        target = await self._browser.send(
-            "Target.createTarget",
-            {"url": "about:blank", "browserContextId": context_id, "newWindow": True},
-        )
-        target_id = target["targetId"]
-        session = await CDPSession.connect(
-            f"ws://127.0.0.1:{self._chromium.port}/devtools/page/{target_id}"
-        )
-        for domain in ("Page", "Runtime", "Network"):
-            await session.send(f"{domain}.enable")
-        await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
-        await session.send("Page.setWebLifecycleState", {"state": "active"})
-        await self._set_cookies(session, account)
-        return _Tab(account.id, context_id, target_id, session)
+        for attempt in (1, 2):
+            if not self._browser or self._browser.closed:
+                await self._recover_browser()
+            assert self._browser and self._chromium
+            try:
+                context_id = await self._context(account)
+                # A window per tab: Chromium throttles background tabs of a shared window,
+                # which made parallel requests on one account run one after another.
+                target = await self._browser.send(
+                    "Target.createTarget",
+                    {"url": "about:blank", "browserContextId": context_id, "newWindow": True},
+                )
+                target_id = target["targetId"]
+                session = await CDPSession.connect(
+                    f"ws://127.0.0.1:{self._chromium.port}/devtools/page/{target_id}"
+                )
+                for domain in ("Page", "Runtime", "Network"):
+                    await session.send(f"{domain}.enable")
+                await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                await session.send("Page.setWebLifecycleState", {"state": "active"})
+                await self._set_cookies(session, account)
+                return _Tab(account.id, context_id, target_id, session)
+            except CDPError as exc:
+                log.warning("CDP error in _open_tab (attempt %d): %s", attempt, exc)
+                if attempt == 1:
+                    await self._recover_browser()
+                else:
+                    raise
+        raise RuntimeError("unreachable in _open_tab")
 
     async def _close_tab(self, tab: _Tab) -> None:
         """Idempotent; marks the tab closed first so a cancelled close never leaves it
@@ -408,6 +730,31 @@ class BrowserDriver(MuseDriver):
     # The textarea mounts ~0.5s before the hidden file input on a fresh thread;
     # attaching immediately fails roughly every third time on a healthy account.
     _ATTACH_READY_TIMEOUT = 3.0
+    _UPLOAD_TIMEOUT = 45.0
+    _UPLOAD_POLL_INTERVAL = 0.2
+
+    async def _wait_upload_complete(self, tab: _Tab, timeout: float = 45.0) -> None:
+        """Wait for reference image upload to complete before sending (P1-6).
+
+        Polls every 200ms checking for [role=progressbar], [aria-busy=true] or upload indicators.
+        Times out after 45s and raises an error if upload doesn't finish, preventing sending prompt without image.
+        """
+        deadline = time.monotonic() + timeout
+        await asyncio.sleep(self._UPLOAD_POLL_INTERVAL)
+        while time.monotonic() < deadline:
+            is_busy = await tab.session.evaluate(dom.CHECK_UPLOAD_BUSY)
+            if not is_busy:
+                await asyncio.sleep(0.1)
+                is_busy_confirm = await tab.session.evaluate(dom.CHECK_UPLOAD_BUSY)
+                if not is_busy_confirm:
+                    return
+            await asyncio.sleep(self._UPLOAD_POLL_INTERVAL)
+
+        is_still_busy = await tab.session.evaluate(dom.CHECK_UPLOAD_BUSY)
+        if is_still_busy:
+            raise UpstreamTimeout(
+                f"reference image upload timed out after {timeout:.0f}s: upload progressbar still active"
+            )
 
     async def _attach(self, tab: _Tab, images: list[InputImage]) -> None:
         if images:
@@ -426,7 +773,7 @@ class BrowserDriver(MuseDriver):
             if not (res or {}).get("ok"):
                 raise UpstreamError(f"failed to attach image: {(res or {}).get('err')}")
         if images:
-            await asyncio.sleep(1.0)
+            await self._wait_upload_complete(tab, timeout=self._UPLOAD_TIMEOUT)
 
     async def _send(self, tab: _Tab, prompt: str) -> None:
         res = await tab.session.evaluate(dom.fill_input(prompt))
@@ -468,10 +815,22 @@ class BrowserDriver(MuseDriver):
                          tab.thread_url or "new thread", snippet)
         return state
 
+    async def _snapshot_media_urls(self, tab: _Tab) -> set[str]:
+        """Snapshot current media URLs on DOM before prompt is sent (P1-3)."""
+        try:
+            urls = await tab.session.evaluate(dom.MEDIA_URLS_SNAPSHOT) or []
+            return {u for u in urls if u}
+        except Exception as exc:
+            log.debug("could not snapshot media urls: %s", exc)
+            return set()
+
     async def _prepare(self, tab: _Tab, prompt: str, images: list[InputImage]) -> dict:
         await self._new_thread(tab)
         base = await self._state(tab)
         await self._attach(tab, images)
+        existing = await self._snapshot_media_urls(tab)
+        existing.update({a["src"] for a in base.get("attachments", []) if a.get("src")})
+        base["existing_urls"] = existing
         await self._send(tab, prompt)
         return base
 
@@ -577,6 +936,11 @@ class BrowserDriver(MuseDriver):
             raise
 
     async def chat_stream(self, account: Account, req: ChatRequest) -> AsyncIterator[str]:
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            async for delta in drv.chat_stream(account, req):
+                yield delta
+            return
         tab, base = await self._begin_chat(account, req)
         base_count, base_text = base.get("agentCount", 0), base.get("lastText", "")
         started = time.monotonic()
@@ -644,6 +1008,10 @@ class BrowserDriver(MuseDriver):
 
     def prewarm(self, account: Account) -> None:
         """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            drv.prewarm(account)
+            return
         if self.settings.warm_threads <= 0 or self._browser is None:
             return
         task = self._warming.get(account.id)
@@ -743,10 +1111,23 @@ class BrowserDriver(MuseDriver):
     # a minute later, and the failover started the whole generation over.
     _OVERRUN_FACTOR = 2.5
 
+    async def _wait_video_mount(self, tab: _Tab, timeout: float = 6.0) -> bool:
+        """Poll every 100ms up to 6s for <video> to mount src or data-hatch-video-src (P1-2)."""
+        res = await tab.session.evaluate(
+            dom.wait_video_mount(timeout_ms=int(timeout * 1000), interval_ms=100),
+            await_promise=True,
+            timeout=int(timeout + 2),
+        )
+        mounted = bool((res or {}).get("mounted"))
+        if not mounted:
+            log.warning("video element did not mount src within %.1fs; continuing with fallback", timeout)
+        return mounted
+
     async def _wait_media(self, tab: _Tab, base: dict, kind: str, timeout: float,
                           on_progress, cancel: asyncio.Event | None) -> dict:
         base_atts = len(base.get("attachments", []))
         base_count = base.get("agentCount", 0)
+        existing_urls = set(base.get("existing_urls") or [])
         grace = self._MEDIA_GRACE.get(kind, 8.0)
         started = time.monotonic()
         text_done_at: float | None = None
@@ -764,9 +1145,47 @@ class BrowserDriver(MuseDriver):
                 denied, text_done_at = True, None
                 continue
             new_atts = st.get("attachments", [])[base_atts:]
-            fresh = [a for a in new_atts if a.get("src") and a.get("kind") == kind]
+
+            # P1-2: If kind is video and any video attachment is missing src or has old src, wait for mount
+            if kind == "video":
+                unmounted = any(
+                    a.get("kind") == "video" and (not a.get("src") or a.get("src") in existing_urls)
+                    for a in new_atts
+                )
+                if unmounted:
+                    await self._wait_video_mount(tab, timeout=6.0)
+                    st = await self._state(tab)
+                    new_atts = st.get("attachments", [])[base_atts:]
+
+            # P1-3: Filter attachments by kind and NOT in existing_urls
+            fresh = [
+                a for a in new_atts
+                if a.get("src") and a.get("src") not in existing_urls and a.get("kind") == kind
+            ]
             if fresh:
                 return fresh[-1]
+
+            # P1-4: Detect Muse video lock response
+            # Only conclude when:
+            # 1. kind == "video"
+            # 2. No video was created (not fresh)
+            # 3. Generation is complete (not st.get("generating"))
+            # 4. Text matches video lock indicators
+            if kind == "video" and not st.get("generating") and not fresh:
+                text_low = (st.get("lastText") or "").lower()
+                tail_low = (st.get("tail") or "").lower()
+                combined_text = f"{text_low} {tail_low}"
+                if any(h in combined_text for h in dom.VIDEO_LOCKED_HINTS):
+                    matched_hint = next(h for h in dom.VIDEO_LOCKED_HINTS if h in combined_text)
+                    raw_text = st.get("lastText") or st.get("tail") or matched_hint
+                    log.warning(
+                        "video locked detected on account %s (matched %r): %.200s",
+                        tab.account_id, matched_hint, raw_text,
+                    )
+                    raise UpstreamVideoLocked(
+                        f"muse.ai reports video generation is locked: {raw_text[:200]}"
+                    )
+
             busy = bool(st.get("generating")) or any(kind in (a.get("tid") or "") for a in new_atts)
             elapsed = time.monotonic() - started
             if on_progress:
@@ -783,6 +1202,17 @@ class BrowserDriver(MuseDriver):
                 if text_done_at is None:
                     text_done_at = time.monotonic()
                 elif time.monotonic() - text_done_at >= grace:
+                    if kind == "video" and not asked_to_attach:
+                        await self._wait_video_mount(tab, timeout=6.0)
+                        st = await self._state(tab)
+                        new_atts = st.get("attachments", [])[base_atts:]
+                        fresh = [
+                            a for a in new_atts
+                            if a.get("src") and a.get("src") not in existing_urls and a.get("kind") == kind
+                        ]
+                        if fresh:
+                            return fresh[-1]
+
                     if not asked_to_attach:
                         # The agent often finishes with the file only in its workspace:
                         # after a denied upload, after post-processing that it shows as
@@ -799,12 +1229,15 @@ class BrowserDriver(MuseDriver):
                         continue
                     # Last resort: media delivered as a link in the text bubble.
                     probe = await tab.session.evaluate(dom.LAST_BUBBLE_MEDIA) or {}
-                    url = self._pick_media_url(probe.get("links", []), kind)
+                    cand_links = [u for u in probe.get("links", []) if u not in existing_urls]
+                    url = self._pick_media_url(cand_links, kind)
                     if url:
                         log.info("%s delivered as link in text bubble: %s", kind, url)
                         return {"src": url, "kind": kind}
                     log.info("%s: no media after %.0fs grace; links=%s html=%.300s",
                              kind, grace, probe.get("links", []), probe.get("html", ""))
+                    if kind == "video" and any(h in text.lower() for h in dom.VIDEO_LOCKED_HINTS):
+                        raise UpstreamVideoLocked(f"muse.ai reports video generation is locked: {text[:200]}")
                     raise UpstreamRefused(f"upstream replied with text only: {text[:200]}")
             else:
                 text_done_at = None
@@ -844,8 +1277,15 @@ class BrowserDriver(MuseDriver):
                                          timeout=300)
         if not (res or {}).get("ok"):
             raise UpstreamError(f"failed to download generated {kind}: {(res or {}).get('err')}")
+        raw_b64 = (res or {}).get("b64") or ""
+        try:
+            raw_bytes = base64.b64decode(raw_b64)
+        except Exception as exc:
+            raise UpstreamError(f"corrupt base64 data for {kind}: {exc}") from exc
+
+        verified_data = await verify_and_save_download(raw_bytes, kind)
         mime = res.get("mime") or ("video/mp4" if kind == "video" else "image/png")
-        return MediaResult(data=base64.b64decode(res["b64"]), mime=mime, kind=kind,
+        return MediaResult(data=verified_data, mime=mime, kind=kind,
                            width=att.get("w") or None, height=att.get("h") or None)
 
     async def _generate(self, account: Account, prompt: str, images: list[InputImage],
@@ -864,6 +1304,9 @@ class BrowserDriver(MuseDriver):
             await self._checkin(tab)
 
     async def generate_image(self, account: Account, req: ImageRequest) -> list[MediaResult]:
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            return await drv.generate_image(account, req)
         prompt = self._media_prompt(req.prompt, "image", req.size)
         results = []
         for _ in range(max(1, req.n)):
@@ -874,6 +1317,9 @@ class BrowserDriver(MuseDriver):
         return results
 
     async def generate_video(self, account: Account, req: VideoRequest) -> MediaResult:
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            return await drv.generate_video(account, req)
         prompt = self._media_prompt(req.prompt, "video", req.size, req.duration)
         images = [req.first_frame] if req.first_frame else []
         return await self._generate(account, prompt, images, "video", req.timeout,
@@ -881,6 +1327,9 @@ class BrowserDriver(MuseDriver):
 
     # ------------------------------------------------------------ session
     async def renew_session(self, account: Account) -> SessionInfo:
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            return await drv.renew_session(account)
         info = await muse.renew_session(account.cookies)
         # Cookies live in the account's browser context, so writing the rotated ones
         # through any open tab updates every tab and keeps hot and warm pages alive.
@@ -915,6 +1364,8 @@ class BrowserDriver(MuseDriver):
     def forget_quota(self, account_id: str) -> None:
         """Drop the cached snapshot so the next ``quota`` call reads the page again."""
         self._quota_cache.pop(account_id, None)
+        if drv := self._account_drivers.get(account_id):
+            drv._quota_cache.pop(account_id, None)
 
     def _cached_quota(self, account_id: str) -> dict[str, Any] | None:
         hit = self._quota_cache.get(account_id)
@@ -930,6 +1381,9 @@ class BrowserDriver(MuseDriver):
         ``MUSE2API_QUOTA_CACHE_S`` (30 min) so the dashboard cannot hammer muse.ai;
         ``forget_quota`` bypasses it. Raises ``AccountBusy`` rather than touch a tab
         that is serving a request."""
+        if self.account is None:
+            drv = self.get_account_driver(account)
+            return await drv.quota(account)
         if hit := self._cached_quota(account.id):
             return hit
         async with self._quota_locks.setdefault(account.id, asyncio.Lock()):

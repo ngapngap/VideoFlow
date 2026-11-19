@@ -24,6 +24,13 @@ FILE_INPUT = 'input[type="file"]'
 LOGIN_HINTS = ("log in", "sign in", "create an account", "use another account")
 QUOTA_HINTS = ("out of credits", "usage limit", "limit reached", "token limit")
 STALL_HINTS = ("Still sending", "Connecting...")
+VIDEO_LOCKED_HINTS = (
+    "tính năng tạo video không khả dụng",
+    "video không khả dụng",
+    "không thể tạo video",
+    "video generation is not available",
+    "unable to generate video",
+)
 
 
 def q(value: str) -> str:
@@ -75,10 +82,20 @@ CHAT_STATE = f"""(() => {{
   const atts = [...document.querySelectorAll({q(ATTACHMENT)})].map(a => {{
     const v = a.querySelector('video'), i = a.querySelector('img');
     const m = v || i;
+    let src = '';
+    if (v) {{
+      src = v.currentSrc || v.src || v.getAttribute('src') || '';
+      if (!src) {{
+        const wrapper = v.closest('[data-hatch-video-src]') || a.closest('[data-hatch-video-src]');
+        if (wrapper) src = wrapper.getAttribute('data-hatch-video-src') || '';
+      }}
+    }} else if (i) {{
+      src = i.currentSrc || i.src || i.getAttribute('src') || '';
+    }}
     return {{
       tid: a.getAttribute('data-testid') || '',
       kind: v ? 'video' : (i ? 'image' : 'unknown'),
-      src: m ? (m.currentSrc || m.src || '') : '',
+      src: src,
       w: m ? (m.videoWidth || m.naturalWidth || 0) : 0,
       h: m ? (m.videoHeight || m.naturalHeight || 0) : 0,
     }};
@@ -89,6 +106,58 @@ CHAT_STATE = f"""(() => {{
             approval: !!document.querySelector({q(APPROVAL_CARD)}),
             attachments: atts, tail }};
 }})()"""
+
+# Snapshot of all media URLs on the page to prevent reusing old results (P1-3)
+MEDIA_URLS_SNAPSHOT = f"""(() => {{
+  const urls = new Set();
+  document.querySelectorAll({q(ATTACHMENT)}).forEach(a => {{
+    const v = a.querySelector('video'), i = a.querySelector('img');
+    const src = (v ? (v.currentSrc || v.src || v.getAttribute('src')) : null)
+      || (i ? (i.currentSrc || i.src || i.getAttribute('src')) : null)
+      || a.getAttribute('data-hatch-video-src')
+      || (a.closest('[data-hatch-video-src]') ? a.closest('[data-hatch-video-src]').getAttribute('data-hatch-video-src') : null);
+    if (src) urls.add(src);
+  }});
+  document.querySelectorAll('video, img').forEach(el => {{
+    const s = el.currentSrc || el.src || el.getAttribute('src');
+    if (s) urls.add(s);
+    const h = el.getAttribute('data-hatch-video-src')
+      || (el.closest('[data-hatch-video-src]') ? el.closest('[data-hatch-video-src]').getAttribute('data-hatch-video-src') : null);
+    if (h) urls.add(h);
+  }});
+  return [...urls];
+}})()"""
+
+def wait_video_mount(timeout_ms: int = 6000, interval_ms: int = 100) -> str:
+    """Poll every interval_ms waiting for <video> to mount src or data-hatch-video-src (P1-2)."""
+    return f"""(async () => {{
+  const scrollers = [...document.querySelectorAll('*')].filter(e => {{
+    const s = getComputedStyle(e);
+    return (s.overflowY === 'auto' || s.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 50;
+  }});
+  scrollers.forEach(e => {{ e.scrollTop = e.scrollHeight; }});
+
+  const check = () => {{
+    for (const v of document.querySelectorAll('video')) {{
+      if (v.currentSrc || v.src || v.getAttribute('src')) return true;
+      const parent = v.closest('[data-hatch-video-src]');
+      if (parent && parent.getAttribute('data-hatch-video-src')) return true;
+    }}
+    for (const el of document.querySelectorAll('[data-hatch-video-src]')) {{
+      if (el.getAttribute('data-hatch-video-src')) return true;
+    }}
+    return false;
+  }};
+
+  const start = Date.now();
+  while (Date.now() - start < {timeout_ms}) {{
+    if (check()) return {{ mounted: true, elapsed_ms: Date.now() - start }};
+    await new Promise(r => setTimeout(r, {interval_ms}));
+  }}
+  return {{ mounted: check(), elapsed_ms: Date.now() - start }};
+}})()"""
+
+WAIT_VIDEO_MOUNT = wait_video_mount(6000, 100)
 
 
 # Click "Deny" on every pending approval card; the agent then carries on without
@@ -170,16 +239,37 @@ def attach_file(b64: str, mime: str, filename: str) -> str:
 }})()"""
 
 
+# Check if reference image upload is in progress (P1-6)
+CHECK_UPLOAD_BUSY = """(() => {
+  const busy = document.querySelector('[role="progressbar"], [aria-busy="true"], [data-testid*="upload-progress"], [data-testid*="progressbar"]');
+  if (busy) {
+    const rect = busy.getBoundingClientRect();
+    if (rect.width > 0 || rect.height > 0 || busy.offsetParent !== null) {
+      return true;
+    }
+  }
+  const chatArea = document.querySelector('form, [data-testid*="chat-input"], div[class*="input"], div[class*="composer"], div[class*="chat-bar"]');
+  if (chatArea) {
+    const el = chatArea.querySelector('[role="progressbar"], [aria-busy="true"], [class*="progressbar"], [class*="uploading"], [class*="spinner"], svg[class*="spin"]');
+    if (el) return true;
+  }
+  return false;
+})()"""
+
+
 def fetch_as_base64(url: str) -> str:
     """Fetch a (possibly blob:) URL inside the page context and return base64 bytes."""
     return f"""(async () => {{
   try {{
     const r = await fetch({q(url)});
+    if (!r.ok) return {{ ok: false, err: `HTTP ${{r.status}} ${{r.statusText}}` }};
     const b = await r.blob();
+    if (!b || b.size === 0) return {{ ok: false, err: 'empty blob (0 bytes)' }};
     const buf = new Uint8Array(await b.arrayBuffer());
+    if (buf.length === 0) return {{ ok: false, err: 'empty buffer (0 bytes)' }};
     let s = '';
     for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-    return {{ ok: true, mime: b.type || '', b64: btoa(s) }};
+    return {{ ok: true, mime: b.type || '', b64: btoa(s), size: buf.length }};
   }} catch (e) {{ return {{ ok: false, err: String(e) }}; }}
 }})()"""
 

@@ -23,6 +23,7 @@ from ..errors import (
     UpstreamAuthError,
     UpstreamQuotaError,
     UpstreamTimeout,
+    UpstreamVideoLocked,
     UpstreamVmDisabled,
 )
 from .model import Account, AccountStatus
@@ -176,6 +177,7 @@ class AccountPool:
             "total": len(self._accounts),
             "available": sum(1 for a in self._accounts.values() if a.is_available(now)),
             "invalid": sum(1 for a in self._accounts.values() if a.status == AccountStatus.INVALID),
+            "video_locked": sum(1 for a in self._accounts.values() if a.status == AccountStatus.VIDEO_LOCKED),
             "inflight": sum(self._inflight.values()),
         }
 
@@ -187,7 +189,7 @@ class AccountPool:
         if kind is None:
             return set()
         usable = [a for a in self._accounts.values()
-                  if a.enabled and a.status != AccountStatus.INVALID]
+                  if a.enabled and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)]
         blocked = {a.id for a in usable if _kind_blocked_until(a, kind) > now}
         return set() if len(blocked) == len(usable) else blocked
 
@@ -207,7 +209,7 @@ class AccountPool:
         free, busy, back_at = [], False, None
         quota_blocked = 0
         for acc in self._accounts.values():
-            if acc.id in excluded or not acc.enabled or acc.status == AccountStatus.INVALID:
+            if acc.id in excluded or not acc.enabled or acc.status in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
                 continue
             if acc.quota_exhausted(now):
                 quota_blocked += 1
@@ -234,7 +236,7 @@ class AccountPool:
         return any(
             a.id not in excluded
             and a.enabled
-            and a.status != AccountStatus.INVALID
+            and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)
             and not a.quota_exhausted(now)
             for a in self._accounts.values()
         )
@@ -290,6 +292,9 @@ class AccountPool:
         if isinstance(error, (UpstreamAuthError, UpstreamVmDisabled)):
             acc.status = AccountStatus.INVALID
             log.warning("account %s marked invalid: %s", acc.id, error)
+        elif isinstance(error, UpstreamVideoLocked):
+            acc.status = AccountStatus.VIDEO_LOCKED
+            log.warning("account %s marked video_locked: %s", acc.id, error)
         elif isinstance(error, UpstreamQuotaError):
             acc.status = AccountStatus.COOLING
             acc.cooldown_until = time.time() + max(self.cooldown, 3600)

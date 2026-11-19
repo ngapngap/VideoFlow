@@ -108,6 +108,10 @@ class MuseDriver(ABC):
     def prewarm(self, account: Account) -> None:  # noqa: B027
         """Start getting ``account`` ready for its first request in the background."""
 
+    def is_account_busy(self, account_id: str) -> bool:
+        """True if the driver is currently executing an operation for this account."""
+        return False
+
     async def health(self) -> dict[str, Any]:
         return {"driver": self.name, "ok": True}
 

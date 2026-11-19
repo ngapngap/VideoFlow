@@ -25,6 +25,31 @@ pub const HEADER: [&str; 10] = [
     "ghi_chu_loi",     // J (mặc định khi tạo mới; khi đọc chấp nhận tên cột cũ / trống)
 ];
 
+/// Kiểm tra xem tên cột có phải là cột nối cảnh hay không (hỗ trợ các biến thể hoa/thường, có/không dấu, gạch dưới/dấu cách).
+pub fn is_noi_canh_header(header: &str) -> bool {
+    let s = header.trim().to_lowercase();
+    matches!(
+        s.as_str(),
+        "noi_canh"
+            | "noi canh"
+            | "noicanh"
+            | "noi-canh"
+            | "nối cảnh"
+            | "nối_cảnh"
+            | "nối-cảnh"
+            | "nốicanh"
+    )
+}
+
+/// Parse giá trị chuỗi thành boolean nối cảnh (1/0, true/false, yes/no, có/không).
+pub fn parse_noi_canh_value(val: &str) -> bool {
+    let s = val.trim().to_lowercase();
+    match s.as_str() {
+        "1" | "true" | "yes" | "y" | "on" | "có" | "co" => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub row_no: usize, // số dòng vật lý trong file (1 = header)
@@ -38,9 +63,13 @@ pub struct Row {
     pub ngay_tao_video: String,
     pub trang_thai: String,
     pub ghi_chu_loi: String,
+    /// Cột tùy chọn nối cảnh liên tục từ frame cuối video trước (P2-1)
+    pub noi_canh: bool,
     /// Các cột phụ sau cột J (nếu người dùng xuất từ bảng có thêm cột K, L...)
     pub extra_columns: Vec<String>,
 }
+
+pub type PromptRow = Row;
 
 impl Row {
     /// Trạng thái chuẩn hóa theo 4.1: trống = "Đang chờ"
@@ -51,6 +80,7 @@ impl Row {
             "Đã tạo video" => RowStatus::DaTaoVideo,
             "Lỗi tạo image" => RowStatus::LoiImage,
             "Lỗi tạo video" => RowStatus::LoiVideo,
+            "Lỗi tạm thời" => RowStatus::LoiTamThoi,
             _ => RowStatus::Cho, // giá trị lạ coi như Đang chờ, ghi log ở tầng trên
         }
     }
@@ -97,6 +127,7 @@ pub enum RowStatus {
     DaTaoVideo,
     LoiImage,
     LoiVideo,
+    LoiTamThoi,
 }
 
 /// Kiểm tra tên file ảnh tham chiếu hợp lệ:
@@ -313,6 +344,7 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
     }
 
     let header_len = headers.len();
+    let noi_canh_col_idx: Option<usize> = headers.iter().position(|h| is_noi_canh_header(h));
     let mut rows = Vec::new();
     for (idx, rec) in record_iter.records().enumerate() {
         let row_no = idx + 2;
@@ -329,6 +361,12 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
             extra_columns.push(rec.get(col_idx).unwrap_or("").to_string());
         }
 
+        let noi_canh = if let Some(nc_idx) = noi_canh_col_idx {
+            parse_noi_canh_value(rec.get(nc_idx).unwrap_or(""))
+        } else {
+            false
+        };
+
         rows.push(Row {
             row_no,
             anh_tham_chieu: get(0),
@@ -341,6 +379,7 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
             ngay_tao_video: get(7),
             trang_thai: get(8),
             ghi_chu_loi: get(9),
+            noi_canh,
             extra_columns,
         });
     }
@@ -354,16 +393,29 @@ fn write_all_unlocked(csv_path: &Path, rows: &[Row]) -> AppResult<()> {
 
     let max_extra = rows.iter().map(|r| r.extra_columns.len()).max().unwrap_or(0);
     let mut header_row: Vec<String> = HEADER.iter().map(|s| (*s).to_string()).collect();
-    if let Some(existing) = read_existing_headers_unlocked(csv_path) {
+    let existing_headers = read_existing_headers_unlocked(csv_path);
+    let mut nc_col_idx: Option<usize> = None;
+
+    if let Some(existing) = existing_headers {
         if let Some(col_j) = existing.get(9) {
             if !col_j.trim().is_empty() {
                 header_row[9] = col_j.clone();
             }
         }
-        for extra_h in existing.into_iter().skip(10) {
+        for (i, extra_h) in existing.into_iter().skip(10).enumerate() {
+            if is_noi_canh_header(&extra_h) {
+                nc_col_idx = Some(10 + i);
+            }
             header_row.push(extra_h);
         }
     }
+
+    let any_noi_canh = rows.iter().any(|r| r.noi_canh);
+    if nc_col_idx.is_none() && any_noi_canh {
+        nc_col_idx = Some(header_row.len());
+        header_row.push("noi_canh".to_string());
+    }
+
     while header_row.len() < 10 + max_extra {
         header_row.push(format!("cot_phu_{}", header_row.len() + 1));
     }
@@ -380,7 +432,13 @@ fn write_all_unlocked(csv_path: &Path, rows: &[Row]) -> AppResult<()> {
         let write_result = (|| -> Result<(), csv::Error> {
             wtr.write_record(&header_row)?;
             for r in rows {
-                wtr.write_record(r.to_cells(total_cols))?;
+                let mut cells = r.to_cells(total_cols);
+                if let Some(nc_idx) = nc_col_idx {
+                    if nc_idx < cells.len() {
+                        cells[nc_idx] = if r.noi_canh { "1".to_string() } else { "0".to_string() };
+                    }
+                }
+                wtr.write_record(&cells)?;
             }
             wtr.flush()?;
             Ok(())
@@ -942,6 +1000,95 @@ mod tests {
             !tmp.exists(),
             "temporary .videoflow_tmp file must be cleaned up"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_noi_canh_header_variants_and_value_parsing() {
+        assert!(is_noi_canh_header("noi_canh"));
+        assert!(is_noi_canh_header("NOI_CANH"));
+        assert!(is_noi_canh_header("noi canh"));
+        assert!(is_noi_canh_header("nối cảnh"));
+        assert!(is_noi_canh_header("Nối Cảnh"));
+        assert!(is_noi_canh_header("nối_cảnh"));
+        assert!(is_noi_canh_header("noicanh"));
+        assert!(is_noi_canh_header("noi-canh"));
+        assert!(!is_noi_canh_header("ghi_chu_loi"));
+        assert!(!is_noi_canh_header("other_col"));
+
+        // True values
+        assert!(parse_noi_canh_value("1"));
+        assert!(parse_noi_canh_value("true"));
+        assert!(parse_noi_canh_value("True"));
+        assert!(parse_noi_canh_value("TRUE"));
+        assert!(parse_noi_canh_value("yes"));
+        assert!(parse_noi_canh_value("YES"));
+        assert!(parse_noi_canh_value("y"));
+        assert!(parse_noi_canh_value("có"));
+        assert!(parse_noi_canh_value("CÓ"));
+        assert!(parse_noi_canh_value("co"));
+        assert!(parse_noi_canh_value("on"));
+
+        // False values
+        assert!(!parse_noi_canh_value("0"));
+        assert!(!parse_noi_canh_value("false"));
+        assert!(!parse_noi_canh_value("False"));
+        assert!(!parse_noi_canh_value("no"));
+        assert!(!parse_noi_canh_value("không"));
+        assert!(!parse_noi_canh_value("khong"));
+        assert!(!parse_noi_canh_value(""));
+        assert!(!parse_noi_canh_value("   "));
+        assert!(!parse_noi_canh_value("invalid_val"));
+    }
+
+    #[test]
+    fn test_parse_csv_without_noi_canh_column_defaults_to_false() {
+        let dir = temp_dir("no_nc");
+        let csv_p = dir.join("prompts.csv");
+        let body = format!(
+            "{}\r\ncat.png,p1,v1,,,,,,,\r\ndog.png,p2,v2,,,,,,,\r\n",
+            HEADER.join(",")
+        );
+        fs::write(&csv_p, body.as_bytes()).expect("write csv");
+        let rows = read_all(&csv_p).expect("read csv");
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].noi_canh);
+        assert!(!rows[1].noi_canh);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_csv_with_noi_canh_column_and_roundtrip() {
+        let dir = temp_dir("with_nc");
+        let csv_p = dir.join("prompts.csv");
+        // Test with Vietnamese header "nối cảnh"
+        let header = format!("{},nối cảnh", HEADER.join(","));
+        let body = format!(
+            "{header}\r\nscene1.png,p1,v1,,,,,,,,0\r\nscene2.png,p2,v2,,,,,,,,1\r\nscene3.png,p3,v3,,,,,,,,true\r\nscene4.png,p4,v4,,,,,,,,có\r\nscene5.png,p5,v5,,,,,,,,no\r\n"
+        );
+        fs::write(&csv_p, body.as_bytes()).expect("write csv");
+
+        let rows = read_all(&csv_p).expect("read csv");
+        assert_eq!(rows.len(), 5);
+        assert!(!rows[0].noi_canh, "scene1 must be false (0)");
+        assert!(rows[1].noi_canh, "scene2 must be true (1)");
+        assert!(rows[2].noi_canh, "scene3 must be true (true)");
+        assert!(rows[3].noi_canh, "scene4 must be true (có)");
+        assert!(!rows[4].noi_canh, "scene5 must be false (no)");
+
+        // Modify a row and write back
+        let mut modified = rows.clone();
+        modified[0].noi_canh = true;
+        write_all(&csv_p, &modified).expect("write modified");
+
+        let reread = read_all(&csv_p).expect("reread");
+        assert_eq!(reread.len(), 5);
+        assert!(reread[0].noi_canh, "scene1 now true after update");
+        assert!(reread[1].noi_canh, "scene2 still true");
+        assert!(reread[2].noi_canh, "scene3 still true");
+        assert!(reread[3].noi_canh, "scene4 still true");
+        assert!(!reread[4].noi_canh, "scene5 still false");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -296,6 +296,11 @@ textarea:disabled {
   background: var(--c-danger-bg);
   color: var(--c-danger);
 }
+.badge-loi-tam-thoi {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-dark);
+  border: 1px solid #f4d39b;
+}
 .badge-bo-qua {
   background: #f1f4f6;
   color: #60707c;
@@ -305,6 +310,11 @@ textarea:disabled {
   background: var(--c-warn-bg);
   color: var(--c-warn-dark);
   border: 1px solid #f4d39b;
+}
+.badge-noi-canh {
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
 }
 .badge-soon {
   height: 20px;

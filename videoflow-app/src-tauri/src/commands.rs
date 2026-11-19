@@ -150,6 +150,7 @@ pub struct RowSummary {
     pub last_error: Option<String>,
     pub row_no: usize,
     pub prompt_modified: bool,
+    pub noi_canh: bool,
 }
 
 #[derive(Serialize)]
@@ -161,7 +162,7 @@ pub struct RowPage {
     pub status_counts: HashMap<String, usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct TimelineEntry {
     pub ts: String,
     pub step: String,
@@ -173,7 +174,7 @@ pub struct TimelineEntry {
     pub duration_ms: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FileRef {
     pub kind: String,
     pub file_name: String,
@@ -185,7 +186,7 @@ pub struct FileRef {
     pub created_at: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct RowDetail {
     pub row: RowSummary,
     pub prompt_image: String,
@@ -196,6 +197,9 @@ pub struct RowDetail {
     pub video_abs_path: Option<String>,
     pub timeline: Vec<TimelineEntry>,
     pub files: Vec<FileRef>,
+    pub video_duration: Option<f64>,
+    pub video_resolution: Option<String>,
+    pub account_used: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -680,6 +684,7 @@ pub fn get_rows(
             last_error,
             row_no: r.row_no,
             prompt_modified,
+            noi_canh: r.noi_canh,
         });
     }
 
@@ -721,6 +726,121 @@ pub fn get_rows(
         page_count,
         status_counts,
     })
+}
+
+/// Đọc nhanh metadata cơ bản (thời lượng giây, độ phân giải width x height) từ file MP4 nếu có.
+/// Hoạt động an toàn, fail-safe (trả về (None, None) nếu file không hợp lệ hoặc không phải MP4).
+pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (None, None);
+    };
+
+    let Ok(meta) = f.metadata() else {
+        return (None, None);
+    };
+    let file_len = meta.len();
+    if file_len < 8 {
+        return (None, None);
+    }
+
+    let mut duration_sec: Option<f64> = None;
+    let mut resolution: Option<String> = None;
+
+    fn scan_boxes<R: Read + Seek>(
+        reader: &mut R,
+        start_offset: u64,
+        max_len: u64,
+        duration_out: &mut Option<f64>,
+        res_out: &mut Option<String>,
+        depth: usize,
+    ) {
+        if depth > 5 {
+            return;
+        }
+        let mut cur = start_offset;
+        while cur + 8 <= start_offset + max_len {
+            if reader.seek(SeekFrom::Start(cur)).is_err() {
+                break;
+            }
+            let mut header = [0u8; 8];
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            let size32 = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+            let tag = &header[4..8];
+
+            let (box_size, header_size) = if size32 == 1 {
+                let mut ext = [0u8; 8];
+                if reader.read_exact(&mut ext).is_err() {
+                    break;
+                }
+                (u64::from_be_bytes(ext), 16u64)
+            } else if size32 == 0 {
+                (max_len.saturating_sub(cur - start_offset), 8u64)
+            } else {
+                (size32, 8u64)
+            };
+
+            if box_size < header_size || cur + box_size > start_offset + max_len {
+                break;
+            }
+
+            let payload_offset = cur + header_size;
+            let payload_len = box_size - header_size;
+
+            if tag == b"moov" || tag == b"trak" {
+                scan_boxes(reader, payload_offset, payload_len, duration_out, res_out, depth + 1);
+            } else if tag == b"mvhd" && duration_out.is_none() && payload_len >= 20 {
+                if reader.seek(SeekFrom::Start(payload_offset)).is_ok() {
+                    let mut buf = [0u8; 32];
+                    let read_len = buf.len().min(payload_len as usize);
+                    if reader.read_exact(&mut buf[..read_len]).is_ok() {
+                        let version = buf[0];
+                        if version == 0 && read_len >= 20 {
+                            let timescale = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]) as f64;
+                            let duration = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as f64;
+                            if timescale > 0.0 {
+                                *duration_out = Some(duration / timescale);
+                            }
+                        } else if version == 1 && read_len >= 28 {
+                            let timescale = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as f64;
+                            let duration = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]) as f64;
+                            if timescale > 0.0 {
+                                *duration_out = Some(duration / timescale);
+                            }
+                        }
+                    }
+                }
+            } else if tag == b"tkhd" && res_out.is_none() && payload_len >= 80 {
+                if reader.seek(SeekFrom::Start(payload_offset)).is_ok() {
+                    let mut buf = [0u8; 96];
+                    let read_len = buf.len().min(payload_len as usize);
+                    if reader.read_exact(&mut buf[..read_len]).is_ok() {
+                        let version = buf[0];
+                        let offset = if version == 0 { 76 } else { 88 };
+                        if read_len >= offset + 8 {
+                            let w = u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]) >> 16;
+                            let h = u32::from_be_bytes([buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]]) >> 16;
+                            if w > 0 && h > 0 {
+                                *res_out = Some(format!("{w}x{h}"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if duration_out.is_some() && res_out.is_some() {
+                break;
+            }
+
+            cur += box_size;
+        }
+    }
+
+    scan_boxes(&mut f, 0, file_len, &mut duration_sec, &mut resolution, 0);
+
+    (duration_sec, resolution)
 }
 
 pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
@@ -874,6 +994,39 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         }
     }
 
+    // Đọc thông tin tài khoản đã sử dụng (UI-3)
+    let mut account_used = None;
+    let acc_file = crate::settings::app_data_dir()
+        .join(crate::muse_sidecar::MUSE_DATA_DIR)
+        .join("accounts.json");
+    if let Ok(content) = std::fs::read_to_string(&acc_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(arr) = val.as_array() {
+                if let Some(acc) = arr
+                    .iter()
+                    .find(|a| a.get("status").and_then(|s| s.as_str()) == Some("active"))
+                    .or_else(|| arr.first())
+                {
+                    let id = acc.get("id").and_then(|s| s.as_str()).unwrap_or("");
+                    let label = acc.get("label").and_then(|s| s.as_str()).unwrap_or("");
+                    if !label.is_empty() && !id.is_empty() && label != id {
+                        account_used = Some(format!("{label} ({id})"));
+                    } else if !label.is_empty() {
+                        account_used = Some(label.to_string());
+                    } else if !id.is_empty() {
+                        account_used = Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let (video_duration, video_resolution) = if let Some(ref vpath) = video_abs_path {
+        probe_mp4_metadata(Path::new(vpath))
+    } else {
+        (None, None)
+    };
+
     Ok(RowDetail {
         row: RowSummary {
             row_key: actual_key.clone(),
@@ -885,6 +1038,7 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
             last_error,
             row_no: row.row_no,
             prompt_modified,
+            noi_canh: row.noi_canh,
         },
         prompt_image: row.promt_tao_image.clone(),
         prompt_video: row.promt_tao_video.clone(),
@@ -894,6 +1048,9 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         video_abs_path,
         timeline,
         files,
+        video_duration,
+        video_resolution,
+        account_used,
     })
 }
 
@@ -1188,7 +1345,7 @@ pub fn start_run(
 pub fn run_row(row_key: String, app: AppHandle, state: State<'_, AppState>) -> AppResult<i64> {
     ensure_not_running(&state)?;
     let p = project_path(&state)?;
-    let cfg = state.settings_cache.read().clone();
+    let _cfg = state.settings_cache.read().clone();
     let rows = prompts_csv::read_all(&p.join("prompts.csv"))?;
     let row = prompts_csv::find_row_by_key(&rows, &row_key)
         .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
@@ -1206,17 +1363,6 @@ pub fn run_row(row_key: String, app: AppHandle, state: State<'_, AppState>) -> A
                     "Dòng này đang ở trạng thái Bỏ qua — hãy bấm 'Đặt lại trạng thái về Đang chờ' trước khi chạy.",
                 ));
             }
-            if !engine::is_prompt_modified(row, Some(&prev))
-                && prev.attempts_count >= cfg.max_attempts as i64
-            {
-                return Err(AppError::new(
-                    "MAX_ATTEMPTS_REACHED",
-                    format!(
-                        "Dòng này đã dừng sau {}/{} lần thử lỗi — hãy sửa prompt hoặc bấm 'Đặt lại trạng thái về Đang chờ'.",
-                        prev.attempts_count, cfg.max_attempts
-                    ),
-                ));
-            }
         }
     }
 
@@ -1225,7 +1371,7 @@ pub fn run_row(row_key: String, app: AppHandle, state: State<'_, AppState>) -> A
         &state,
         EngineConfig {
             kind: "rieng",
-            row_keys: vec![row.anh_tham_chieu.clone()],
+            row_keys: vec![key_of_row],
             force_step: None,
             reset_error_attempts: false,
         },
@@ -1297,7 +1443,7 @@ pub fn rerun_row_step(
         &state,
         EngineConfig {
             kind: "lam_lai",
-            row_keys: vec![row.anh_tham_chieu.clone()],
+            row_keys: vec![key_of_row],
             force_step: Some(forced),
             reset_error_attempts: false,
         },
@@ -1385,7 +1531,7 @@ fn ensure_seed_run_id(conn: &rusqlite::Connection) -> AppResult<i64> {
 pub fn reset_row_status_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE jobs
          SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
              image_prompt_hash = NULL, video_prompt_hash = NULL,
@@ -1395,6 +1541,25 @@ pub fn reset_row_status_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         rusqlite::params![row_key],
     )
     .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    if updated == 0 {
+        if let Ok(rows) = prompts_csv::read_all(&p.join("prompts.csv")) {
+            if let Some(row) = prompts_csv::find_row_by_key(&rows, row_key) {
+                let legacy_key = row.anh_tham_chieu.trim();
+                if !legacy_key.is_empty() && !legacy_key.eq_ignore_ascii_case(row_key) {
+                    let _ = conn.execute(
+                        "UPDATE jobs
+                         SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
+                             image_prompt_hash = NULL, video_prompt_hash = NULL,
+                             video_task_id = NULL, video_download_url = NULL,
+                             attempts_count = 0, last_error = NULL
+                         WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
+                        rusqlite::params![legacy_key],
+                    );
+                }
+            }
+        }
+    }
 
     prompts_csv::update_row(&p.join("prompts.csv"), row_key, |r| {
         r.trang_thai = "Đang chờ".into();
@@ -1986,6 +2151,7 @@ pub async fn muse_update_account(
     account_id: String,
     enabled: Option<bool>,
     label: Option<String>,
+    proxy: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
@@ -1998,11 +2164,44 @@ pub async fn muse_update_account(
         if let Some(l) = label {
             body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
         }
+        if let Some(p) = proxy {
+            body.insert("proxy".into(), serde_json::Value::String(p.trim().to_string()));
+        }
         let path = format!(
             "/admin/accounts/{}",
             muse_sanitize_id(&account_id)?
         );
         crate::muse_sidecar::admin_send(port, &key, "PATCH", &path, Some(&serde_json::Value::Object(body)))
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_open_login(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let safe_id = muse_sanitize_id(&account_id)?;
+        crate::muse_sidecar::open_login(port, &key, &safe_id)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_open_view(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let safe_id = muse_sanitize_id(&account_id)?;
+        crate::muse_sidecar::open_view(port, &key, &safe_id)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2463,6 +2662,7 @@ pub fn get_run_detail_at(p: &Path, run_id: i64) -> AppResult<(RunSummary, Vec<Ro
                 image_file: r.get(5)?,
                 video_file: r.get(6)?,
                 prompt_modified: false,
+                noi_canh: false,
             })
         }) {
             for item in it.flatten() {
@@ -3162,6 +3362,89 @@ mod tests {
         let exported_text = String::from_utf8(std::fs::read(&out_csv).unwrap()).unwrap();
         assert!(exported_text.contains("lam_lai"));
         assert!(!exported_text.contains(",chung,"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ui3_probe_mp4_metadata_and_row_detail_fields() {
+        let dir = temp_proj("ui3_video_detail");
+        let non_exist = dir.join("missing.mp4");
+        let (d_none, r_none) = probe_mp4_metadata(&non_exist);
+        assert!(d_none.is_none());
+        assert!(r_none.is_none());
+
+        // Tạo mock MP4 file với mvhd (timescale=1000, duration=5000) và tkhd (720x1280)
+        let mut mp4_bytes = Vec::new();
+        // 1. ftyp box (20 bytes)
+        mp4_bytes.extend_from_slice(&20u32.to_be_bytes());
+        mp4_bytes.extend_from_slice(b"ftypisom");
+        mp4_bytes.extend_from_slice(&1u32.to_be_bytes());
+        mp4_bytes.extend_from_slice(b"isom");
+
+        // 2. mvhd box (108 bytes)
+        let mut mvhd_bytes = Vec::new();
+        mvhd_bytes.extend_from_slice(&108u32.to_be_bytes());
+        mvhd_bytes.extend_from_slice(b"mvhd");
+        mvhd_bytes.push(0); // version 0
+        mvhd_bytes.extend_from_slice(&[0, 0, 0]); // flags
+        mvhd_bytes.extend_from_slice(&0u32.to_be_bytes()); // create_time
+        mvhd_bytes.extend_from_slice(&0u32.to_be_bytes()); // mod_time
+        mvhd_bytes.extend_from_slice(&1000u32.to_be_bytes()); // timescale = 1000
+        mvhd_bytes.extend_from_slice(&5000u32.to_be_bytes()); // duration = 5000 (5.0s)
+        mvhd_bytes.resize(108, 0); // pad rest of mvhd
+
+        // 3. tkhd box (92 bytes)
+        let mut tkhd_bytes = Vec::new();
+        tkhd_bytes.extend_from_slice(&92u32.to_be_bytes());
+        tkhd_bytes.extend_from_slice(b"tkhd");
+        tkhd_bytes.push(0); // version 0
+        tkhd_bytes.extend_from_slice(&[0, 0, 7]); // flags
+        tkhd_bytes.resize(84, 0);
+        tkhd_bytes.extend_from_slice(&(720u32 << 16).to_be_bytes()); // width = 720
+        tkhd_bytes.extend_from_slice(&(1280u32 << 16).to_be_bytes()); // height = 1280
+        assert_eq!(tkhd_bytes.len(), 92);
+
+        // 4. trak box wrap tkhd
+        let trak_size = (8 + tkhd_bytes.len()) as u32;
+        let mut trak_bytes = Vec::new();
+        trak_bytes.extend_from_slice(&trak_size.to_be_bytes());
+        trak_bytes.extend_from_slice(b"trak");
+        trak_bytes.extend_from_slice(&tkhd_bytes);
+
+        // 5. moov box wrap mvhd + trak
+        let moov_size = (8 + mvhd_bytes.len() + trak_bytes.len()) as u32;
+        let mut moov_bytes = Vec::new();
+        moov_bytes.extend_from_slice(&moov_size.to_be_bytes());
+        moov_bytes.extend_from_slice(b"moov");
+        moov_bytes.extend_from_slice(&mvhd_bytes);
+        moov_bytes.extend_from_slice(&trak_bytes);
+
+        mp4_bytes.extend_from_slice(&moov_bytes);
+
+        let video_file = dir.join("video_out").join("test_sample.mp4");
+        std::fs::write(&video_file, &mp4_bytes).unwrap();
+
+        let (duration, resolution) = probe_mp4_metadata(&video_file);
+        assert_eq!(duration, Some(5.0));
+        assert_eq!(resolution, Some("720x1280".to_string()));
+
+        // Thiết lập dự án và gọi build_row_detail_at
+        let csv_path = dir.join("prompts.csv");
+        std::fs::write(
+            &csv_path,
+            "anh_tham_chieu,promt_tao_image,promt_tao_video,anh_da_tao,video_da_tao,ngay_tao_idea,ngay_tao_anh,ngay_tao_video,trang_thai,ghi_chu_loi\n\
+             test.png,prompt_img,prompt_vid,test_gen.png,test_sample.mp4,2026-11-20,2026-11-20,2026-11-20,Đã tạo video,\n",
+        )
+        .unwrap();
+
+        let detail = build_row_detail_at(&dir, "test.png").unwrap();
+        assert_eq!(detail.row.image_name, "test.png");
+        assert_eq!(detail.row.video_file, "test_sample.mp4");
+        assert_eq!(detail.prompt_image, "prompt_img");
+        assert_eq!(detail.prompt_video, "prompt_vid");
+        assert_eq!(detail.video_duration, Some(5.0));
+        assert_eq!(detail.video_resolution, Some("720x1280".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

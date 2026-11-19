@@ -212,6 +212,42 @@ impl ApiFail {
             };
         }
 
+        // Upstream từ chối do vi phạm chính sách / nội dung (muse2api trả 502 code `upstream_refused`):
+        // retry vô nghĩa — xếp NghiepVu để dừng ngay, không retry 3 lần làm kẹt 7.5 phút ([P0-7]).
+        if err_code_json == "upstream_refused"
+            || combined_low.contains("upstream_refused")
+            || combined_low.contains("content policy")
+            || combined_low.contains("policy violation")
+            || combined_low.contains("vi phạm chính sách")
+        {
+            return Self {
+                kind: ApiFailKind::NghiepVu,
+                http_status: Some(status),
+                code: "UPSTREAM_REFUSED".into(),
+                message: format!("Yêu cầu bị từ chối do vi phạm chính sách/nội dung (HTTP {status}): {msg}"),
+            };
+        }
+
+        // Muse khóa tính năng tạo video (muse2api trả code `upstream_video_locked` hoặc `video_locked`):
+        // retry vô nghĩa — xếp NghiepVu để dừng ngay ([P1-4]).
+        if err_code_json == "upstream_video_locked"
+            || err_code_json == "video_locked"
+            || combined_low.contains("upstream_video_locked")
+            || combined_low.contains("video_locked")
+            || combined_low.contains("tính năng tạo video không khả dụng")
+            || combined_low.contains("video không khả dụng")
+            || combined_low.contains("không thể tạo video")
+            || combined_low.contains("video generation is not available")
+            || combined_low.contains("unable to generate video")
+        {
+            return Self {
+                kind: ApiFailKind::NghiepVu,
+                http_status: Some(status),
+                code: "VIDEO_LOCKED".into(),
+                message: format!("Tính năng tạo video bị khóa trên tài khoản (HTTP {status}): {msg}"),
+            };
+        }
+
         let retry_after_s = headers
             .and_then(|h| h.get("retry-after"))
             .and_then(|v| v.to_str().ok())
@@ -690,6 +726,40 @@ pub fn classify_poll_task_failure(json: &Value) -> PollOutcome {
             message: format!("Pool muse2api chưa có account khả dụng: {msg}"),
             kind: ApiFailKind::TamThoi { retry_after_s: None },
             code: "TASK_TRANSIENT_ERROR".into(),
+        };
+    }
+
+    // Upstream từ chối do vi phạm chính sách / nội dung (muse2api trả code `upstream_refused`):
+    // retry vô nghĩa — xếp NghiepVu để dừng ngay, không retry 3 lần làm kẹt 7.5 phút ([P0-7]).
+    if raw_code == "upstream_refused"
+        || combined_low.contains("upstream_refused")
+        || combined_low.contains("content policy")
+        || combined_low.contains("policy violation")
+        || combined_low.contains("vi phạm chính sách")
+    {
+        return PollOutcome::Loi {
+            message: format!("Yêu cầu bị từ chối do vi phạm chính sách/nội dung: {msg}"),
+            kind: ApiFailKind::NghiepVu,
+            code: "UPSTREAM_REFUSED".into(),
+        };
+    }
+
+    // Muse khóa tính năng tạo video (muse2api trả code `upstream_video_locked` hoặc `video_locked`):
+    // retry vô nghĩa — xếp NghiepVu để dừng ngay ([P1-4]).
+    if raw_code == "upstream_video_locked"
+        || raw_code == "video_locked"
+        || combined_low.contains("upstream_video_locked")
+        || combined_low.contains("video_locked")
+        || combined_low.contains("tính năng tạo video không khả dụng")
+        || combined_low.contains("video không khả dụng")
+        || combined_low.contains("không thể tạo video")
+        || combined_low.contains("video generation is not available")
+        || combined_low.contains("unable to generate video")
+    {
+        return PollOutcome::Loi {
+            message: format!("Tính năng tạo video bị khóa trên tài khoản: {msg}"),
+            kind: ApiFailKind::NghiepVu,
+            code: "VIDEO_LOCKED".into(),
         };
     }
 
@@ -1369,6 +1439,104 @@ mod tests {
             r#"{"error":{"message":"muse.ai disconnected this account's workspace (vm_state=DISABLED)"}}"#,
         );
         assert_eq!(f2.kind, ApiFailKind::NghiepVu);
+    }
+
+    #[test]
+    fn test_upstream_refused_classification_khong_retry() {
+        // [P0-7]: UpstreamRefused (502) với error code "upstream_refused" phải là NghiepVu
+        let f1 = ApiFail::classify_http(
+            502,
+            None,
+            r#"{"error":{"code":"upstream_refused","message":"Upstream answered but did not produce what was asked"}}"#,
+        );
+        assert_eq!(f1.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f1.code, "UPSTREAM_REFUSED");
+
+        // [P0-7]: 502 với text content policy / policy violation / vi phạm chính sách trong body
+        let f2 = ApiFail::classify_http(
+            502,
+            None,
+            r#"{"detail":"Generation blocked due to content policy violation"}"#,
+        );
+        assert_eq!(f2.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f2.code, "UPSTREAM_REFUSED");
+
+        // [P0-7]: Poll outcome failure với code "upstream_refused"
+        let p1 = classify_poll_task_failure(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "code": "upstream_refused",
+                "message": "Prompt vi phạm chính sách cộng đồng"
+            }
+        }));
+        match p1 {
+            PollOutcome::Loi { kind, code, message } => {
+                assert_eq!(kind, ApiFailKind::NghiepVu);
+                assert_eq!(code, "UPSTREAM_REFUSED");
+                assert!(message.contains("vi phạm chính sách"));
+            }
+            other => panic!("expected Loi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_video_locked_classification_khong_retry() {
+        // [P1-4]: HTTP error với code upstream_video_locked hoặc message
+        let f1 = ApiFail::classify_http(
+            403,
+            None,
+            r#"{"error":{"code":"upstream_video_locked","message":"muse.ai reports video generation is locked"}}"#,
+        );
+        assert_eq!(f1.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f1.code, "VIDEO_LOCKED");
+
+        let f2 = ApiFail::classify_http(
+            502,
+            None,
+            r#"{"error":{"code":"upstream_error","message":"Tính năng tạo video không khả dụng trên tài khoản"}}"#,
+        );
+        assert_eq!(f2.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f2.code, "VIDEO_LOCKED");
+
+        let f3 = ApiFail::classify_http(
+            502,
+            None,
+            r#"{"error":{"message":"video generation is not available for this account"}}"#,
+        );
+        assert_eq!(f3.kind, ApiFailKind::NghiepVu);
+        assert_eq!(f3.code, "VIDEO_LOCKED");
+
+        // [P1-4]: Async poll task failure với code upstream_video_locked
+        let p1 = classify_poll_task_failure(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "code": "upstream_video_locked",
+                "message": "muse.ai reports video generation is locked"
+            }
+        }));
+        match p1 {
+            PollOutcome::Loi { kind, code, message } => {
+                assert_eq!(kind, ApiFailKind::NghiepVu);
+                assert_eq!(code, "VIDEO_LOCKED");
+                assert!(message.contains("khóa trên tài khoản"));
+            }
+            other => panic!("expected Loi, got {other:?}"),
+        }
+
+        let p2 = classify_poll_task_failure(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "message": "Không thể tạo video vào lúc này"
+            }
+        }));
+        match p2 {
+            PollOutcome::Loi { kind, code, message } => {
+                assert_eq!(kind, ApiFailKind::NghiepVu);
+                assert_eq!(code, "VIDEO_LOCKED");
+                assert!(message.contains("Không thể tạo video"));
+            }
+            other => panic!("expected Loi, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 <script lang="ts">
   // Màn hình Cài đặt (6.6, 6.6b): 5 tab, 100% tùy chọn hoạt động thật, kiểm tra hợp lệ nghiêm ngặt, 0 A11y warnings
-  import { onDestroy, onMount } from "svelte";
+  import { createEventDispatcher, onDestroy, onMount } from "svelte";
+  const dispatch = createEventDispatcher<{ navigate: string }>();
   import {
     confirmStartEnabled,
     endpointStatus,
@@ -67,23 +68,7 @@
   let museStatus: import("../lib/api").MuseStatusView | null = null;
   let museAccounts: MuseAccount[] = [];
   let museLoading = false;
-  let museActionBusy = false;
   let museErr = "";
-
-  // Form thêm cookie: 3 ô = 3 cookie muse.ai (2 ô đầu bắt buộc, hatch_vml tùy chọn)
-  let museNewLabel = "";
-  let museCookieSess = ""; // hatch_sess (bắt buộc)
-  let museCookieDevice = ""; // hatch_native_auth_device (bắt buộc)
-  let museCookieVml = ""; // hatch_vml (tùy chọn)
-  let museAllowDup = false;
-  let museAddBusy = false;
-  let museAddErr = "";
-  let museDupPending = false; // lần bấm đầu trùng → hiện cảnh báo, lần 2 + allowDuplicate
-
-  // Quota đang refresh từng account (loading trên nút)
-  let museQuotaBusyId = "";
-  let museQuotaErr: Record<string, string> = {};
-
   let museSidecarBusy = false;
 
   async function museRefresh() {
@@ -165,76 +150,6 @@
     }
   }
 
-  /** Trạng thái hiển thị của account (theo accState của dashboard muse2api) */
-  function museAccState(a: MuseAccount): { key: string; label: string; cls: string } {
-    const now = Date.now() / 1000;
-    const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
-      a.last_error || ""
-    );
-    if (!a.enabled) return { key: "disabled", label: "Tắt", cls: "mute" };
-    if (a.status === "invalid") return { key: "invalid", label: "Lỗi phiên", cls: "err" };
-    if (a.status === "cooling" && a.cooldown_until > now) {
-      return isQuota
-        ? { key: "quota", label: "Hết hạn mức", cls: "warn" }
-        : { key: "cooling", label: "Tạm chờ", cls: "info" };
-    }
-    return { key: "active", label: "Hoạt động", cls: "ok" };
-  }
-
-  /** Sắp xếp: lỗi trước, rồi theo label — như renderAccounts của muse2api */
-  function museSortedAccounts(list: MuseAccount[]): MuseAccount[] {
-    const order: Record<string, number> = {
-      quota: 0,
-      invalid: 1,
-      cooling: 2,
-      active: 3,
-      disabled: 4,
-    };
-    return [...list].sort(
-      (a, b) =>
-        (order[museAccState(a).key] ?? 9) - (order[museAccState(b).key] ?? 9) ||
-        (a.label || a.id).localeCompare(b.label || b.id)
-    );
-  }
-
-  $: museCounts = (() => {
-    const c: Record<string, number> = {
-      active: 0,
-      quota: 0,
-      cooling: 0,
-      invalid: 0,
-      disabled: 0,
-    };
-    for (const a of museAccounts) c[museAccState(a).key] += 1;
-    return c;
-  })();
-
-  /** % đã dùng cho bar: ưu tiên weekly_used_pct, fallback tính từ dạng đếm */
-  function museQuotaPct(q: MuseQuotaSnapshot | undefined): number | null {
-    if (!q) return null;
-    if (q.weekly_used_pct != null) return q.weekly_used_pct;
-    if (q.messages_used != null && q.messages_limit) {
-      return Math.round((q.messages_used / q.messages_limit) * 100);
-    }
-    return null;
-  }
-
-  function museQuotaBarClass(pct: number | null): string {
-    if (pct == null) return "";
-    if (pct >= 100) return "full";
-    if (pct >= 80) return "high";
-    return "";
-  }
-
-  function museTimeAgo(ts: number | undefined): string {
-    if (!ts) return "";
-    const diff = Date.now() / 1000 - ts;
-    if (diff < 60) return "vừa xong";
-    if (diff < 3600) return `${Math.floor(diff / 60)} phút trước`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)} giờ trước`;
-    return `${Math.floor(diff / 86400)} ngày trước`;
-  }
-
   /** Các trường cấu hình engine đã đổi so với lúc spawn (dùng cho banner cảnh báo). */
   function museChangedFields(): string[] {
     const st = museStatus?.sidecar;
@@ -261,143 +176,6 @@
       out.push(s.muse_headless ? "bật headless" : "tắt headless");
     }
     return out;
-  }
-
-  function museCookieExpiry(a: MuseAccount): { txt: string; cls: string } | null {
-    const exp = a.cookie_expires;
-    if (!exp || Object.keys(exp).length === 0) return null;
-    const ts =
-      exp["hatch_vml"] != null
-        ? exp["hatch_vml"]
-        : Math.min(...Object.values(exp));
-    const days = (ts - Date.now() / 1000) / 86400;
-    if (days <= 0) return { txt: "Cookie hết hạn", cls: "err" };
-    if (days < 1) return { txt: `Hết hạn trong ${Math.max(1, Math.floor(days * 24))}h`, cls: "err" };
-    if (days < 3) return { txt: `Còn ${days.toFixed(1)} ngày`, cls: "warn" };
-    return { txt: `Còn ${Math.round(days)} ngày`, cls: "info" };
-  }
-
-  // Svelte chỉ theo dõi dependency xuất hiện trực tiếp trong câu lệnh `$:` — liệt kê
-  // trực tiếp 2 biến bắt buộc ở đây, không dựa vào hàm.
-  $: museRequiredFilled =
-    museCookieSess.trim().length > 0 && museCookieDevice.trim().length > 0;
-
-  async function museAddCookie(allowDuplicate = false) {
-    if (museAddBusy) return;
-    museAddErr = "";
-    const sess = museCookieSess.trim();
-    const device = museCookieDevice.trim();
-    const vml = museCookieVml.trim();
-    if (!sess || !device) {
-      museAddErr = "Thiếu cookie bắt buộc — cần cả hatch_sess và hatch_native_auth_device.";
-      return;
-    }
-    const cookies: Record<string, string> = {
-      hatch_sess: sess,
-      hatch_native_auth_device: device,
-    };
-    if (vml) cookies.hatch_vml = vml;
-    museAddBusy = true;
-    try {
-      await api.muse_add_cookie(museNewLabel.trim() || "acc", cookies, allowDuplicate);
-      // Lưu thành công: tự xóa sạch cả 3 ô + nhãn + trạng thái cảnh báo
-      museCookieSess = "";
-      museCookieDevice = "";
-      museCookieVml = "";
-      museNewLabel = "";
-      museAllowDup = false;
-      museDupPending = false;
-      museAddErr = "";
-      showToast("success", "Đã thêm cookie vào pool.");
-      await museRefresh();
-    } catch (e) {
-      const msg = formatApiError(e);
-      if (msg.includes("hatch_sess already belongs")) {
-        // Trùng session: lần đầu cảnh báo, lần 2 user phải tick cho phép
-        if (!allowDuplicate && !museDupPending) {
-          museDupPending = true;
-          museAddErr =
-            "Cookie trùng với một account đang có. Kiểm tra lại — nếu chắc chắn, tick 'Cho phép trùng session' và bấm Thêm lần nữa.";
-        } else {
-          museAddErr = msg;
-        }
-      } else {
-        museAddErr = msg;
-      }
-    } finally {
-      museAddBusy = false;
-    }
-  }
-
-  async function museToggle(a: MuseAccount) {
-    if (museActionBusy) return;
-    museActionBusy = true;
-    try {
-      await api.muse_update_account(a.id, !a.enabled);
-      await museRefresh();
-    } catch (e) {
-      showToast("error", formatApiError(e));
-    } finally {
-      museActionBusy = false;
-    }
-  }
-
-  async function museDelete(a: MuseAccount) {
-    if (museActionBusy) return;
-    if (!window.confirm(`Xóa account "${a.label || a.id}" khỏi pool?`)) return;
-    museActionBusy = true;
-    try {
-      await api.muse_delete_account(a.id);
-      showToast("success", "Đã xóa account.");
-      await museRefresh();
-    } catch (e) {
-      showToast("error", formatApiError(e));
-    } finally {
-      museActionBusy = false;
-    }
-  }
-
-  async function museRenew(a: MuseAccount) {
-    if (museActionBusy) return;
-    museActionBusy = true;
-    try {
-      await api.muse_renew_account(a.id);
-      showToast("success", "Đã gia hạn phiên (renew session).");
-      await museRefresh();
-    } catch (e) {
-      showToast("error", formatApiError(e));
-    } finally {
-      museActionBusy = false;
-    }
-  }
-
-  async function museRefreshQuota(a: MuseAccount, force: boolean) {
-    if (museQuotaBusyId) return;
-    museQuotaBusyId = a.id;
-    delete museQuotaErr[a.id];
-    museQuotaErr = { ...museQuotaErr };
-    try {
-      const res = await api.muse_account_quota(a.id, force);
-      // Snapshot mới lưu vào meta của account trong danh sách hiện có
-      const idx = museAccounts.findIndex((x) => x.id === a.id);
-      if (idx >= 0) {
-        museAccounts[idx] = { ...museAccounts[idx], meta: { ...museAccounts[idx].meta, quota: res.quota } };
-        museAccounts = [...museAccounts];
-      }
-    } catch (e) {
-      museQuotaErr = { ...museQuotaErr, [a.id]: formatApiError(e) };
-    } finally {
-      museQuotaBusyId = "";
-    }
-  }
-
-  async function museDownloadExtension() {
-    try {
-      await api.muse_download_extension();
-      showToast("success", "Đã tải extension import cookie — cài vào Chrome/Edge theo chế độ developer.");
-    } catch (e) {
-      showToast("error", formatApiError(e));
-    }
   }
 
   // Khi mở tab Video lần đầu: nạp status sidecar (chưa spawn — chỉ đọc trạng thái)
@@ -1486,221 +1264,23 @@
             </div>
           </div>
 
-          <div class="muse-cols">
-            <div class="muse-col">
-          {#if museStatus?.sidecar.running}
-            <!-- Tổng quan pool -->
-            <div class="muse-summary">
-              {#if museAccounts.length === 0}
-                <span class="muse-badge mute">Chưa có tài khoản — thêm cookie bên dưới</span>
-              {:else}
-                {#if museCounts.active}<span class="muse-badge ok">Hoạt động <b>{museCounts.active}</b></span>{/if}
-                {#if museCounts.quota}<span class="muse-badge warn">Hết hạn mức <b>{museCounts.quota}</b></span>{/if}
-                {#if museCounts.cooling}<span class="muse-badge info">Tạm chờ <b>{museCounts.cooling}</b></span>{/if}
-                {#if museCounts.invalid}<span class="muse-badge err">Lỗi phiên <b>{museCounts.invalid}</b></span>{/if}
-                {#if museCounts.disabled}<span class="muse-badge mute">Tắt <b>{museCounts.disabled}</b></span>{/if}
-              {/if}
+          <!-- UI-1: Thu gọn danh sách tài khoản thành 1 dòng tóm tắt kèm nút chuyển nhanh sang tab Tài khoản -->
+          <div class="muse-accounts-summary-row">
+            <div class="muse-summary-info">
+              <Icons name="video-source" size={16} />
+              <span>
+                {museAccounts.length} tài khoản · {museAccounts.filter((a) => a.enabled).length} đang bật
+              </span>
             </div>
-
-            <!-- Card từng tài khoản: trạng thái + hạn mức + cookie expiry + thao tác -->
-            {#each museSortedAccounts(museAccounts) as a (a.id)}
-              {@const st = museAccState(a)}
-              {@const q = a.meta?.quota}
-              {@const pct = museQuotaPct(q)}
-              {@const exp = museCookieExpiry(a)}
-              <article class="muse-acc s-{st.key}">
-                <div class="muse-acc-top">
-                  <div class="grow">
-                    <div class="muse-acc-name" title={a.label || a.id}>{a.label || a.id}</div>
-                    <div class="muse-acc-id">{a.id}</div>
-                  </div>
-                  <span class="muse-badge {st.cls}">{st.label}</span>
-                  <label class="muse-switch" title={a.enabled ? "Đang bật — bấm để tắt" : "Đang tắt — bấm để bật"}>
-                    <input
-                      type="checkbox"
-                      checked={a.enabled}
-                      disabled={museActionBusy || $running}
-                      on:change={() => museToggle(a)}
-                    />
-                    <span></span>
-                  </label>
-                </div>
-
-                <!-- Khối hạn mức: quota hàng tuần + quota bổ sung -->
-                {#if q && (q.found || pct != null || q.plan)}
-                  <div class="muse-quota">
-                    <div class="qrail">
-                      <b class={museQuotaBarClass(pct)} style="width:{pct != null ? Math.min(100, pct) : 0}%"></b>
-                    </div>
-                    <div class="qmeta">
-                      <span>
-                        {q.plan ? q.plan.replace(/\s*plan\s*$/i, "") : "—"}{pct != null ? ` · ${pct}% đã dùng` : ""}
-                      </span>
-                      <span>
-                        reset {q.resets_at || "—"}{q.checked_at ? ` · ${museTimeAgo(q.checked_at)}` : ""}
-                      </span>
-                    </div>
-                    {#if q.extra_left}
-                      <div class="qextra">
-                        Quota bổ sung còn: <b>{q.extra_left}</b>
-                      </div>
-                    {/if}
-                    {#if q.error}
-                      <div class="qerr selectable">{q.error}</div>
-                    {/if}
-                  </div>
-                {:else}
-                  <div class="muse-quota empty">Chưa có dữ liệu hạn mức — bấm "Đọc hạn mức".</div>
-                {/if}
-
-                {#if museQuotaErr[a.id]}
-                  <div class="feedback-line bad selectable">{museQuotaErr[a.id]}</div>
-                {/if}
-
-                <div class="muse-acc-meta">
-                  {#if exp}
-                    <span class="muse-badge plain {exp.cls}">{exp.txt}</span>
-                  {/if}
-                  <span class="muse-stat">Thành công {a.success_count}</span>
-                  {#if a.fail_count > 0}
-                    <span class="muse-stat bad">Lỗi {a.fail_count}</span>
-                  {/if}
-                  {#if a.last_used_at > 0}
-                    <span class="muse-stat">Dùng gần nhất {museTimeAgo(a.last_used_at)}</span>
-                  {/if}
-                </div>
-
-                {#if a.last_error}
-                  <div class="muse-last-error selectable" title="last_error">{a.last_error}</div>
-                {/if}
-
-                <div class="muse-acc-actions">
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    disabled={museQuotaBusyId === a.id || $running}
-                    on:click={() => museRefreshQuota(a, true)}
-                    title="Đọc lại hạn mức từ trang Settings → Usage của muse.ai (có thể bị từ chối khi account đang chạy)"
-                  >
-                    <Icons name="refresh" size={14} />
-                    <span>{museQuotaBusyId === a.id ? "Đang đọc..." : "Đọc hạn mức"}</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    disabled={museActionBusy || $running}
-                    on:click={() => museRenew(a)}
-                    title="Gia hạn phiên muse.ai (GET /api/session) và cập nhật cookie"
-                  >
-                    <Icons name="check" size={14} />
-                    <span>Gia hạn phiên</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-secondary"
-                    disabled={museActionBusy || $running}
-                    on:click={() => museDelete(a)}
-                  >
-                    <Icons name="trash" size={14} />
-                    <span>Xóa</span>
-                  </button>
-                </div>
-              </article>
-            {/each}
-          {:else}
-            <div class="muse-offline">
-              Engine chưa chạy — bấm "Khởi động" ở trên (lần đầu 30–60 giây vì phải khởi động Edge), hoặc thêm cookie
-              ngay bên dưới: engine sẽ tự khởi động khi bấm "Thêm cookie".
-            </div>
-          {/if}
-            </div>
-            <div class="muse-col">
-          <!-- Thêm cookie: LUÔN hiển thị — không phụ thuộc trạng thái engine -->
-          <div class="muse-add">
-            <label class="label" for="muse-add-label">Tên tài khoản (nhãn)</label>
-            <input
-              id="muse-add-label"
-              class="input full"
-              bind:value={museNewLabel}
-              disabled={museAddBusy || $running}
-              placeholder="Ví dụ: tài khoản chính"
-              autocomplete="off"
-            />
-            <div class="label" style="margin-top:2px">
-              Cookie muse.ai — nhập 3 cookie lấy từ F12 → Application → Cookies
-            </div>
-
-            <label class="label" for="muse-cookie-sess">
-              <code>hatch_sess</code> <span class="muse-req">* bắt buộc</span>
-            </label>
-            <input
-              id="muse-cookie-sess"
-              class="input full muse-cookie-input"
-              bind:value={museCookieSess}
-              disabled={museAddBusy || $running}
-              placeholder="Dán giá trị cookie hatch_sess"
-              autocomplete="off"
-              spellcheck="false"
-            />
-
-            <label class="label" for="muse-cookie-device">
-              <code>hatch_native_auth_device</code> <span class="muse-req">* bắt buộc</span>
-            </label>
-            <input
-              id="muse-cookie-device"
-              class="input full muse-cookie-input"
-              bind:value={museCookieDevice}
-              disabled={museAddBusy || $running}
-              placeholder="Dán giá trị cookie hatch_native_auth_device"
-              autocomplete="off"
-              spellcheck="false"
-            />
-
-            <label class="label" for="muse-cookie-vml">
-              <code>hatch_vml</code> <span class="muse-opt">(tùy chọn)</span>
-            </label>
-            <input
-              id="muse-cookie-vml"
-              class="input full muse-cookie-input"
-              bind:value={museCookieVml}
-              disabled={museAddBusy || $running}
-              placeholder="Dán giá trị cookie hatch_vml nếu có"
-              autocomplete="off"
-              spellcheck="false"
-            />
-
-            <div class="hint">
-              Đăng nhập muse.ai trên Edge/Chrome → F12 → tab <b>Application</b> → <b>Cookies</b> →
-              <code>https://muse.ai</code> → copy giá trị từng cookie vào 3 ô trên
-              (<code>hatch_vml</code> có thể không có — bỏ trống). Engine chưa chạy thì lần
-              "Thêm cookie" đầu tiên sẽ tự khởi động engine (30–60 giây vì phải khởi động Edge).
-            </div>
-            <div class="inline muse-add-actions">
-              <button
-                type="button"
-                class="btn-primary"
-                disabled={museAddBusy || $running || !museRequiredFilled}
-                on:click={() => museAddCookie(museAllowDup)}
-              >
-                <Icons name="check" size={14} />
-                <span>{museAddBusy ? "Đang thêm..." : "Thêm cookie"}</span>
-              </button>
-              <button type="button" class="btn-secondary" disabled={$running} on:click={museDownloadExtension}>
-                <Icons name="link" size={14} />
-                <span>Tải extension import cookie</span>
-              </button>
-            </div>
-            {#if museDupPending}
-              <label class="muse-dup-allow">
-                <input type="checkbox" bind:checked={museAllowDup} />
-                <span>Cho phép trùng session (chỉ khi chắc chắn đây là cookie mới hợp lệ)</span>
-              </label>
-            {/if}
-            {#if museAddErr}
-              <div class="feedback-line bad selectable">{museAddErr}</div>
-            {/if}
-          </div>
-            </div>
+            <button
+              type="button"
+              class="btn-secondary jump-accounts-btn"
+              on:click={() => dispatch("navigate", "accounts")}
+              title="Chuyển sang tab Tài khoản trên thanh điều hướng"
+            >
+              <Icons name="video-source" size={14} />
+              <span>Quản lý tài khoản</span>
+            </button>
           </div>
         </div>
         {/if}
@@ -1938,6 +1518,22 @@
         <div class="hint">
           Bộ lập lịch hoạt động khi ứng dụng đang mở hoặc thu nhỏ dưới System Tray. Tự dọn lịch sử luôn
           bảo toàn 100% file sản phẩm và trạng thái mới nhất của từng dòng.
+        </div>
+
+        <div class="section-divider"></div>
+
+        <label class="check" for="cfg-auto-merge">
+          <input
+            id="cfg-auto-merge"
+            type="checkbox"
+            bind:checked={s.auto_merge}
+            on:change={mark}
+            disabled={$running}
+          />
+          <span>Tự động ghép video sau batch (Auto-merge FFmpeg)</span>
+        </label>
+        <div class="hint" style="margin-left: 24px;">
+          Tự động ghép nối các clip video thành phẩm theo đúng thứ tự dòng CSV thành file tổng hợp tại <code>video_out/</code> sau khi hoàn tất batch.
         </div>
 
       {:else}
@@ -2526,26 +2122,7 @@
     flex-direction: column;
     gap: 10px;
   }
-  /* Màn hình rộng: pool tài khoản và form thêm cookie nằm 2 cột để hết khoảng trống bên phải */
-  .muse-cols {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .muse-col {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    min-width: 0;
-  }
-  @media (min-width: 1400px) {
-    .muse-cols {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 16px;
-      align-items: start;
-    }
-  }
+
   .muse-head {
     display: flex;
     align-items: center;
@@ -2582,239 +2159,35 @@
     border-color: color-mix(in srgb, var(--c-green) 35%, transparent);
     color: var(--c-green);
   }
-  .muse-badge.warn {
-    background: var(--c-warn-bg);
-    border-color: color-mix(in srgb, var(--c-warn) 35%, transparent);
-    color: var(--c-warn-dark);
-  }
-  .muse-badge.err {
-    background: var(--c-danger-bg);
-    border-color: color-mix(in srgb, var(--c-danger) 35%, transparent);
-    color: var(--c-danger);
-  }
-  .muse-badge.info {
-    background: var(--c-teal-light);
-    border-color: color-mix(in srgb, var(--c-teal) 35%, transparent);
-    color: var(--c-teal);
-  }
   .muse-badge.mute {
     background: var(--c-surface-subtle);
     color: var(--c-muted);
   }
-  .muse-badge.plain {
-    font-weight: 500;
-  }
-  .muse-badge b {
-    font-weight: 700;
-  }
-  .muse-summary {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .muse-acc {
-    border: 1px solid var(--c-border);
-    border-left: 4px solid var(--c-green);
-    border-radius: 10px;
-    background: var(--c-card);
-    padding: 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .muse-acc.s-quota {
-    border-left-color: var(--c-warn);
-    background: linear-gradient(180deg, var(--c-warn-bg), var(--c-card) 90px);
-  }
-  .muse-acc.s-invalid {
-    border-left-color: var(--c-danger);
-  }
-  .muse-acc.s-cooling {
-    border-left-color: var(--c-teal);
-  }
-  .muse-acc.s-disabled {
-    border-left-color: var(--c-border-strong);
-    opacity: 0.85;
-  }
-  .muse-acc-top {
+  .muse-accounts-summary-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--c-surface-subtle);
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    gap: 12px;
   }
-  .muse-acc-name {
+  .muse-summary-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--c-text);
     font-weight: 600;
-    font-size: var(--fs-label);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    font-size: 13px;
   }
-  .muse-acc-id {
-    font-size: var(--fs-hint);
-    color: var(--c-muted);
-    font-family: var(--font-mono, monospace);
-  }
-  .muse-switch {
-    position: relative;
+  .jump-accounts-btn {
     display: inline-flex;
     align-items: center;
-    cursor: pointer;
-  }
-  .muse-switch input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
-  .muse-switch span {
-    width: 34px;
-    height: 20px;
-    border-radius: 999px;
-    background: var(--c-border-strong);
-    position: relative;
-    transition: background 0.15s;
-  }
-  .muse-switch span::after {
-    content: "";
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #fff;
-    transition: transform 0.15s;
-  }
-  .muse-switch input:checked + span {
-    background: var(--c-green);
-  }
-  .muse-switch input:checked + span::after {
-    transform: translateX(14px);
-  }
-  .muse-switch input:disabled + span {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  /* Khối hạn mức (quota hàng tuần + quota bổ sung) */
-  .muse-quota {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .muse-quota.empty {
-    font-size: var(--fs-hint);
-    color: var(--c-muted);
-    font-style: italic;
-  }
-  .muse-quota .qrail {
-    height: 7px;
-    border-radius: 4px;
-    background: var(--c-surface-subtle);
-    overflow: hidden;
-    border: 1px solid var(--c-border);
-  }
-  .muse-quota .qrail b {
-    display: block;
-    height: 100%;
-    background: var(--c-teal);
-    border-radius: 4px;
-    transition: width 0.3s;
-  }
-  .muse-quota .qrail b.high {
-    background: var(--c-warn);
-  }
-  .muse-quota .qrail b.full {
-    background: var(--c-danger);
-  }
-  .muse-quota .qmeta {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    font-size: var(--fs-hint);
-    color: var(--c-muted);
-    overflow: hidden;
-  }
-  .muse-quota .qmeta span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .muse-quota .qextra {
-    font-size: var(--fs-hint);
-    color: var(--c-text);
-  }
-  .muse-quota .qextra b {
-    color: var(--c-teal);
-  }
-  .muse-quota .qerr {
-    font-size: var(--fs-hint);
-    color: var(--c-warn-dark);
-  }
-  .muse-acc-meta {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
-    font-size: var(--fs-hint);
-    color: var(--c-muted);
-  }
-  .muse-stat.bad {
-    color: var(--c-danger);
-  }
-  .muse-last-error {
-    font-size: var(--fs-hint);
-    color: var(--c-danger);
-    background: var(--c-danger-bg);
-    border-radius: 6px;
-    padding: 6px 8px;
-    overflow-wrap: anywhere;
-  }
-  .muse-acc-actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .muse-add {
-    border-top: 1px dashed var(--c-border-strong);
-    padding-top: 10px;
-    display: flex;
-    flex-direction: column;
     gap: 6px;
-  }
-  .muse-textarea {
-    resize: vertical;
-    font-family: var(--font-mono, monospace);
-    font-size: var(--fs-hint);
-    min-height: 72px;
-  }
-  .muse-add-actions {
-    margin-top: 4px;
-  }
-  .muse-dup-allow {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: var(--fs-hint);
-    color: var(--c-warn-dark);
-    background: var(--c-warn-bg);
-    border-radius: 6px;
-    padding: 6px 8px;
-  }
-  .muse-cookie-input {
-    font-family: var(--font-mono, monospace);
-    font-size: var(--fs-hint);
-  }
-  .muse-req {
-    color: var(--c-danger);
-    font-weight: 600;
-  }
-  .muse-opt {
-    color: var(--c-muted);
-    font-weight: 400;
-  }
-  .muse-offline {
-    font-size: var(--fs-label);
-    color: var(--c-muted);
-    padding: 10px 0;
+    height: 32px;
+    padding: 0 12px;
+    font-size: 12px;
   }
   .muse-stale-config {
     display: flex;

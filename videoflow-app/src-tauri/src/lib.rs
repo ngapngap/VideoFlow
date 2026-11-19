@@ -81,6 +81,8 @@ pub fn run() {
             commands::muse_update_account,
             commands::muse_delete_account,
             commands::muse_renew_account,
+            commands::muse_open_login,
+            commands::muse_open_view,
             commands::muse_account_quota,
             commands::muse_download_extension,
             commands::app_version,

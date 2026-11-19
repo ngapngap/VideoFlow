@@ -31,8 +31,8 @@ SESSION_COOKIES = ("hatch_sess", "hatch_native_auth_device")
 OPTIONAL_SESSION_COOKIES = ("hatch_gw", "hatch_vml")
 
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/140.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 

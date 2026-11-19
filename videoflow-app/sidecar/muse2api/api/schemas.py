@@ -66,9 +66,10 @@ class AccountCreate(BaseModel):
     #   2. raw "Cookie" request header string "a=1; b=2"
     #   3. list of cookie-export entries (e.g. EditThisCookie):
     #      [{"name": ..., "value": ..., "expirationDate": ...}, ...]
-    cookies: dict[str, str] | str | list[dict[str, Any]]
+    cookies: dict[str, str] | str | list[dict[str, Any]] = Field(default_factory=dict)
     cookie_expires: dict[str, int] = Field(default_factory=dict)
     enabled: bool = True
+    proxy: str | None = None
 
 
 class AccountsImportRequest(BaseModel):
@@ -82,6 +83,7 @@ class AccountUpdate(BaseModel):
     enabled: bool | None = None
     cookies: dict[str, str] | None = None
     cookie_expires: dict[str, int] | None = None
+    proxy: str | None = None
 
 
 class KeyCreate(BaseModel):

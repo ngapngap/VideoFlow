@@ -11,6 +11,7 @@ from ..config import Settings
 from ..core.matting import Matting
 from ..core.media import MediaStore
 from ..drivers.base import MuseDriver
+from ..drivers.browser.interactive import InteractiveBrowserManager
 from ..drivers.registry import create_driver
 from .gateway import Gateway
 from .request_log import RequestLog, current_record
@@ -28,6 +29,7 @@ class Services:
     matting: Matting
     keys: KeyStore
     requests: RequestLog
+    interactive: InteractiveBrowserManager | None = None
 
     @classmethod
     def build(cls, settings: Settings, driver: MuseDriver | None = None) -> Services:
@@ -58,4 +60,5 @@ class Services:
             matting=Matting(settings.matting_model),
             keys=KeyStore(settings.keys_file),
             requests=requests,
+            interactive=InteractiveBrowserManager(settings, pool, driver),
         )

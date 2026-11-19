@@ -1,11 +1,11 @@
 //! state.db theo sơ đồ 13.1: 6 bảng (+ meta), khóa ngoại bật, đường dẫn lưu tương đối.
 //! Mỗi dự án có đúng một state.db nằm ở gốc thư mục dự án.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Kiểu trả về chuẩn của `latest_job_status`:
 /// `(status, image_status, video_status, last_error, attempts_count)`
@@ -57,7 +57,7 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             row_key TEXT NOT NULL,
             row_no INTEGER,
             status TEXT NOT NULL CHECK (status IN
-                ('dang_cho','da_tao_image','da_tao_video','loi_tao_image','loi_tao_video','bo_qua')),
+                ('dang_cho','da_tao_image','da_tao_video','loi_tao_image','loi_tao_video','loi_tam_thoi','bo_qua')),
             image_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (image_status IN
                 ('chua_chay','dang_chay','xong','loi')),
             video_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (video_status IN
@@ -130,12 +130,99 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(conn, "jobs", "video_task_id", "TEXT")?;
     ensure_column(conn, "jobs", "video_download_url", "TEXT")?;
 
+    // Migration idempotent v2 -> v3: cập nhật CHECK constraint bảng jobs cho phép 'loi_tam_thoi'
+    migrate_jobs_v3_check_constraint(conn)?;
+
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![SCHEMA_VERSION.to_string()],
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_jobs_v3_check_constraint(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let needs_migration = match table_sql {
+        Some(sql) => !sql.contains("'loi_tam_thoi'"),
+        None => false,
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    // SQLite không hỗ trợ ALTER TABLE để sửa CHECK constraint trên bảng sẵn có.
+    // Thực hiện quy trình chuẩn của SQLite:
+    // 1. Tắt PRAGMA foreign_keys bên ngoài transaction.
+    // 2. Chạy transaction tái tạo bảng jobs và di chuyển dữ liệu.
+    // 3. Khôi phục lại PRAGMA foreign_keys = ON.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let migration_res = (|| -> Result<(), rusqlite::Error> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE jobs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id),
+                row_key TEXT NOT NULL,
+                row_no INTEGER,
+                status TEXT NOT NULL CHECK (status IN
+                    ('dang_cho','da_tao_image','da_tao_video','loi_tao_image','loi_tao_video','loi_tam_thoi','bo_qua')),
+                image_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (image_status IN
+                    ('chua_chay','dang_chay','xong','loi')),
+                video_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (video_status IN
+                    ('chua_chay','dang_chay','xong','loi')),
+                image_prompt_hash TEXT,
+                video_prompt_hash TEXT,
+                video_task_id TEXT,
+                video_download_url TEXT,
+                attempts_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                duration_ms INTEGER
+            );
+
+            INSERT INTO jobs_new (
+                id, run_id, row_key, row_no, status,
+                image_status, video_status, image_prompt_hash, video_prompt_hash,
+                video_task_id, video_download_url, attempts_count, last_error,
+                started_at, finished_at, duration_ms
+            )
+            SELECT
+                id, run_id, row_key, row_no, status,
+                image_status, video_status, image_prompt_hash, video_prompt_hash,
+                video_task_id, video_download_url, attempts_count, last_error,
+                started_at, finished_at, duration_ms
+            FROM jobs;
+
+            DROP TABLE jobs;
+
+            ALTER TABLE jobs_new RENAME TO jobs;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_run_row ON jobs(run_id, row_key);
+            CREATE INDEX IF NOT EXISTS idx_jobs_row ON jobs(row_key);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            "#,
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    let fk_on_res = conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA foreign_key_check;");
+    migration_res?;
+    fk_on_res?;
+
     Ok(())
 }
 
@@ -293,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fresh_schema_v2_and_fast_reopen_keeps_wal() {
+    fn test_fresh_schema_v3_and_fast_reopen_keeps_wal() {
         let dir = temp_project_dir("fresh");
         {
             let conn = open(&dir).expect("open fresh state.db");
@@ -309,7 +396,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .expect("read meta schema_version");
-            assert_eq!(meta_ver, "2");
+            assert_eq!(meta_ver, SCHEMA_VERSION.to_string());
 
             conn.execute(
                 "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung','dang_chay','2026-11-18T00:00:00Z',1)",
@@ -401,19 +488,183 @@ mod tests {
             .expect("setup v1 schema");
         }
 
-        let conn = open(&dir).expect("open & migrate v1 -> v2");
+        let conn = open(&dir).expect("open & migrate v1 -> v3");
         create_schema(&conn).expect("idempotent create_schema");
 
         let user_ver: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(user_ver, 2);
+        assert_eq!(user_ver, 3);
 
         conn.execute(
             "UPDATE jobs SET video_task_id = 'migrated_task', video_download_url = 'https://example.com/v.mp4' WHERE row_key = 'old.png'",
             [],
         )
         .expect("update newly added columns on v1 row");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_v2_to_v3_jobs_constraint() {
+        let dir = temp_project_dir("migrate_v2_to_v3");
+        let db_path = dir.join("state.db");
+        {
+            let conn = Connection::open(&db_path).expect("open raw v2 db");
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                PRAGMA user_version = 2;
+
+                CREATE TABLE meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO meta(key, value) VALUES ('schema_version', '2');
+
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('chung','rieng','lich','lam_lai')),
+                    status TEXT NOT NULL CHECK (status IN ('dang_chay','hoan_tat','da_dung','gian_doan')),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    total_rows INTEGER NOT NULL DEFAULT 0,
+                    done_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    row_key TEXT NOT NULL,
+                    row_no INTEGER,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('dang_cho','da_tao_image','da_tao_video','loi_tao_image','loi_tao_video','bo_qua')),
+                    image_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (image_status IN
+                        ('chua_chay','dang_chay','xong','loi')),
+                    video_status TEXT NOT NULL DEFAULT 'chua_chay' CHECK (video_status IN
+                        ('chua_chay','dang_chay','xong','loi')),
+                    image_prompt_hash TEXT,
+                    video_prompt_hash TEXT,
+                    video_task_id TEXT,
+                    video_download_url TEXT,
+                    attempts_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    duration_ms INTEGER
+                );
+                CREATE UNIQUE INDEX uq_jobs_run_row ON jobs(run_id, row_key);
+                CREATE INDEX idx_jobs_row ON jobs(row_key);
+                CREATE INDEX idx_jobs_status ON jobs(status);
+
+                CREATE TABLE file_refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER REFERENCES jobs(id),
+                    row_key TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('tham_chieu','anh','video')),
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    is_current INTEGER NOT NULL DEFAULT 1,
+                    size_bytes INTEGER,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id),
+                    step TEXT NOT NULL CHECK (step IN ('B2','B3','download')),
+                    attempt_no INTEGER NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result TEXT NOT NULL CHECK (result IN ('ok','loi_tam_thoi','loi_nghiep_vu')),
+                    http_status INTEGER,
+                    error_code TEXT,
+                    error_message TEXT
+                );
+
+                INSERT INTO runs(id, kind, status, started_at, total_rows)
+                VALUES (1, 'chung', 'hoan_tat', '2026-11-18T00:00:00Z', 1);
+
+                INSERT INTO jobs(id, run_id, row_key, row_no, status, video_task_id, attempts_count)
+                VALUES (42, 1, 'row_old.png', 1, 'dang_cho', 'task_init_123', 2);
+
+                INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                VALUES (42, 'row_old.png', 'anh', 'img_1.png', 'image_out/img_1.png', 1, 1, '2026-11-18T00:01:00Z');
+
+                INSERT INTO attempts(job_id, step, attempt_no, result)
+                VALUES (42, 'B2', 1, 'ok');
+                "#,
+            )
+            .expect("setup raw v2 schema");
+
+            // Xác minh trước migration: DB v2 cũ sẽ BỊ LỖI CHECK constraint khi cập nhật 'loi_tam_thoi'
+            let err = conn.execute(
+                "UPDATE jobs SET status = 'loi_tam_thoi' WHERE id = 42",
+                [],
+            );
+            assert!(err.is_err(), "v2 schema MUST reject 'loi_tam_thoi' due to CHECK constraint");
+        }
+
+        // Mở database thông qua open() để kích hoạt auto migration v2 -> v3
+        let conn = open(&dir).expect("open & auto-migrate v2 -> v3");
+
+        // 1. Kiểm tra user_version và meta schema_version đã lên 3
+        let user_ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read user_version");
+        assert_eq!(user_ver, 3);
+
+        let schema_ver: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+            .expect("read meta schema_version");
+        assert_eq!(schema_ver, "3");
+
+        // 2. Kiểm tra dữ liệu cũ của jobs được bảo toàn nguyên vẹn
+        let (row_key, video_task, attempts): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT row_key, video_task_id, attempts_count FROM jobs WHERE id = 42",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read preserved job #42");
+        assert_eq!(row_key, "row_old.png");
+        assert_eq!(video_task.as_deref(), Some("task_init_123"));
+        assert_eq!(attempts, 2);
+
+        // 3. Kiểm tra file_refs và attempts trỏ vào job #42 vẫn hoàn toàn nguyên vẹn
+        let ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_refs WHERE job_id = 42", [], |r| r.get(0))
+            .expect("count file_refs");
+        assert_eq!(ref_count, 1);
+
+        let att_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attempts WHERE job_id = 42", [], |r| r.get(0))
+            .expect("count attempts");
+        assert_eq!(att_count, 1);
+
+        // 4. Kiểm tra cập nhật 'loi_tam_thoi' trên dòng cũ giờ đây THÀNH CÔNG
+        conn.execute(
+            "UPDATE jobs SET status = 'loi_tam_thoi' WHERE id = 42",
+            [],
+        )
+        .expect("UPDATE status = 'loi_tam_thoi' on migrated table must succeed");
+
+        let updated_st: String = conn
+            .query_row("SELECT status FROM jobs WHERE id = 42", [], |r| r.get(0))
+            .expect("read updated status");
+        assert_eq!(updated_st, "loi_tam_thoi");
+
+        // 5. Kiểm tra INSERT mới với status = 'loi_tam_thoi' thành công
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status) VALUES (1, 'new_row.png', 2, 'loi_tam_thoi')",
+            [],
+        )
+        .expect("INSERT with status = 'loi_tam_thoi' must succeed");
+
+        // 6. Kiểm tra tính idempotent: gọi create_schema thêm lần nữa không phát sinh lỗi
+        create_schema(&conn).expect("create_schema should be idempotent on v3");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

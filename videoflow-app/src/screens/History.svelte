@@ -524,6 +524,7 @@
     if (s === "Đã tạo video") return "badge-video";
     if (s === "Lỗi tạo image") return "badge-loi-image";
     if (s === "Lỗi tạo video") return "badge-loi-video";
+    if (s === "Lỗi tạm thời") return "badge-loi-tam-thoi";
     if (s === "Bỏ qua") return "badge-bo-qua";
     return "badge-cho";
   }

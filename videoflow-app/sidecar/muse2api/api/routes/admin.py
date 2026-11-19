@@ -19,6 +19,7 @@ from ... import __version__
 from ...accounts.keepalive import renew_account
 from ...accounts.model import Account, AccountStatus
 from ...auth.keys import ApiKey
+from ...drivers.browser.driver import AccountBusy
 from ...errors import InvalidRequest, Muse2APIError, NotFound
 from ...services.container import Services
 from ...upstream.muse import missing_session_cookies
@@ -69,13 +70,22 @@ def parse_cookies(value: dict[str, str] | str | list[dict]) -> tuple[dict[str, s
 
 def _build_account(item: AccountCreate) -> Account:
     """Build an Account from a create payload, normalising the cookie format first."""
-    cookies, expires = parse_cookies(item.cookies)
-    cookies = {k: v for k, v in cookies.items() if v}
-    expires = {k: v for k, v in expires.items() if k in cookies}
-    if not cookies:
-        raise InvalidRequest("cookies must not be empty")
-    return Account(label=item.label, cookies=cookies,
-                   cookie_expires={**expires, **item.cookie_expires}, enabled=item.enabled)
+    if not item.cookies:
+        cookies, expires = {}, {}
+    else:
+        cookies, expires = parse_cookies(item.cookies)
+        cookies = {k: v for k, v in cookies.items() if v}
+        expires = {k: v for k, v in expires.items() if k in cookies}
+    status = AccountStatus.ACTIVE if cookies else AccountStatus.INVALID
+    proxy_val = item.proxy.strip() if item.proxy and item.proxy.strip() else None
+    return Account(
+        label=item.label,
+        cookies=cookies,
+        cookie_expires={**expires, **item.cookie_expires},
+        enabled=item.enabled,
+        status=status,
+        proxy=proxy_val,
+    )
 
 
 def _check_duplicate_session(acc: Account, svc: Services) -> None:
@@ -101,9 +111,12 @@ def _get(svc: Services, account_id: str) -> Account:
 
 @router.get("/status")
 async def status(svc: Services = Depends(get_services)) -> dict:
+    driver_health = await svc.driver.health()
+    browser_alive = getattr(svc.driver, "browser_alive", bool(driver_health.get("ok", False)))
     return {
         "version": __version__,
-        "driver": await svc.driver.health(),
+        "browser_alive": browser_alive,
+        "driver": driver_health,
         "capabilities": svc.driver.capabilities.__dict__,
         "accounts": svc.pool.stats(),
     }
@@ -156,20 +169,28 @@ async def update_account(account_id: str, body: AccountUpdate,
         # Same guard as POST: a hatching session must not be shared by two accounts,
         # otherwise both fight over its rotation and die together.
         if not allow_duplicate_session:
-            probe = Account(id=acc.id, label=acc.label, cookies=body.cookies)
+            probe = Account(id=acc.id, label=acc.label, cookies={**acc.cookies, **body.cookies})
             _check_duplicate_session(probe, svc)
-        acc.cookies = {k: v for k, v in body.cookies.items() if v}
+        for k, v in body.cookies.items():
+            if v:
+                acc.cookies[k] = v
+            else:
+                acc.cookies.pop(k, None)
         # Expiry belongs to the OLD session: drop it for cookies that were replaced, or
         # the account would look like it expires when the previous session did.
         acc.cookie_expires = {
             name: exp for name, exp in (acc.cookie_expires or {}).items()
-            if name in acc.cookies
+            if name not in body.cookies
         }
         # Fresh cookies give an invalid account another chance.
         acc.status = AccountStatus.ACTIVE
         acc.last_error = None
     if body.cookie_expires is not None:
-        acc.cookie_expires = body.cookie_expires
+        if acc.cookie_expires is None:
+            acc.cookie_expires = {}
+        acc.cookie_expires.update(body.cookie_expires)
+    if body.proxy is not None:
+        acc.proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
     await svc.pool.upsert(acc)
     return {"account": acc.public()}
 
@@ -195,6 +216,26 @@ async def reset_account(account_id: str, svc: Services = Depends(get_services)) 
 async def renew(account_id: str, svc: Services = Depends(get_services)) -> dict:
     _get(svc, account_id)
     return await renew_account(svc.pool, svc.driver, account_id)
+
+
+@router.post("/accounts/{account_id}/open-login")
+async def open_login(account_id: str, svc: Services = Depends(get_services)) -> dict:
+    acc = _get(svc, account_id)
+    if svc.interactive and svc.interactive.is_account_busy(account_id):
+        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
+    if svc.interactive is None:
+        raise InvalidRequest("Interactive browser sessions not available")
+    return await svc.interactive.open_login(acc)
+
+
+@router.post("/accounts/{account_id}/open-view")
+async def open_view(account_id: str, svc: Services = Depends(get_services)) -> dict:
+    acc = _get(svc, account_id)
+    if svc.interactive and svc.interactive.is_account_busy(account_id):
+        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
+    if svc.interactive is None:
+        raise InvalidRequest("Interactive browser sessions not available")
+    return await svc.interactive.open_view(acc)
 
 
 @router.get("/accounts/{account_id}/quota")

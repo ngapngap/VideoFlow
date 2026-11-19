@@ -85,6 +85,7 @@ export interface RowSummary {
   row_no: number;
   prompt_modified?: boolean;
   ref_exists?: boolean;
+  noi_canh?: boolean;
 }
 
 export interface RowPage {
@@ -127,6 +128,9 @@ export interface RowDetail {
   video_abs_path: string | null;
   files: FileVersionItem[];
   timeline: TimelineItem[];
+  video_duration?: number | null;
+  video_resolution?: string | null;
+  account_used?: string | null;
 }
 
 export interface DryRunResult {
@@ -204,6 +208,8 @@ export interface Settings {
   schedule_enabled: boolean;
   schedule_hours: number;
   auto_cleanup_days: number;
+  /** Tự động ghép nối các clip video sau khi kết thúc batch (P2-2) */
+  auto_merge: boolean;
   confirm_start: boolean;
   notify_on_finish: boolean;
   minimize_to_tray: boolean;
@@ -247,7 +253,8 @@ export interface MuseAccount {
   id: string;
   label: string;
   enabled: boolean;
-  status: "active" | "cooling" | "invalid";
+  status: "active" | "cooling" | "invalid" | "video_locked";
+  proxy?: string | null;
   cookies: Record<string, string>;
   cookie_expires: Record<string, number>;
   created_at: number;
@@ -380,12 +387,17 @@ export const api = {
       cookies,
       allowDuplicate,
     }),
-  muse_update_account: (accountId: string, enabled?: boolean, label?: string) =>
+  muse_update_account: (accountId: string, enabled?: boolean, label?: string, proxy?: string | null) =>
     invoke<{ account: MuseAccount }>("muse_update_account", {
       accountId,
       enabled: enabled ?? null,
       label: label ?? null,
+      proxy: proxy ?? null,
     }),
+  muse_open_login: (accountId: string) =>
+    invoke<{ ok: boolean; message?: string }>("muse_open_login", { accountId }),
+  muse_open_view: (accountId: string) =>
+    invoke<{ ok: boolean; message?: string }>("muse_open_view", { accountId }),
   muse_delete_account: (accountId: string) =>
     invoke<{ ok: boolean }>("muse_delete_account", { accountId }),
   muse_renew_account: (accountId: string) =>

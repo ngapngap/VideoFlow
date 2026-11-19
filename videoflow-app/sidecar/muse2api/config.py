@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     def profile_dir(self) -> Path:
         return self.browser_profile_dir or (self.data_dir / "browser-profile")
 
+    def account_profile_dir(self, account_id: str) -> Path:
+        if self.browser_profile_dir:
+            return self.browser_profile_dir.parent / "profiles" / account_id
+        return self.data_dir / "muse" / "profiles" / account_id
+
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.media_dir):
             d.mkdir(parents=True, exist_ok=True)
