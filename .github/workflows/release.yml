@@ -211,7 +211,7 @@ jobs:
               ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
 
-      - name: Smoke 2/2 — contract VideoFlow (mock driver: video + ảnh)
+      - name: Smoke 2/2 — contract VideoFlow (mock driver, video + ảnh)
         shell: pwsh
         run: |
           $exe = "videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
