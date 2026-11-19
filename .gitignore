@@ -1,0 +1,23 @@
+# Node / frontend
+node_modules/
+dist/
+
+# Rust / Tauri (pattern có / chỉ khớp từ gốc repo — bỏ / để khớp mọi độ sâu)
+target/
+**/gen/schemas/
+
+# Build artifacts
+*.exe
+*.msi
+*.appx
+*.nsis.zip
+
+# Workspace cục bộ (không thuộc mã nguồn)
+_build/
+.zcode/
+rustup-init.exe
+
+# Hệ thống / IDE
+.DS_Store
+Thumbs.db
+*.log

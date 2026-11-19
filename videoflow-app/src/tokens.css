@@ -1,0 +1,381 @@
+/* Design tokens & nền tảng giao diện VideoFlow Desktop v1.3.1 (mục 6.1b - 6.1e) */
+:root {
+  /* Màu thương hiệu & trạng thái */
+  --c-teal: #0e7c86; /* hành động chính */
+  --c-teal-dark: #0a5f66;
+  --c-teal-light: #e6f2f3;
+  --c-teal-subtle: #f2f8f9;
+  --c-green: #2e7d46; /* Start, thành công */
+  --c-green-bg: #e4f2ea;
+  --c-warn: #d98a1f; /* cảnh báo */
+  --c-warn-dark: #a9650d;
+  --c-warn-bg: #fef6e7;
+  --c-danger: #b3372c; /* Stop, xóa, lỗi */
+  --c-danger-bg: #f9e8e6;
+
+  /* Nền / đường kẻ / chữ */
+  --c-page: #f5f8fa;
+  --c-card: #ffffff;
+  --c-surface-subtle: #f0f4f7;
+  --c-border: #dce4e8;
+  --c-border-strong: #c5d1d8;
+  --c-text: #1c2733;
+  --c-muted: #54626c;
+
+  /* Bo góc / bóng đổ nổi tinh tế */
+  --r-btn: 8px;
+  --r-input: 8px;
+  --r-card: 12px;
+  --r-modal: 12px;
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-hover: 0 6px 16px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.04);
+  --shadow-modal: 0 20px 44px rgba(15, 23, 42, 0.2), 0 4px 12px rgba(15, 23, 42, 0.08);
+  --focus-ring: 0 0 0 3px rgba(14, 124, 134, 0.22);
+
+  /* Kích thước khung */
+  --w-sidebar: 232px;
+  --w-sidebar-collapsed: 64px;
+  --h-nav-item: 40px;
+  --h-titlebar: 56px;
+  --h-statusbar: 28px;
+  --h-input: 36px;
+  --h-btn-primary: 40px;
+  --h-btn-start: 48px;
+  --h-btn-secondary: 36px;
+  --h-btn-ghost: 32px;
+  --h-table-row: 44px;
+  --h-table-head: 40px;
+  --w-detail-drawer: 440px;
+  --h-progress: 10px;
+  --h-badge: 24px;
+
+  /* Cỡ chữ */
+  --fs-h-screen: 20px;
+  --fs-h-block: 16px;
+  --fs-body: 14px;
+  --fs-label: 13px;
+  --fs-hint: 12px;
+  --fs-big-number: 28px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: var(--fs-body);
+  line-height: 1.45;
+  color: var(--c-text);
+  background: var(--c-page);
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Cho phép bôi đen sao chép ở các vùng dữ liệu, lỗi, đường dẫn, bảng và thông báo */
+input,
+textarea,
+.selectable,
+.error-box,
+td,
+pre,
+code,
+.toast,
+.head-path {
+  user-select: text;
+}
+
+button {
+  font-family: inherit;
+  border: none;
+  cursor: pointer;
+  border-radius: var(--r-btn);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    color 0.14s ease,
+    box-shadow 0.14s ease,
+    transform 0.08s ease,
+    opacity 0.14s ease;
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.25);
+  box-shadow: none;
+}
+
+button:focus-visible,
+.input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* 5 loại nút theo 6.1c */
+.btn-primary {
+  height: var(--h-btn-primary);
+  padding: 0 20px;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  background: var(--c-teal);
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(14, 124, 134, 0.2);
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--c-teal-dark);
+  box-shadow: 0 3px 8px rgba(14, 124, 134, 0.24);
+}
+
+.btn-start {
+  height: var(--h-btn-start);
+  padding: 0 28px;
+  min-width: 240px;
+  font-size: 16px;
+  font-weight: 700;
+  background: var(--c-green);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(46, 125, 70, 0.25);
+}
+.btn-start:hover:not(:disabled) {
+  filter: brightness(0.94);
+  box-shadow: 0 4px 12px rgba(46, 125, 70, 0.3);
+}
+
+.btn-danger {
+  height: var(--h-btn-primary);
+  padding: 0 20px;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  background: var(--c-danger);
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(179, 55, 44, 0.2);
+}
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(0.93);
+  box-shadow: 0 3px 8px rgba(179, 55, 44, 0.25);
+}
+
+.btn-secondary {
+  height: var(--h-btn-secondary);
+  padding: 0 16px;
+  font-size: var(--fs-body);
+  font-weight: 500;
+  background: #fff;
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+}
+.btn-secondary:hover:not(:disabled) {
+  border-color: var(--c-teal);
+  color: var(--c-teal);
+  background: var(--c-teal-subtle);
+}
+
+.btn-ghost {
+  height: var(--h-btn-ghost);
+  padding: 0 12px;
+  font-size: var(--fs-label);
+  font-weight: 500;
+  background: transparent;
+  color: var(--c-muted);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--c-teal-light);
+  color: var(--c-teal);
+}
+
+/* Ô nhập theo 6.1e */
+.input,
+select,
+textarea {
+  height: var(--h-input);
+  padding: 0 12px;
+  font-size: var(--fs-body);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-input);
+  background: #fff;
+  color: var(--c-text);
+  font-family: inherit;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+}
+textarea.input,
+textarea {
+  height: auto;
+  padding: 8px 12px;
+}
+.input:hover:not(:disabled),
+select:hover:not(:disabled),
+textarea:hover:not(:disabled) {
+  border-color: var(--c-border-strong);
+}
+.input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--c-teal);
+  box-shadow: var(--focus-ring);
+}
+.input.invalid,
+select.invalid,
+textarea.invalid {
+  border-color: var(--c-danger);
+}
+.input:disabled,
+select:disabled,
+textarea:disabled {
+  background: var(--c-surface-subtle);
+  color: var(--c-muted);
+  cursor: not-allowed;
+  opacity: 0.78;
+}
+
+.label {
+  font-size: var(--fs-label);
+  font-weight: 600;
+  color: var(--c-text);
+  margin-bottom: 6px;
+  display: block;
+}
+
+/* Thẻ */
+.card {
+  background: var(--c-card);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+  padding: 16px;
+}
+
+/* Badge trạng thái: màu cố định kèm chữ đầy đủ (6.1e) */
+.badge {
+  height: var(--h-badge);
+  padding: 0 10px;
+  border-radius: 12px;
+  font-size: var(--fs-hint);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.badge-cho {
+  background: #eceff1;
+  color: var(--c-muted);
+}
+.badge-image {
+  background: var(--c-teal-light);
+  color: var(--c-teal);
+}
+.badge-video {
+  background: var(--c-green-bg);
+  color: var(--c-green);
+}
+.badge-loi-image,
+.badge-loi-video {
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
+}
+.badge-bo-qua {
+  background: #f1f4f6;
+  color: #60707c;
+  border: 1px dashed #c5d1d8;
+}
+.badge-sua-prompt {
+  background: var(--c-warn-bg);
+  color: var(--c-warn-dark);
+  border: 1px solid #f4d39b;
+}
+.badge-soon {
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #edf3f6;
+  color: #4b6370;
+  border: 1px solid #d1dde3;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+/* Chip lọc (6.3b tiếp) */
+.chip {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 16px;
+  font-size: var(--fs-label);
+  font-weight: 500;
+  border: 1px solid var(--c-border);
+  background: #fff;
+  color: var(--c-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.chip:hover:not(:disabled):not(.active) {
+  border-color: var(--c-teal);
+  color: var(--c-teal);
+  background: var(--c-teal-subtle);
+}
+.chip.active {
+  background: var(--c-teal);
+  border-color: var(--c-teal);
+  color: #fff;
+  font-weight: 600;
+}
+.chip .count {
+  font-size: var(--fs-hint);
+  opacity: 0.88;
+}
+
+/* Thanh tiến độ (6.14) */
+.progress-bar {
+  height: var(--h-progress);
+  border-radius: 999px;
+  background: #e4ebee;
+  overflow: hidden;
+}
+.progress-bar > div {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--c-teal) 0%, #149ba7 100%);
+  transition: width 0.3s ease;
+}
+
+/* Scrollbar tinh gọn */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c7d3da;
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #aab9c2;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
