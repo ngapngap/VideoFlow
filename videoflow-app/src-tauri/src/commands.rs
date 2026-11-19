@@ -140,6 +140,9 @@ pub struct UntrackedImageItem {
 #[derive(Serialize, Clone)]
 pub struct RowSummary {
     pub row_key: String,
+    /// Tên file ảnh tham chiếu (cột A) — hiển thị cho người dùng.
+    /// `row_key` là khóa dòng (`tên ảnh#hash prompt`), có thể khác tên ảnh.
+    pub image_name: String,
     pub status: String,
     pub image_file: String,
     pub video_file: String,
@@ -628,7 +631,14 @@ pub fn get_rows(
         if r.is_example() || r.is_empty_content() {
             continue;
         }
-        let key_low = r.anh_tham_chieu.to_lowercase();
+        // Khoá tra state.db là khóa dòng (tên ảnh + hash prompt), không phải tên ảnh —
+        // nếu dùng tên ảnh thì nhiều dòng cùng ảnh sẽ đọc chung một bản ghi job.
+        let row_key = prompts_csv::row_key_of(
+            &r.anh_tham_chieu,
+            &r.promt_tao_image,
+            &r.promt_tao_video,
+        );
+        let key_low = row_key.to_lowercase();
         let prev = latest_map.get(&key_low);
         let media = media_map.get(&key_low);
         let label = engine::effective_status_label(r, prev);
@@ -661,7 +671,8 @@ pub fn get_rows(
         *status_counts.entry(label.to_string()).or_insert(0) += 1;
 
         summaries.push(RowSummary {
-            row_key: r.anh_tham_chieu.clone(),
+            row_key,
+            image_name: r.anh_tham_chieu.clone(),
             status: label.into(),
             image_file,
             video_file,
@@ -686,7 +697,10 @@ pub fn get_rows(
     if let Some(q) = query.as_deref().map(str::trim) {
         if !q.is_empty() {
             let q_low = q.to_lowercase();
-            summaries.retain(|r| r.row_key.to_lowercase().contains(&q_low));
+            summaries.retain(|r| {
+                r.row_key.to_lowercase().contains(&q_low)
+                    || r.image_name.to_lowercase().contains(&q_low)
+            });
         }
     }
 
@@ -711,26 +725,31 @@ pub fn get_rows(
 
 pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let rows = prompts_csv::read_all(&p.join("prompts.csv"))?;
-    let row = rows
-        .iter()
-        .find(|r| r.anh_tham_chieu == row_key)
-        .or_else(|| rows.iter().find(|r| r.anh_tham_chieu.eq_ignore_ascii_case(row_key)))
+    let row = prompts_csv::find_row_by_key(&rows, row_key)
         .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
 
-    let actual_key = &row.anh_tham_chieu;
+    // Khoá dòng chuẩn hoá (tên ảnh + hash prompt) — dùng cho mọi truy vấn state.db.
+    let actual_key = &prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let prev = engine::latest_job_info(&conn, actual_key);
+    // Tra job: khoá mới trước, fallback dữ liệu cũ (row_key = tên ảnh) khi ảnh duy nhất.
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let prev_owned = engine::map_lookup_legacy(&latest_map, &rows, row).cloned();
+    let prev = prev_owned.as_ref();
 
-    let status_label = engine::effective_status_label(row, prev.as_ref());
-    let prompt_modified = engine::is_prompt_modified(row, prev.as_ref());
-    let attempts_count = prev.as_ref().map(|j| j.attempts_count).unwrap_or(0);
+    let status_label = engine::effective_status_label(row, prev);
+    let prompt_modified = engine::is_prompt_modified(row, prev);
+    let attempts_count = prev.map(|j| j.attempts_count).unwrap_or(0);
     let last_error = prev
-        .as_ref()
         .and_then(|j| j.last_error.clone())
         .or_else(|| (!row.ghi_chu_loi.trim().is_empty()).then(|| row.ghi_chu_loi.clone()));
 
-    let ref_path = p.join("input").join(actual_key);
+    // File tham chiếu nằm ở input/<tên ảnh> — KHÔNG dùng khoá dòng (có '#hash').
+    let ref_path = p.join("input").join(row.anh_tham_chieu.trim());
     let ref_exists = ref_path.is_file();
     let ref_abs_path = clean_abs_path_string(&ref_path);
 
@@ -858,6 +877,7 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     Ok(RowDetail {
         row: RowSummary {
             row_key: actual_key.clone(),
+            image_name: row.anh_tham_chieu.clone(),
             status: status_label.into(),
             image_file: eff_image_file,
             video_file: eff_video_file,
@@ -1170,13 +1190,16 @@ pub fn run_row(row_key: String, app: AppHandle, state: State<'_, AppState>) -> A
     let p = project_path(&state)?;
     let cfg = state.settings_cache.read().clone();
     let rows = prompts_csv::read_all(&p.join("prompts.csv"))?;
-    let row = rows
-        .iter()
-        .find(|r| r.anh_tham_chieu.eq_ignore_ascii_case(&row_key))
+    let row = prompts_csv::find_row_by_key(&rows, &row_key)
         .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
+    let key_of_row = prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
 
     if let Ok(conn) = crate::state_db::open(&p) {
-        if let Some(prev) = engine::latest_job_info(&conn, &row.anh_tham_chieu) {
+        if let Some(prev) = engine::latest_job_info(&conn, &key_of_row) {
             if prev.status == "bo_qua" {
                 return Err(AppError::new(
                     "ROW_SKIPPED",
@@ -1230,15 +1253,18 @@ pub fn rerun_row_step(
 
     let p = project_path(&state)?;
     let rows = prompts_csv::read_all(&p.join("prompts.csv"))?;
-    let row = rows
-        .iter()
-        .find(|r| r.anh_tham_chieu.eq_ignore_ascii_case(&row_key))
+    let row = prompts_csv::find_row_by_key(&rows, &row_key)
         .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
+    let key_of_row = prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
 
     if forced == Step::B3 {
         // [P0-2] / #27 [P0-3]: Chặn chạy riêng bước Video nếu prompt tạo ảnh đã bị sửa đổi!
         if let Ok(conn) = crate::state_db::open(&p) {
-            let prev = engine::latest_job_info(&conn, &row.anh_tham_chieu);
+            let prev = engine::latest_job_info(&conn, &key_of_row);
             let (img_changed, _) = engine::detect_prompt_change(row, prev.as_ref());
             if img_changed {
                 return Err(AppError::new(
@@ -1248,7 +1274,7 @@ pub fn rerun_row_step(
             }
         }
 
-        let detail = build_row_detail_at(&p, &row.anh_tham_chieu)?;
+        let detail = build_row_detail_at(&p, &key_of_row)?;
         if detail.row.image_file.trim().is_empty() {
             return Err(AppError::new(
                 "NO_IMAGE",
@@ -1387,11 +1413,13 @@ pub fn reset_row_status(row_key: String, state: State<'_, AppState>) -> AppResul
 pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let csv_path = p.join("prompts.csv");
     let rows = prompts_csv::read_all(&csv_path)?;
-    let row = rows
-        .iter()
-        .find(|r| r.anh_tham_chieu.eq_ignore_ascii_case(row_key))
+    let row = prompts_csv::find_row_by_key(&rows, row_key)
         .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
-    let actual_key = row.anh_tham_chieu.clone();
+    let actual_key = prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
     let img_hash = engine::sha2hex(row.promt_tao_image.trim());
     let vid_hash = engine::sha2hex(row.promt_tao_video.trim());
     let row_no = row.row_no as i64;
@@ -1673,25 +1701,76 @@ pub fn save_row_prompts_at(
 ) -> AppResult<RowDetail> {
     let trimmed_img = prompt_image.trim();
     let trimmed_vid = prompt_video.trim();
-    prompts_csv::save_prompts(&p.join("prompts.csv"), row_key, trimmed_img, trimmed_vid)?;
+    let csv_path = p.join("prompts.csv");
 
+    // Khoá dòng chứa hash prompt → sửa prompt là khoá đổi. Phải biết tên ảnh TRƯỚC khi
+    // ghi để dựng khoá mới và để tra bản ghi job cũ (khoá cũ).
+    let before = prompts_csv::read_all(&csv_path)?;
+    let old_row = prompts_csv::find_row_by_key(&before, row_key)
+        .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
+    let image_name = old_row.anh_tham_chieu.clone();
+
+    // Trạng thái "Bỏ qua" là quyết định của người dùng về DÒNG, không về prompt →
+    // phải mang theo khi khoá đổi vì prompt sửa. Cột trạng thái trong CSV cũng vậy.
+    let was_skipped = old_row.trang_thai.trim() == "Bỏ qua";
+    let old_trang_thai = old_row.trang_thai.clone();
+    let old_note = old_row.ghi_chu_loi.clone();
+
+    prompts_csv::save_prompts(&csv_path, row_key, trimmed_img, trimmed_vid)?;
+    if was_skipped {
+        // save_prompts chỉ sửa cột B/C nên trạng thái vẫn còn; không cần ghi lại.
+        let _ = (&old_trang_thai, &old_note);
+    }
+
+    let new_key = prompts_csv::row_key_of(&image_name, trimmed_img, trimmed_vid);
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    // Di trú bản ghi job của dòng này sang KHOÁ MỚI (khoá chứa hash prompt).
+    //
+    // Áp dụng cho mọi bản ghi "chưa sinh sản phẩm" (dang_cho/bo_qua, attempts = 0,
+    // image/video status = chua_chay): dời khoá + cập nhật hash để không hiện cảnh báo
+    // "prompt đã sửa" ngay sau khi người dùng tự sửa prompt. Bản ghi đã có kết quả
+    // (đã tạo ảnh/video, đã thử) được GIỮ NGUYÊN ở khoá cũ — đó chính là mốc để phát
+    // hiện "prompt đã sửa" về sau.
+    let image_low = image_name.trim().to_lowercase();
+    // Ngoặc rõ ràng cho nhóm khoá: `(A OR B) AND <điều kiện chưa chạy>` — thiếu ngoặc thì
+    // `OR` sẽ nuốt mất điều kiện và UPDATE ghi đè cả bản ghi ĐÃ CÓ KẾT QUẢ (hash prompt
+    // lịch sử bị xoá → mất cảnh báo "prompt đã sửa").
+    let moved = conn
+        .execute(
+            "UPDATE jobs
+             SET row_key = ?1, image_prompt_hash = ?2, video_prompt_hash = ?3
+             WHERE (LOWER(row_key) = LOWER(?4) OR LOWER(row_key) LIKE ?5 || '#%')
+               AND status IN ('dang_cho', 'bo_qua')
+               AND attempts_count = 0
+               AND image_status = 'chua_chay'
+               AND video_status = 'chua_chay'",
+            rusqlite::params![
+                new_key,
+                engine::sha2hex(trimmed_img),
+                engine::sha2hex(trimmed_vid),
+                row_key,
+                image_low
+            ],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    // Nếu sau khi dời còn nhiều bản ghi cùng tên ảnh ở trạng thái "chưa chạy" thì giữ
+    // lại đúng một bản (khoá mới) để dry-run không đếm trùng.
     conn.execute(
-        "UPDATE jobs SET image_prompt_hash = ?1, video_prompt_hash = ?2
-         WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?3) ORDER BY id DESC LIMIT 1)
+        "DELETE FROM jobs
+         WHERE LOWER(row_key) LIKE ?1 || '#%'
+           AND LOWER(row_key) <> LOWER(?2)
            AND status IN ('dang_cho', 'bo_qua')
            AND attempts_count = 0
            AND image_status = 'chua_chay'
            AND video_status = 'chua_chay'",
-        rusqlite::params![
-            engine::sha2hex(trimmed_img),
-            engine::sha2hex(trimmed_vid),
-            row_key
-        ],
+        rusqlite::params![image_low, new_key],
     )
     .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    build_row_detail_at(p, row_key)
+    let _ = moved;
+    build_row_detail_at(p, &new_key)
 }
 
 #[tauri::command]
@@ -1817,11 +1896,15 @@ fn muse_sanitize_id(id: &str) -> AppResult<String> {
 
 #[tauri::command]
 pub async fn muse_sidecar_status(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    // Clone MỘT lần cho cả status lẫn phần mô tả: trước đây clone 2 lần nên nếu người
+    // dùng lưu Cài đặt đúng lúc request đang chạy, response sẽ trộn cấu hình cũ/mới.
     let cfg = state.settings_cache.read().clone();
-    let st = tauri::async_runtime::spawn_blocking(move || crate::muse_sidecar::status(&cfg))
-        .await
-        .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
-    let cfg = state.settings_cache.read().clone();
+    let cfg_for_status = cfg.clone();
+    let st = tauri::async_runtime::spawn_blocking(move || {
+        crate::muse_sidecar::status(&cfg_for_status)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
     let chromium = if cfg.muse_chromium_path.trim().is_empty() {
         crate::muse_sidecar::detect_chromium("")
             .map(|p| p.to_string_lossy().to_string())
@@ -1846,15 +1929,10 @@ pub async fn muse_start_sidecar(state: State<'_, AppState>) -> AppResult<serde_j
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))??;
-    // Serialize SidecarStatus sang JSON thủ công (không derive Serialize ở type lib)
-    Ok(serde_json::json!({
-        "running": st.running,
-        "port": st.port,
-        "version": st.version,
-        "driver": st.driver,
-        "account_total": st.account_total,
-        "account_available": st.account_available,
-    }))
+    // `SidecarStatus` đã derive Serialize — serialize thẳng để KHÔNG bỏ sót field mới
+    // (cfg_port/cfg_chromium/cfg_headless/restart_required) như bản dựng tay trước đây.
+    serde_json::to_value(&st)
+        .map_err(|e| AppError::new("SERIALIZE_FAIL", format!("{e}")))
 }
 
 #[tauri::command]
@@ -2369,7 +2447,15 @@ pub fn get_run_detail_at(p: &Path, run_id: i64) -> AppResult<(RunSummary, Vec<Ro
         if let Ok(it) = stmt.query_map(rusqlite::params![run_id], |r| {
             let db_status: String = r.get(1)?;
             Ok(RowSummary {
-                row_key: r.get(0)?,
+                row_key: {
+                    let k: String = r.get(0)?;
+                    k
+                },
+                image_name: {
+                    // Bảng jobs chỉ lưu khóa dòng → hiển thị tên ảnh bằng cách bỏ hậu tố hash.
+                    let k: String = r.get(0)?;
+                    crate::prompts_csv::row_key_image_name(&k).to_string()
+                },
                 status: engine::db_status_to_label(&db_status).into(),
                 last_error: r.get(2)?,
                 attempts_count: r.get(3)?,
@@ -2838,7 +2924,8 @@ mod tests {
         )
         .unwrap();
 
-        let detail = skip_row_at(&dir, "fresh.png").expect("skip brand-new row");
+        let fresh_key = prompts_csv::row_key_of("fresh.png", "img", "vid");
+        let detail = skip_row_at(&dir, &fresh_key).expect("skip brand-new row");
         assert_eq!(detail.row.status, "Bỏ qua");
 
         let dry = engine::dry_run(&dir, &Settings::default()).unwrap();
@@ -2917,12 +3004,18 @@ mod tests {
 
         let (summary, run_rows) = get_run_detail_at(&dir, run_id).unwrap();
         assert_eq!(summary.duration_ms, Some(120_000));
-        let old_row = run_rows.iter().find(|r| r.row_key == "old.png").unwrap();
+        // Bảng jobs trong test ghi khoá legacy ('old.png'); row detail hiển thị tên ảnh
+        // suy ra từ khoá nên so qua image_name.
+        let old_row = run_rows.iter().find(|r| r.image_name == "old.png").unwrap();
         assert_eq!(old_row.image_file, "old_gen.png");
         assert_eq!(old_row.video_file, "old_gen.mp4");
 
+        // remap: dữ liệu legacy trong CSV nên khoá legacy vẫn tra được (ảnh duy nhất).
         let remapped = remap_reference_image_at(&dir, "old.png", "new.png").expect("remap ok");
-        assert_eq!(remapped.row.row_key, "new.png");
+        // Sau remap, ảnh cột A đổi nên khoá dòng đổi theo (tên ảnh mới + hash prompt cũ).
+        assert_eq!(remapped.row.image_name, "new.png");
+        assert!(remapped.row.row_key.starts_with("new.png#"));
+        let new_key = remapped.row.row_key.clone();
         assert_eq!(
             remapped.row.image_file, "old_gen.png",
             "orphan file_ref v2 must be purged on remap"
@@ -2931,7 +3024,7 @@ mod tests {
         assert!(resolve_safe_project_target(&dir, "image_out/old_gen.png").is_ok());
         assert!(resolve_safe_project_target(&dir, "../outside.txt").is_err());
 
-        assert!(delete_row_at(&dir, "new.png").unwrap());
+        assert!(delete_row_at(&dir, &new_key).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

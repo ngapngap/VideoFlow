@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from datetime import datetime
@@ -90,20 +91,32 @@ def _mask(value: str) -> str:
 
 
 _ZERO_EXTRA = ("0", "0.0", "none", "null", "n/a", "-", "—")
+# Hậu tố số lượng muse.ai render: "1.2B tokens", "500K tokens", "2M", "0B tokens left"
+_QUANTITY_SUFFIX = re.compile(r"^([0-9]*\.?[0-9]+)\s*([kmb])?\b", re.IGNORECASE)
 
 
 def _extra_is_zero(text: str) -> bool:
-    """``"0 tokens"``/``"none"`` → exhausted; ``"1,200 tokens"`` → still has balance."""
-    cleaned = text.strip().lower().replace(",", "").replace("tokens", "").strip()
-    if not cleaned or cleaned in _ZERO_EXTRA:
+    """``"0B tokens left"``/``"none"`` → hết; ``"1,200 tokens"``/``"2B tokens"`` → còn.
+
+    muse.ai renders the extra-token balance with SI-ish suffixes ("1.2B tokens left"), so a
+    bare ``float()`` on the first word reads "0b" as unparseable and wrongly reports a
+    balance. Parse the leading number and its K/M/B suffix; anything unparseable counts as
+    non-zero so an unknown balance never blocks the account.
+    """
+    cleaned = text.strip().lower().replace(",", "")
+    if not cleaned:
         return True
-    # Leading number decides ("0 / 5000"); anything unparseable is treated as non-zero
-    # so an unknown balance never blocks the account.
     head = cleaned.split()[0]
+    if head in _ZERO_EXTRA:
+        return True
+    m = _QUANTITY_SUFFIX.match(cleaned)
+    if not m:
+        return False
     try:
-        return float(head) <= 0
+        value = float(m.group(1))
     except ValueError:
         return False
+    return value <= 0
 
 
 _RESET_FORMATS = (
@@ -127,11 +140,15 @@ def _reset_deadline(resets_at: Any, now: float) -> float | None:
     if isinstance(resets_at, (int, float)):
         return float(resets_at) - now
     text = str(resets_at).strip()
-    # Drop a trailing clock/timezone part: "Oct 12, 2025 at 10:00 (GMT+7)".
-    for sep in (" at ", ", ", " - ", " (", "T"):
+    # Bỏ phần giờ/timezone ở cuối: "Oct 12, 2025 at 10:00 (GMT+7)", "Oct 12, 2025 (GMT+7)".
+    # Lưu ý KHÔNG cắt ở ", " vì dấu phẩy nằm trong chính định dạng ngày ("Oct 12, 2025").
+    for sep in (" at ", " (", " – ", " - ", "T"):
         if sep in text:
-            text = text.split(sep, 1)[0] if sep != ", " else text
-            break
+            text = text.split(sep, 1)[0]
+    text = text.strip().rstrip(",").strip()
+    # Còn dạng "Oct 12, 2025, 10:00" → bỏ phần giờ sau dấu phẩy thứ hai.
+    if text.count(",") == 2:
+        text = text.rsplit(",", 1)[0].strip()
     for fmt in _RESET_FORMATS:
         try:
             when = datetime.strptime(text, fmt).replace(

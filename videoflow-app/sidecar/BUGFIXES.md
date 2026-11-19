@@ -117,13 +117,16 @@ muse.ai báo hết. Account đã biết cạn quota vẫn được lease, đốt
 | `weekly_used_pct < 100` hoặc không có snapshot | dùng được |
 | `weekly_used_pct >= 100` + `extra_left` còn > 0 | **dùng được** (quota bổ sung) |
 | `weekly_used_pct >= 100` + `resets_at` đã qua | dùng được (đã reset) |
-| `weekly_used_pct >= 100` + reset ở tương lai/không rõ | **chặn lease** |
+| `weekly_used_pct >= 100` + reset **ở tương lai** | **chặn lease** |
+| `weekly_used_pct >= 100` + `resets_at` **không parse được** | **dùng được** (không chặn trên phỏng đoán) |
 
 `is_available()` gọi hàm này **trước** nhánh cooldown — nếu chỉ xét cooldown thì account
 bị chặn vì hết quota sẽ được lease lại ngay khi cooldown hết (bug do test bắt được).
 Shape đếm của driver mock (`messages_used/limit`) và `resets_at` không parse được đều
 coi là **dùng được** — pool không bao giờ chặn account dựa trên phỏng đoán.
-`extra_left` parse: `"0 tokens"`/`none`/`-` → hết; `"1,200 tokens"`/`"0 / 5000"` → còn.
+`extra_left` parse: `"0 tokens"`/`"0B tokens left"`/`"none"`/`-`/`"0 / 5000"` → **hết**;
+`"1,200 tokens"`/`"1.2B tokens left"`/`"500K tokens"` → **còn**. (Hậu tố K/M/B được hiểu —
+muse.ai render extra tokens dạng "1.2B tokens left".)
 
 ## Fix 6 — PATCH /admin/accounts/{id} bypass kiểm tra trùng session
 

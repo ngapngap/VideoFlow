@@ -27,11 +27,16 @@ git push origin v1.4.1        # ← trigger Release workflow
 | Secret | Nội dung |
 |---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | Toàn bộ nội dung file `.updater-key.pem` (minisign private key) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Mật khẩu của key (hiện dùng `videofLowUpdater2026`) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Mật khẩu của key — lưu trong password manager, **không ghi vào repo/docs** |
 
 Khoá nằm ở **`D:\VideoFlow\.updater-key.pem`** — đã gitignore, **phải backup**.
 Mất khoá/password thì không thể phát hành bản cập nhật cho các bản đã cài
-(pubkey nằm cố định trong `tauri.conf.json`).
+(pubkey nằm cố định trong `tauri.conf.json`). Mật khẩu chỉ lưu trong password manager +
+GitHub secret; **không bao giờ commit hay ghi vào tài liệu**.
+
+> **Đã xoay khoá 19/11/2026** do mật khẩu cũ từng bị ghi trong tài liệu. Mọi máy đang chạy
+> bản cũ hơn `v1.4.1` phải **cài tay một lần** (pubkey mới chỉ có từ v1.4.1); sau đó
+> auto-update hoạt động lại bình thường.
 
 Đổi mật khẩu/khoá: `npx tauri signer generate -w <path>` rồi cập nhật `plugins.updater.pubkey`
 trong `tauri.conf.json` + set lại 2 secrets. **Lưu ý:** đổi khoá làm mọi bản cũ không
@@ -46,7 +51,7 @@ tự cập nhật được nữa (phải cài tay 1 lần).
 | Frontend | `npm ci` → `npm run check` (svelte-check) → `npm run build` |
 | Rust | stub sidecar → `cargo clippy --all-targets -D warnings` → `cargo test` |
 | Sidecar | cài `requirements.txt` (đã pin) → `compileall` → pytest (`tests/`: quota enforcement, chặn trùng session ở POST **và** PATCH) → chạy API mock kiểm `/healthz`, `/admin/status` |
-| Rust | ... → build engine exe thật → `cargo test` (gồm test spawn engine qua **browser driver thật** với Edge headless) → smoke `/admin/status` xác nhận `driver=browser, ok=true` |
+| Rust | build engine exe thật → `cargo test` (gồm test spawn engine qua **browser driver thật** với Edge headless) → smoke `/admin/status` xác nhận `driver=browser, ok=true` |
 
 ## Code-signing (SmartScreen)
 
@@ -83,8 +88,9 @@ phải bấm *Run anyway*.
 cd videoflow-app
 taskkill //F //IM videoflow-desktop.exe          # tránh khoá file exe
 # build sidecar nếu sửa python: cd sidecar && pyinstaller muse2api.spec --distpath ../src-tauri/binaries --noconfirm
+# Không hardcode mật khẩu ở đây: đọc từ biến môi trường của shell (hoặc file .env local đã gitignore)
 export TAURI_SIGNING_PRIVATE_KEY="$(cat ../.updater-key.pem)"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="videofLowUpdater2026"
+: "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?set biến này trong shell/secret manager trước khi build}"
 npx tauri build
 ```
 

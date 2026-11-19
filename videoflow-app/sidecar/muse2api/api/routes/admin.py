@@ -159,6 +159,12 @@ async def update_account(account_id: str, body: AccountUpdate,
             probe = Account(id=acc.id, label=acc.label, cookies=body.cookies)
             _check_duplicate_session(probe, svc)
         acc.cookies = {k: v for k, v in body.cookies.items() if v}
+        # Expiry belongs to the OLD session: drop it for cookies that were replaced, or
+        # the account would look like it expires when the previous session did.
+        acc.cookie_expires = {
+            name: exp for name, exp in (acc.cookie_expires or {}).items()
+            if name in acc.cookies
+        }
         # Fresh cookies give an invalid account another chance.
         acc.status = AccountStatus.ACTIVE
         acc.last_error = None

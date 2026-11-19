@@ -18,8 +18,13 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Protocol
 
-from ..errors import (NoAccountAvailable, UpstreamAuthError, UpstreamQuotaError,
-                      UpstreamTimeout, UpstreamVmDisabled)
+from ..errors import (
+    NoAccountAvailable,
+    UpstreamAuthError,
+    UpstreamQuotaError,
+    UpstreamTimeout,
+    UpstreamVmDisabled,
+)
 from .model import Account, AccountStatus
 from .store import AccountStore
 
@@ -188,14 +193,24 @@ class AccountPool:
 
     def _candidates(
         self, exclude: Iterable[str], kind: str | None = None
-    ) -> tuple[list[Account], bool, float | None]:
-        """Returns (free candidates, whether a usable account is merely busy, and the
-        earliest time a cooling account comes back, if any)."""
+    ) -> tuple[list[Account], bool, float | None, int]:
+        """Returns ``(free, busy, cooling_back_at, quota_blocked_count)``.
+
+        Quota-blocked accounts are counted separately and deliberately **not** folded into
+        ``cooling_back_at``: their ``cooldown_until`` stays 0.0 (they were never cooled
+        down), so including them made ``back_at`` land in the past — ``acquire()`` then
+        slept/re-polled for the whole 60 s timeout before failing, and reported
+        "cooling down" for what was really an exhausted quota.
+        """
         now = time.time()
         excluded = set(exclude) | self._kind_blocked(kind, now)
         free, busy, back_at = [], False, None
+        quota_blocked = 0
         for acc in self._accounts.values():
             if acc.id in excluded or not acc.enabled or acc.status == AccountStatus.INVALID:
+                continue
+            if acc.quota_exhausted(now):
+                quota_blocked += 1
                 continue
             if not acc.is_available(now):  # cooling down
                 back_at = acc.cooldown_until if back_at is None else min(back_at, acc.cooldown_until)
@@ -204,14 +219,25 @@ class AccountPool:
                 busy = True
                 continue
             free.append(acc)
-        return free, busy, back_at
+        return free, busy, back_at, quota_blocked
 
     def has_alternative(self, exclude: Iterable[str], kind: str | None = None) -> bool:
-        """Whether an enabled, valid account exists outside ``exclude`` (busy or cooling counts)
-        that is not blocked for ``kind``."""
-        excluded = set(exclude) | self._kind_blocked(kind, time.time())
-        return any(a.id not in excluded and a.enabled and a.status != AccountStatus.INVALID
-                   for a in self._accounts.values())
+        """Whether an enabled, valid, not-quota-exhausted account exists outside ``exclude``
+        (busy or cooling counts) that is not blocked for ``kind``.
+
+        Quota matters here: the gateway uses this to decide whether to fail over. Counting
+        an exhausted account as an alternative made it retry into a pool that could only
+        answer 503, turning a fast failure into a 60 s wait.
+        """
+        now = time.time()
+        excluded = set(exclude) | self._kind_blocked(kind, now)
+        return any(
+            a.id not in excluded
+            and a.enabled
+            and a.status != AccountStatus.INVALID
+            and not a.quota_exhausted(now)
+            for a in self._accounts.values()
+        )
 
     async def acquire(
         self, *, exclude: Iterable[str] = (), hint: str | None = None, kind: str | None = None
@@ -220,7 +246,7 @@ class AccountPool:
         deadline = time.monotonic() + self.acquire_timeout
         async with self._cond:
             while True:
-                free, busy, back_at = self._candidates(exclude, kind)
+                free, busy, back_at, quota_blocked = self._candidates(exclude, kind)
                 if free:
                     acc = self.strategy.choose(free, hint)
                     self._inflight[acc.id] += 1
@@ -229,7 +255,11 @@ class AccountPool:
                 remaining = deadline - time.monotonic()
                 back_in = None if back_at is None else back_at - time.time()
                 if not busy and back_in is None:
-                    raise NoAccountAvailable("no usable account in pool")
+                    raise NoAccountAvailable(
+                        "all accounts are out of quota"
+                        if quota_blocked
+                        else "no usable account in pool"
+                    )
                 if remaining <= 0 or (not busy and back_in > remaining):
                     # Nothing frees up before the deadline; say why instead of waiting in vain.
                     reason = "busy" if busy else "cooling down"

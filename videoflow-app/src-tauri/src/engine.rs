@@ -90,6 +90,90 @@ pub enum Step {
     B3,
 }
 
+/// Tra bản ghi job cho một dòng CSV, có tương thích dữ liệu CŨ.
+///
+/// `state.db` trước v1.4.1 lưu `row_key` = tên ảnh. Nếu CSV hiện tại chỉ có **một** dòng
+/// dùng ảnh đó thì dữ liệu cũ chắc chắn thuộc về dòng này, nên dùng lại được — nhờ vậy
+/// trạng thái `video_task_id`, số lần thử và cảnh báo "prompt đã sửa" không bị mất khi
+/// nâng cấp. Khi ảnh được dùng cho nhiều dòng (>=2), dữ liệu cũ là mơ hồ → bỏ qua và
+/// dòng được tính lại từ đầu (đúng như tài liệu migration đã nêu).
+pub fn job_for_row<'a>(
+    map: &'a HashMap<String, LatestJobInfo>,
+    rows: &[prompts_csv::Row],
+    row: &prompts_csv::Row,
+) -> Option<&'a LatestJobInfo> {
+    let key = row_key_low(row);
+    if let Some(j) = map.get(&key) {
+        return Some(j);
+    }
+    let legacy = row.anh_tham_chieu.trim().to_lowercase();
+    if legacy.is_empty() {
+        return None;
+    }
+    let same_image = rows
+        .iter()
+        .filter(|r| r.anh_tham_chieu.trim().to_lowercase() == legacy)
+        .count();
+    // Ảnh dùng cho ĐÚNG một dòng ⇒ mọi bản ghi lịch sử của ảnh đó thuộc dòng này:
+    // ưu tiên `row_key` = tên ảnh (dữ liệu trước v1.4.1), nếu không có thì lấy bản ghi
+    // cùng tên ảnh với hash khác (khoá đổi khi người dùng sửa prompt).
+    if same_image != 1 {
+        return None;
+    }
+    if let Some(j) = map.get(&legacy) {
+        return Some(j);
+    }
+    let prefix = format!("{legacy}#");
+    map.iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, v)| v)
+}
+
+/// Như `job_for_row` nhưng cho map bất kỳ (media refs, …) — cùng quy tắc legacy:
+/// chỉ fallback về tên ảnh khi CSV có đúng một dòng dùng ảnh đó.
+pub fn map_lookup_legacy<'a, V>(
+    map: &'a HashMap<String, V>,
+    rows: &[prompts_csv::Row],
+    row: &prompts_csv::Row,
+) -> Option<&'a V> {
+    if let Some(v) = map.get(&row_key_low(row)) {
+        return Some(v);
+    }
+    let legacy = row.anh_tham_chieu.trim().to_lowercase();
+    if legacy.is_empty() {
+        return None;
+    }
+    let same_image = rows
+        .iter()
+        .filter(|r| r.anh_tham_chieu.trim().to_lowercase() == legacy)
+        .count();
+    // Khi ảnh chỉ dùng cho MỘT dòng, mọi bản ghi lịch sử của ảnh đó chắc chắn thuộc dòng
+    // này: ưu tiên bản ghi legacy (`row_key` = tên ảnh, dữ liệu trước v1.4.1), nếu không
+    // có thì lấy bản ghi có cùng tên ảnh với hash prompt CŨ (khoá đổi khi sửa prompt).
+    if same_image != 1 {
+        return None;
+    }
+    if let Some(j) = map.get(&legacy) {
+        return Some(j);
+    }
+    let prefix = format!("{legacy}#");
+    map.iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, v)| v)
+}
+
+/// Khoá dòng (lowercase) dùng để tra `state.db`. Xem `prompts_csv::row_key_of`.
+pub fn row_key_low(row: &prompts_csv::Row) -> String {
+    prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    )
+    .to_lowercase()
+}
+
 /// Bản ghi jobs mới nhất của một `row_key` trong `state.db`
 #[derive(Debug, Clone)]
 pub struct LatestJobInfo {
@@ -370,7 +454,10 @@ pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str
         .unwrap_or(0);
 
     let ext = if kind == "anh" { "png" } else { "mp4" };
-    let stem = Path::new(row_key)
+    // row_key là "<tên ảnh>#<hash prompt>" → stem phải lấy từ tên ảnh, nếu không tên
+    // file đầu ra sẽ dính hash và khác hoàn toàn quy ước `stem_gen.png`.
+    let image_name = crate::prompts_csv::row_key_image_name(row_key);
+    let stem = Path::new(image_name)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anh".into());
@@ -478,13 +565,18 @@ pub fn plan_row(
         return None;
     }
 
-    if !engine_cfg.row_keys.is_empty()
-        && !engine_cfg
-            .row_keys
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case(&row.anh_tham_chieu))
-    {
-        return None;
+    // `row_keys` đến từ UI = khoá dòng (tên ảnh#hash prompt); vẫn nhận cả dạng legacy
+    // (chỉ tên ảnh) để lời gọi cũ và CLI không bị bỏ qua im lặng.
+    if !engine_cfg.row_keys.is_empty() {
+        let current = row_key_low(row);
+        let image = row.anh_tham_chieu.trim();
+        let matched = engine_cfg.row_keys.iter().any(|k| {
+            let k = k.trim();
+            k.eq_ignore_ascii_case(&current) || k.eq_ignore_ascii_case(image)
+        });
+        if !matched {
+            return None;
+        }
     }
 
     let prev_img_hash = prev.and_then(|p| p.image_prompt_hash.clone());
@@ -740,7 +832,11 @@ fn finish_job_status(
     if row.trang_thai != res.csv_label || row.ghi_chu_loi != new_note {
         row.trang_thai = res.csv_label.to_string();
         row.ghi_chu_loi = new_note.clone();
-        let row_key = row.anh_tham_chieu.clone();
+        let row_key = crate::prompts_csv::row_key_of(
+            &row.anh_tham_chieu,
+            &row.promt_tao_image,
+            &row.promt_tao_video,
+        );
         let label = res.csv_label;
         if let Err(e) = prompts_csv::update_row(ctx.csv_path, &row_key, |r| {
             r.trang_thai = label.into();
@@ -823,14 +919,31 @@ pub fn sync_rows_from_state_db(
     let media_map = load_current_media_map(conn);
 
     let mut synced = 0usize;
+    // Đếm số dòng dùng mỗi ảnh TRƯỚC khi iter_mut (fallback legacy cần thông tin này
+    // mà không được mượn `rows` cùng lúc với `iter_mut`).
+    let image_counts: HashMap<String, usize> = rows
+        .iter()
+        .filter(|r| !r.is_example() && !r.is_empty_content())
+        .fold(HashMap::new(), |mut acc, r| {
+            *acc.entry(r.anh_tham_chieu.trim().to_lowercase()).or_insert(0) += 1;
+            acc
+        });
+
     for r in rows.iter_mut() {
         if r.is_example() || r.is_empty_content() {
             continue;
         }
-        let key_low = r.anh_tham_chieu.to_lowercase();
+        let key_low = row_key_low(r);
+        // Fallback dữ liệu cũ: jobs/file_refs lưu theo tên ảnh.
+        let legacy_key = r.anh_tham_chieu.trim().to_lowercase();
+        let legacy_only = image_counts.get(&legacy_key).copied().unwrap_or(0) == 1;
+        let mut image_lookup_key = key_low.clone();
+        if !media_map.contains_key(&key_low) && legacy_only && !legacy_key.is_empty() {
+            image_lookup_key = legacy_key.clone();
+        }
         let mut changed = false;
 
-        if let Some(m) = media_map.get(&key_low) {
+        if let Some(m) = media_map.get(&image_lookup_key) {
             if let Some(ref img_f) = m.image_file {
                 if !img_f.is_empty() && image_out.join(img_f).is_file() {
                     if r.anh_da_tao != *img_f {
@@ -865,7 +978,16 @@ pub fn sync_rows_from_state_db(
             }
         }
 
-        if let Some(j) = latest_map.get(&key_low) {
+        // Ở đây `rows` đang bị mượn mut → tự quyết định lookup key bằng image_counts
+        // (giống quy tắc job_for_row) thay vì gọi hàm cần &[Row].
+        let job_lookup_key = if latest_map.contains_key(&key_low) {
+            key_low.clone()
+        } else if legacy_only && !legacy_key.is_empty() {
+            legacy_key.clone()
+        } else {
+            key_low.clone()
+        };
+        if let Some(j) = latest_map.get(&job_lookup_key) {
             let csv_label = match j.status.as_str() {
                 "dang_cho" | "bo_qua" => Some("Đang chờ"),
                 "da_tao_image" => Some("Đã tạo image"),
@@ -1051,15 +1173,19 @@ pub fn run_with_emitter_and_hook(
     // B1: chọn dòng & lập kế hoạch bước chạy TRƯỚC khi tạo bản ghi mới
     let mut planned_rows: VecDeque<(prompts_csv::Row, RowPlan)> = VecDeque::new();
     let mut seen_keys = std::collections::HashSet::new();
-    for r in rows {
-        let key_low = r.anh_tham_chieu.trim().to_lowercase();
+    for r in &rows {
+        // Khoá dòng (tên ảnh + hash prompt) — dùng tên ảnh thì hai dòng cùng ảnh sẽ
+        // chia sẻ một bản ghi job và "dòng này xong thì dòng kia cũng xong".
+        let key_low = row_key_low(r);
         if key_low.is_empty() || !seen_keys.insert(key_low.clone()) {
             continue;
         }
-        let prev = latest_map.get(&key_low);
-        let db_img = media_map.get(&key_low).and_then(|m| m.image_file.as_deref());
-        if let Some(plan) = plan_row(&r, prev, cfg, &engine_cfg, &image_out, db_img) {
-            planned_rows.push_back((r, plan));
+        let prev = job_for_row(&latest_map, &rows, r);
+        // media_map dùng chung khoá với jobs; fallback tên ảnh khi ảnh duy nhất.
+        let db_img = map_lookup_legacy(&media_map, &rows, r)
+            .and_then(|m| m.image_file.as_deref());
+        if let Some(plan) = plan_row(r, prev, cfg, &engine_cfg, &image_out, db_img) {
+            planned_rows.push_back((r.clone(), plan));
         }
     }
 
@@ -1145,7 +1271,11 @@ pub fn run_with_emitter_and_hook(
                         break;
                     }
 
-                    let row_key = row.anh_tham_chieu.clone();
+                    let row_key = crate::prompts_csv::row_key_of(
+                        &row.anh_tham_chieu,
+                        &row.promt_tao_image,
+                        &row.promt_tao_video,
+                    );
                     let row_timer = Instant::now();
 
                     let prev_before_insert = latest_job_info(&w_conn, &row_key);
@@ -1460,13 +1590,19 @@ fn run_b2(
     row: &mut prompts_csv::Row,
     force_new: bool,
 ) -> Result<RowStatus, ApiFail> {
-    let row_key = row.anh_tham_chieu.clone();
+    // Tên ảnh (file trong input/) — KHÔNG phải khóa dòng.
+    let image_name = row.anh_tham_chieu.clone();
+    let row_key = crate::prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
     let ref_path = ctx
         .csv_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("input")
-        .join(&row_key);
+        .join(&image_name);
     if !ref_path.is_file() {
         return Err(ApiFail {
             kind: ApiFailKind::NghiepVu,
@@ -1733,7 +1869,11 @@ fn download_and_commit_video(
     url: &str,
     task_id: &str,
 ) -> Result<(), ApiFail> {
-    let row_key = row.anh_tham_chieu.clone();
+    let row_key = crate::prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
     ctx.emit_step_progress(
         &row_key,
         "download",
@@ -1832,7 +1972,11 @@ fn run_b3(
     row: &mut prompts_csv::Row,
     force_new: bool,
 ) -> Result<RowStatus, ApiFail> {
-    let row_key = row.anh_tham_chieu.clone();
+    let row_key = crate::prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
 
     if row.anh_da_tao.is_empty() {
         return Err(ApiFail {
@@ -2273,9 +2417,9 @@ pub fn dry_run(project_path: &Path, cfg: &Settings) -> AppResult<DryRunResult> {
     };
 
     for r in &rows {
-        let key_low = r.anh_tham_chieu.to_lowercase();
-        let prev = latest_map.get(&key_low);
-        let db_img = media_map.get(&key_low).and_then(|m| m.image_file.as_deref());
+        let prev = job_for_row(&latest_map, &rows, r);
+        let db_img = map_lookup_legacy(&media_map, &rows, r)
+            .and_then(|m| m.image_file.as_deref());
         let mut r_eff = r.clone();
         if r_eff.anh_da_tao.is_empty() {
             if let Some(img_f) = db_img {
@@ -2912,6 +3056,8 @@ mod tests {
             }],
         )
         .unwrap();
+        // Engine lưu jobs theo KHOÁ DÒNG (tên ảnh + hash prompt), không phải tên ảnh.
+        let bag_key = crate::prompts_csv::row_key_of("bag.png", "bag img", "bag vid");
 
         let phase = Arc::new(AtomicUsize::new(1));
         let post_video_calls = Arc::new(AtomicUsize::new(0));
@@ -3001,7 +3147,7 @@ mod tests {
         let _ = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag).unwrap();
         {
             let conn = crate::state_db::open(&dir).unwrap();
-            assert_eq!(latest_job_info(&conn, "bag.png").unwrap().attempts_count, 1);
+            assert_eq!(latest_job_info(&conn, &bag_key).unwrap().attempts_count, 1);
         }
 
         // 3) Poll gặp HTTP 502 liên tiếp khi đang carried_attempts = 1 -> phải dừng đúng ở 3/3 (KHÔNG bao giờ lên 4/3 hay 5/3!)
@@ -3010,7 +3156,7 @@ mod tests {
         {
             let conn = crate::state_db::open(&dir).unwrap();
             assert_eq!(
-                latest_job_info(&conn, "bag.png").unwrap().attempts_count,
+                latest_job_info(&conn, &bag_key).unwrap().attempts_count,
                 3,
                 "row-wide attempts_count must be capped strictly at max_attempts (3/3)!"
             );
@@ -3028,7 +3174,7 @@ mod tests {
         {
             let conn = crate::state_db::open(&dir).unwrap();
             assert_eq!(
-                latest_job_info(&conn, "bag.png").unwrap().attempts_count,
+                latest_job_info(&conn, &bag_key).unwrap().attempts_count,
                 0,
                 "DOWNLOAD_FAIL must not increment generation attempts_count"
             );
@@ -3046,7 +3192,7 @@ mod tests {
         {
             let conn = crate::state_db::open(&dir).unwrap();
             assert_eq!(
-                latest_job_info(&conn, "bag.png").unwrap().attempts_count,
+                latest_job_info(&conn, &bag_key).unwrap().attempts_count,
                 0,
                 "[P1-1]: attempts_count must reset to 0 on row completion"
             );

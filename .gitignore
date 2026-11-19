@@ -9,13 +9,22 @@ target/
 # Sidecar muse2api (PyInstaller)
 videoflow-app/sidecar/build/
 **/__pycache__/
-# Runtime state của engine khi chạy trực tiếp từ repo — data/accounts.json chứa COOKIE THẬT
-videoflow-app/sidecar/data/
+# Runtime state của engine — data/accounts.json chứa COOKIE THẬT.
+# config.py đặt data_dir TƯƠNG ĐỐI theo thư mục làm việc, nên `python -m muse2api` chạy từ
+# gốc repo / videoflow-app / sidecar đều sinh data/ ở chỗ khác nhau → chặn mọi `data/`.
+data/
+**/data/
 videoflow-app/sidecar/.env
+.env
 videoflow-app/sidecar/.venv/
-videoflow-app/sidecar/**/*.db
-videoflow-app/sidecar/**/*.db-wal
-videoflow-app/sidecar/**/*.db-shm
+.venv/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+# Khoá updater (không bao giờ commit)
+.updater-key.pem
+.updater-key.pem.pub
+.updater-pass.new
 
 # Build artifacts
 *.exe

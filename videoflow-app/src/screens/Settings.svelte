@@ -133,11 +133,20 @@
       await api.muse_stop_sidecar();
       await api.muse_start_sidecar();
       showToast("success", "Đã áp dụng cài đặt mới cho engine VideoFlow Muse.");
-      await museRefresh();
     } catch (e) {
       museErr = formatApiError(e);
-      showToast("error", museErr);
+      showToast("error", `Áp dụng thất bại: ${museErr}`);
+      // Engine có thể đang chết sau khi Dừng → thử khởi động lại để không để app ở
+      // trạng thái "badge Đang chạy nhưng engine đã chết".
+      try {
+        await api.muse_start_sidecar();
+        showToast("info", "Đã khởi động lại engine với cấu hình đang lưu.");
+      } catch (retryErr) {
+        museErr = `${museErr} — khởi động lại cũng lỗi: ${formatApiError(retryErr)}`;
+      }
     } finally {
+      // Luôn đồng bộ badge/nút theo trạng thái THẬT, kể cả khi lỗi.
+      await museRefresh();
       museSidecarBusy = false;
     }
   }
@@ -224,6 +233,34 @@
     if (diff < 3600) return `${Math.floor(diff / 60)} phút trước`;
     if (diff < 86400) return `${Math.floor(diff / 3600)} giờ trước`;
     return `${Math.floor(diff / 86400)} ngày trước`;
+  }
+
+  /** Các trường cấu hình engine đã đổi so với lúc spawn (dùng cho banner cảnh báo). */
+  function museChangedFields(): string[] {
+    const st = museStatus?.sidecar;
+    if (!st?.running || !s) return [];
+    const out: string[] = [];
+    if (st.cfg_port != null && Number(s.muse_sidecar_port) !== st.cfg_port) {
+      out.push(`Port ${st.cfg_port} → ${s.muse_sidecar_port}`);
+    }
+    const curChrome = (s.muse_chromium_path || "").trim();
+    const spawnedChrome = (st.cfg_chromium || "").trim();
+    // Chuẩn hoá để so sánh: bỏ tiền tố verbatim `\\?\`, quy `/` → `\`, bỏ hoa/thường.
+    // Gõ đúng đường dẫn đang dùng (chỉ khác dấu) thì KHÔNG báo "đã đổi".
+    const norm = (p: string) =>
+      p
+        .replace(/^\\\\\?\\/, "")
+        .replace(/\//g, "\\")
+        .replace(/\\+$/, "")
+        .toLowerCase();
+    const effective = norm(curChrome || museStatus?.chromium_path || "");
+    if (effective !== norm(spawnedChrome || museStatus?.chromium_path || "")) {
+      out.push(`Edge/Chrome → ${curChrome || "tự dò"}`);
+    }
+    if (st.cfg_headless != null && Boolean(s.muse_headless) !== st.cfg_headless) {
+      out.push(s.muse_headless ? "bật headless" : "tắt headless");
+    }
+    return out;
   }
 
   function museCookieExpiry(a: MuseAccount): { txt: string; cls: string } | null {
@@ -1391,9 +1428,10 @@
             <div class="muse-stale-config">
               <Icons name="alert" size={14} />
               <span>
-                Cài đặt <b>Port / Edge / headless</b> đã thay đổi nhưng engine đang chạy với cấu hình cũ
-                (port {museStatus.sidecar.cfg_port ?? "?"},
-                {museStatus.sidecar.cfg_headless ? "headless" : "có giao diện"}).
+                Engine đang chạy với cấu hình cũ:
+                {#each museChangedFields() as f, i (f)}
+                  {i > 0 ? ", " : ""}<b>{f}</b>
+                {/each}.
                 Bấm <b>"Áp dụng &amp; khởi động lại"</b> để có hiệu lực.
               </span>
             </div>

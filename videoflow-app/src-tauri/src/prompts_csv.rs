@@ -129,13 +129,66 @@ pub fn validate_row_key(key: &str, row_no: Option<usize>) -> AppResult<()> {
     Ok(())
 }
 
-/// Kiểm tra toàn bộ danh sách dòng: khóa rỗng trên dòng có prompt, path traversal,
-/// trùng khóa không phân biệt hoa/thường, và trùng tên gốc (`file_stem`) gây ghi đè sản phẩm đầu ra.
+/// Khóa định danh một dòng CSV.
+///
+/// Trước đây `row_key` **chính là** tên ảnh tham chiếu (cột A), nên thiết kế ngầm giả định
+/// 1 ảnh = 1 dòng. Workflow thật lại là **1 ảnh tham chiếu → N dòng với prompt khác nhau**:
+/// dùng lại ảnh cho 10 dòng thì bị chặn trùng khóa, và nếu bỏ chặn thì sửa/xóa/trạng thái
+/// dính chùm (first-match, hash theo row_key trong state.db, chọn dòng ở UI).
+///
+/// Khóa mới = `tên ảnh + "#" + 8 ký tự hash(prompt ảnh + prompt video)`:
+/// - ổn định khi chèn/xóa/sắp xếp lại dòng trong CSV (không phải số thứ tự),
+/// - **không** đổi format file CSV (giá trị khóa suy ra từ dữ liệu, cột A giữ nguyên tên ảnh),
+/// - hai dòng chỉ trùng khóa khi **cùng ảnh và cùng prompt** — đó mới đúng là trùng thật.
+///
+/// Dòng chưa có prompt (nháp) dùng hậu tố `#0` để vẫn phân biệt được với dòng đã điền.
+pub fn row_key_of(anh_tham_chieu: &str, prompt_image: &str, prompt_video: &str) -> String {
+    let name = anh_tham_chieu.trim();
+    let combined = format!("{}\u{1f}{}", prompt_image.trim(), prompt_video.trim());
+    if combined == "\u{1f}" {
+        // Chưa có prompt nào → chưa thể sinh media, khóa theo tên ảnh là đủ duy nhất
+        // (hai dòng cùng ảnh và đều trống prompt là dòng nháp, không có gì để tách).
+        return format!("{name}#0");
+    }
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(combined.as_bytes());
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{name}#{hex}")
+}
+
+/// Tên ảnh (stem) của một khóa dòng — bỏ hậu tố `#hash`. Khóa cũ (chỉ tên ảnh) trả về chính nó.
+pub fn row_key_image_name(row_key: &str) -> &str {
+    row_key.rsplit_once('#').map_or(row_key, |(name, hash)| {
+        if !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit() || c == '0') {
+            name
+        } else {
+            row_key
+        }
+    })
+}
+
+/// Duyệt mọi dòng của CSV và trả về khóa mới (`row_key_of`) cho từng dòng.
+/// Dùng để chuyển `row_key` cũ (tên ảnh) → khóa mới ở mọi nơi tra cứu.
+pub fn row_keys_by_legacy_key(rows: &[Row]) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for r in rows {
+        let legacy = r.anh_tham_chieu.trim().to_lowercase();
+        if legacy.is_empty() {
+            continue;
+        }
+        out.entry(legacy)
+            .or_default()
+            .push(row_key_of(&r.anh_tham_chieu, &r.promt_tao_image, &r.promt_tao_video));
+    }
+    out
+}
+
+/// Kiểm tra toàn bộ danh sách dòng: khóa rỗng / path traversal trên cột A, và trùng **khóa dòng**
+/// (`row_key_of`). Không còn chặn trùng tên ảnh hay trùng `file_stem`: một ảnh dùng cho nhiều
+/// dòng là workflow hợp lệ, và việc chống ghi đè file đầu ra đã do `next_version`
+/// (`stem_gen.png`, `stem_gen_v2.png`, …) đảm nhiệm.
 pub fn validate_rows(rows: &[Row]) -> AppResult<()> {
     let mut seen_keys: HashMap<String, (usize, String)> = HashMap::new();
-    let mut seen_stems: HashMap<String, (usize, String)> = HashMap::new();
     let mut dup_keys: Vec<String> = Vec::new();
-    let mut dup_stems: Vec<String> = Vec::new();
 
     for r in rows {
         if r.is_empty_content() {
@@ -147,48 +200,28 @@ pub fn validate_rows(rows: &[Row]) -> AppResult<()> {
             continue;
         }
 
-        let key_trimmed = r.anh_tham_chieu.trim();
-        let lower_key = key_trimmed.to_lowercase();
+        let key = row_key_of(&r.anh_tham_chieu, &r.promt_tao_image, &r.promt_tao_video);
+        let lower_key = key.to_lowercase();
         let row_label = if r.row_no > 0 { r.row_no } else { 0 };
 
-        if let Some((first_no, first_name)) = seen_keys.get(&lower_key) {
+        if let Some((first_no, first_key)) = seen_keys.get(&lower_key) {
             dup_keys.push(format!(
-                "'{}' (dòng {}) trùng với '{}' (dòng {})",
-                key_trimmed, row_label, first_name, first_no
+                "'{}' (dòng {}) trùng với (dòng {})",
+                r.anh_tham_chieu.trim(), row_label, first_no
             ));
+            let _ = first_key;
             continue;
         }
-        seen_keys.insert(lower_key, (row_label, key_trimmed.to_string()));
-
-        let stem = file_stem_lower(key_trimmed);
-        if !stem.is_empty() {
-            if let Some((first_no, first_name)) = seen_stems.get(&stem) {
-                dup_stems.push(format!(
-                    "'{}' (dòng {}) và '{}' (dòng {}) có cùng tên gốc '{}'",
-                    first_name, first_no, key_trimmed, row_label, stem
-                ));
-            } else {
-                seen_stems.insert(stem, (row_label, key_trimmed.to_string()));
-            }
-        }
+        seen_keys.insert(lower_key, (row_label, key));
     }
 
     if !dup_keys.is_empty() {
         return Err(AppError::new(
             "PROMPTS_DUPLICATE_KEY",
             format!(
-                "Tên ảnh tham chiếu bị trùng ở cột A (không phân biệt hoa/thường trên Windows): {}. Copy file ảnh thành tên khác hoặc đổi tên trong cột A rồi nạp lại.",
+                "Có dòng trùng hoàn toàn (cùng ảnh tham chiếu VÀ cùng prompt ảnh + prompt video): {}. \
+                 Sửa một trong hai prompt để mỗi dòng tạo ra sản phẩm khác nhau, hoặc xóa dòng thừa.",
                 dup_keys.join("; ")
-            ),
-        ));
-    }
-
-    if !dup_stems.is_empty() {
-        return Err(AppError::new(
-            "PROMPTS_DUPLICATE_STEM",
-            format!(
-                "Tên gốc ảnh tham chiếu bị trùng khiến ảnh/video đầu ra ghi đè lẫn nhau: {}. Hãy đổi tên gốc file ảnh trong thư mục input/ và cột A.",
-                dup_stems.join("; ")
             ),
         ));
     }
@@ -196,14 +229,6 @@ pub fn validate_rows(rows: &[Row]) -> AppResult<()> {
     Ok(())
 }
 
-fn file_stem_lower(file_name: &str) -> String {
-    Path::new(file_name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(file_name)
-        .trim()
-        .to_lowercase()
-}
 
 /// Chuẩn hóa mốc thời gian RFC3339 sang định dạng cột G/H `dd/mm/YYYY HH:MM` của CSV.
 pub fn format_csv_timestamp(ts: &str) -> String {
@@ -415,21 +440,56 @@ pub fn write_all(csv_path: &Path, rows: &[Row]) -> AppResult<()> {
 pub fn update_row<F: FnOnce(&mut Row)>(csv_path: &Path, row_key: &str, apply: F) -> AppResult<()> {
     let _guard = crate::csv_writer::GLOBAL_QUEUE.lock();
     let mut rows = read_all_unlocked(csv_path)?;
-    let pos = rows
-        .iter()
-        .position(|r| r.anh_tham_chieu == row_key)
-        .or_else(|| {
-            rows.iter()
-                .position(|r| r.anh_tham_chieu.eq_ignore_ascii_case(row_key))
-        })
-        .ok_or_else(|| {
-            AppError::new(
-                "ROW_NOT_FOUND",
-                format!("Không tìm thấy dòng có ảnh tham chiếu '{row_key}' trong prompts.csv"),
-            )
-        })?;
+    let pos = find_row_position(&rows, row_key).ok_or_else(|| {
+        AppError::new(
+            "ROW_NOT_FOUND",
+            format!("Không tìm thấy dòng '{row_key}' trong prompts.csv"),
+        )
+    })?;
     apply(&mut rows[pos]);
     write_all_unlocked(csv_path, &rows)
+}
+
+/// Tìm `Row` theo khóa dòng (dùng chung quy tắc với `update_row`/`delete_row`).
+pub fn find_row_by_key<'a>(rows: &'a [Row], row_key: &str) -> Option<&'a Row> {
+    find_row_position(rows, row_key).map(|i| &rows[i])
+}
+
+/// Định vị dòng theo khóa:
+/// 1. khớp `row_key_of` hiện tại (chính xác, kể cả hash prompt),
+/// 2. khớp không phân biệt hoa/thường (hash hex có thể khác case qua các bản),
+/// 3. fallback: `row_key` là tên ảnh thuần (dữ liệu/lời gọi kiểu cũ) → **chỉ** nhận khi
+///    tên ảnh đó xuất hiện đúng một dòng; nhiều dòng cùng ảnh là mơ hồ, KHÔNG đoán bừa.
+pub fn find_row_position(rows: &[Row], row_key: &str) -> Option<usize> {
+    let target = row_key.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let key_of =
+        |r: &Row| row_key_of(&r.anh_tham_chieu, &r.promt_tao_image, &r.promt_tao_video);
+
+    if let Some(i) = rows.iter().position(|r| key_of(r) == target) {
+        return Some(i);
+    }
+    if let Some(i) = rows
+        .iter()
+        .position(|r| key_of(r).eq_ignore_ascii_case(target))
+    {
+        return Some(i);
+    }
+    // Legacy: khóa là tên ảnh thuần (không có '#') → chỉ nhận khi duy nhất.
+    if !target.contains('#') {
+        let matches: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.anh_tham_chieu.eq_ignore_ascii_case(target))
+            .map(|(i, _)| i)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+    }
+    None
 }
 
 /// Lưu prompt cột B & C của một dòng (đã `.trim()` đồng nhất với khi đọc CSV).
@@ -453,24 +513,27 @@ pub fn remap_key(csv_path: &Path, old_key: &str, new_key: &str) -> AppResult<()>
     })
 }
 
-/// Xóa một dòng khỏi prompts.csv theo khóa ảnh tham chiếu.
+/// Xóa **đúng một** dòng khỏi prompts.csv theo khóa dòng.
+///
+/// Trước đây hàm retain theo tên ảnh nên xóa một dòng là xóa luôn mọi dòng dùng chung ảnh.
 pub fn delete_row(csv_path: &Path, row_key: &str) -> AppResult<()> {
     let _guard = crate::csv_writer::GLOBAL_QUEUE.lock();
     let mut rows = read_all_unlocked(csv_path)?;
-    let before = rows.len();
-    rows.retain(|r| !r.anh_tham_chieu.eq_ignore_ascii_case(row_key));
-    if rows.len() == before {
-        return Err(AppError::new(
+    let pos = find_row_position(&rows, row_key).ok_or_else(|| {
+        AppError::new(
             "ROW_NOT_FOUND",
             format!("Không tìm thấy dòng '{row_key}' trong prompts.csv"),
-        ));
-    }
+        )
+    })?;
+    rows.remove(pos);
     write_all_unlocked(csv_path, &rows)
 }
 
 /// Nhập hàng loạt dòng ảnh mới từ `input/` vào cuối `prompts.csv` dưới `GLOBAL_QUEUE`.
 /// Mỗi phần tử trong `new_rows` là `(anh_tham_chieu, promt_tao_image, promt_tao_video)`.
-/// Bỏ qua các khóa đã tồn tại (không phân biệt hoa/thường), và từ chối nếu trùng `file_stem` khác đuôi.
+/// Bỏ qua khóa dòng đã tồn tại (`row_key_of`: cùng ảnh **và** cùng prompt).
+/// Không còn chặn trùng tên ảnh/`file_stem`: một ảnh dùng cho nhiều dòng là hợp lệ,
+/// chống ghi đè đầu ra do `next_version` lo.
 pub fn append_rows(path: &Path, new_rows: &[(String, String, String)]) -> AppResult<usize> {
     let _guard = crate::csv_writer::GLOBAL_QUEUE.lock();
     if new_rows.is_empty() {
@@ -484,17 +547,14 @@ pub fn append_rows(path: &Path, new_rows: &[(String, String, String)]) -> AppRes
     };
 
     let mut existing_keys: HashSet<String> = HashSet::new();
-    let mut existing_stems: HashMap<String, String> = HashMap::new();
     for r in &rows {
         if r.is_empty_content() || r.is_example() {
             continue;
         }
-        let k = r.anh_tham_chieu.trim();
-        existing_keys.insert(k.to_lowercase());
-        let stem = file_stem_lower(k);
-        if !stem.is_empty() {
-            existing_stems.insert(stem, k.to_string());
-        }
+        existing_keys.insert(
+            row_key_of(&r.anh_tham_chieu, &r.promt_tao_image, &r.promt_tao_video)
+                .to_lowercase(),
+        );
     }
 
     let now_idea = chrono::Local::now().format("%d/%m/%Y %H:%M").to_string();
@@ -507,32 +567,20 @@ pub fn append_rows(path: &Path, new_rows: &[(String, String, String)]) -> AppRes
             continue;
         }
 
-        let lower_key = key.to_lowercase();
-        if existing_keys.contains(&lower_key) {
+        let img_prompt = raw_img_prompt.trim();
+        let vid_prompt = raw_vid_prompt.trim();
+        let row_key = row_key_of(key, img_prompt, vid_prompt).to_lowercase();
+        if existing_keys.contains(&row_key) {
             continue;
         }
-
-        let stem = file_stem_lower(key);
-        if let Some(conflict_file) = existing_stems.get(&stem) {
-            return Err(AppError::new(
-                "PROMPTS_DUPLICATE_STEM",
-                format!(
-                    "Không thể nhập '{key}' vì trùng tên gốc '{stem}' với '{conflict_file}' đã có trong danh sách."
-                ),
-            ));
-        }
-
-        existing_keys.insert(lower_key);
-        if !stem.is_empty() {
-            existing_stems.insert(stem, key.to_string());
-        }
+        existing_keys.insert(row_key);
 
         let next_row_no = rows.len() + 2;
         rows.push(Row {
             row_no: next_row_no,
             anh_tham_chieu: key.to_string(),
-            promt_tao_image: raw_img_prompt.trim().to_string(),
-            promt_tao_video: raw_vid_prompt.trim().to_string(),
+            promt_tao_image: img_prompt.to_string(),
+            promt_tao_video: vid_prompt.to_string(),
             ngay_tao_idea: now_idea.clone(),
             trang_thai: "Đang chờ".into(),
             ..Default::default()
@@ -688,27 +736,39 @@ mod tests {
             ("watch.webp".to_string(), "Đồng hồ".to_string(), "Cận cảnh".to_string()),
         ];
         let added = append_rows(&csv_p, &batch).expect("append batch");
-        assert_eq!(added, 2, "duplicate BAG.PNG must be skipped");
+        // Cả 3 dòng khác prompt nên không dòng nào là trùng thật — kể cả BAG.PNG (cùng
+        // ảnh, khác prompt) vẫn là dòng hợp lệ.
+        assert_eq!(added, 3, "mỗi dòng khác prompt là dòng mới hợp lệ");
 
-        // Thử nhập trùng stem bag.jpg -> báo lỗi PROMPTS_DUPLICATE_STEM
-        let stem_err = append_rows(
+        // Cùng ảnh nhưng prompt khác → là dòng MỚI hợp lệ (workflow 1 ảnh → N video).
+        let added_same_image = append_rows(
             &csv_p,
-            &[("bag.jpg".to_string(), "p".to_string(), "v".to_string())],
+            &[(
+                "bag.png".to_string(),
+                "Ảnh túi da mặt trước".to_string(),
+                "Video cận cảnh khoá".to_string(),
+            )],
         )
-        .expect_err("stem collision must error");
-        assert_eq!(stem_err.code, "PROMPTS_DUPLICATE_STEM");
+        .expect("same image with a different prompt must be accepted");
+        assert_eq!(added_same_image, 1);
 
-        // Chuyển phiên bản ảnh và video đang hoạt động
-        set_active_media_file(&csv_p, "bag.png", "image", "bag_gen_v2.png")
+        // Chuyển phiên bản ảnh/video đang hoạt động — dùng KHOÁ DÒNG (bag.png có 2 dòng
+        // cùng ảnh nên tên ảnh thuần là mơ hồ, đúng như thiết kế mới).
+        let bag_key = row_key_of("bag.png", "Ảnh túi da", "Video xoay 360");
+        set_active_media_file(&csv_p, &bag_key, "image", "bag_gen_v2.png")
             .expect("switch active image");
-        set_active_media_file(&csv_p, "bag.png", "video", "bag_gen_v2.mp4")
+        set_active_media_file(&csv_p, &bag_key, "video", "bag_gen_v2.mp4")
             .expect("switch active video");
 
         let rows = read_all(&csv_p).expect("read after switch");
-        let bag = rows.iter().find(|r| r.anh_tham_chieu == "bag.png").unwrap();
+        let bag = rows
+            .iter()
+            .find(|r| {
+                row_key_of(&r.anh_tham_chieu, &r.promt_tao_image, &r.promt_tao_video) == bag_key
+            })
+            .expect("bag row");
         assert_eq!(bag.anh_da_tao, "bag_gen_v2.png");
         assert_eq!(bag.video_da_tao, "bag_gen_v2.mp4");
-        assert_eq!(bag.trang_thai, "Đang chờ");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -747,27 +807,103 @@ mod tests {
     }
 
     #[test]
-    fn test_case_insensitive_duplicate_and_stem_collision() {
-        let dir = temp_dir("dups");
-
-        let csv_case = dir.join("dup_case.csv");
-        let body_case = format!(
-            "{}\r\nCat.png,p1,p2,,,,,,,\r\ncat.png,p3,p4,,,,,,,\r\n",
+    fn test_cung_anh_khac_prompt_la_hai_dong_hop_le() {
+        let dir = temp_dir("same_image");
+        let csv = dir.join("same_image.csv");
+        // 1 ảnh tham chiếu → 2 dòng prompt khác nhau: hợp lệ (workflow thật).
+        let body = format!(
+            "{}\r\ncat.png,ảnh mèo ngồi,video xoay,,,,,,,\r\ncat.png,ảnh mèo đứng,video zoom,,,,,,,\r\n",
             HEADER.join(",")
         );
-        fs::write(&csv_case, body_case.as_bytes()).expect("write dup_case");
-        let err_case = read_all(&csv_case).expect_err("must reject Cat.png vs cat.png");
-        assert_eq!(err_case.code, "PROMPTS_DUPLICATE_KEY");
+        fs::write(&csv, body.as_bytes()).expect("write same_image");
+        let rows = read_all(&csv).expect("same image + different prompts must be accepted");
+        assert_eq!(rows.len(), 2);
 
-        let csv_stem = dir.join("dup_stem.csv");
-        let body_stem = format!(
-            "{}\r\ncat.png,p1,p2,,,,,,,\r\nCAT.jpg,p3,p4,,,,,,,\r\n",
+        let k1 = row_key_of(&rows[0].anh_tham_chieu, &rows[0].promt_tao_image, &rows[0].promt_tao_video);
+        let k2 = row_key_of(&rows[1].anh_tham_chieu, &rows[1].promt_tao_image, &rows[1].promt_tao_video);
+        assert_ne!(k1, k2, "cùng ảnh nhưng khác prompt phải khác khoá");
+        assert!(k1.starts_with("cat.png#"), "khoá phải giữ tên ảnh: {k1}");
+        assert_eq!(row_key_image_name(&k1), "cat.png");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_trung_hoan_toan_moi_bao_loi() {
+        let dir = temp_dir("dup_exact");
+        let csv = dir.join("dup_exact.csv");
+        // Cùng ảnh + cùng prompt → trùng thật.
+        let body = format!(
+            "{}\r\ncat.png,p1,p2,,,,,,,\r\ncat.png,p1,p2,,,,,,,\r\n",
             HEADER.join(",")
         );
-        fs::write(&csv_stem, body_stem.as_bytes()).expect("write dup_stem");
-        let err_stem = read_all(&csv_stem).expect_err("must reject cat.png vs CAT.jpg");
-        assert_eq!(err_stem.code, "PROMPTS_DUPLICATE_STEM");
+        fs::write(&csv, body.as_bytes()).expect("write dup_exact");
+        let err = read_all(&csv).expect_err("identical rows must be rejected");
+        assert_eq!(err.code, "PROMPTS_DUPLICATE_KEY");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn test_xoa_dung_mot_dong_khi_nhieu_dong_cung_anh() {
+        let dir = temp_dir("delete_one");
+        let csv = dir.join("one.csv");
+        let body = format!(
+            "{}\r\ncat.png,pA,vA,,,,,,,\r\ncat.png,pB,vB,,,,,,,\r\n",
+            HEADER.join(",")
+        );
+        fs::write(&csv, body.as_bytes()).expect("write one");
+        let rows = read_all(&csv).expect("read");
+        let key_b = row_key_of(&rows[1].anh_tham_chieu, &rows[1].promt_tao_image, &rows[1].promt_tao_video);
+
+        delete_row(&csv, &key_b).expect("delete row B");
+        let after = read_all(&csv).expect("read after delete");
+        assert_eq!(after.len(), 1, "chỉ xoá đúng 1 dòng, không xoá cả chùm cùng ảnh");
+        assert_eq!(after[0].promt_tao_image, "pA");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sua_dung_dong_theo_khoa_moi() {
+        let dir = temp_dir("update_one");
+        let csv = dir.join("upd.csv");
+        let body = format!(
+            "{}\r\ncat.png,pA,vA,,,,,,,\r\ncat.png,pB,vB,,,,,,,\r\n",
+            HEADER.join(",")
+        );
+        fs::write(&csv, body.as_bytes()).expect("write upd");
+        let rows = read_all(&csv).expect("read");
+        let key_b = row_key_of(&rows[1].anh_tham_chieu, &rows[1].promt_tao_image, &rows[1].promt_tao_video);
+
+        update_row(&csv, &key_b, |r| r.ghi_chu_loi = "ghi-chu-B".into()).expect("update B");
+        let after = read_all(&csv).expect("read after update");
+        assert_eq!(after[0].ghi_chu_loi, "", "dòng A không được đổi theo");
+        assert_eq!(after[1].ghi_chu_loi, "ghi-chu-B");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_khoa_cu_chi_nhan_khi_duy_nhat() {
+        let dir = temp_dir("legacy_key");
+        let csv = dir.join("legacy.csv");
+        let body = format!(
+            "{}\r\ncat.png,pA,vA,,,,,,,\r\ncat.png,pB,vB,,,,,,,\r\n",
+            HEADER.join(",")
+        );
+        fs::write(&csv, body.as_bytes()).expect("write legacy");
+        // Khoá legacy (chỉ tên ảnh) với 2 dòng cùng ảnh là mơ hồ → phải báo không tìm thấy,
+        // KHÔNG được đoán bừa dòng đầu tiên.
+        let err = update_row(&csv, "cat.png", |r| r.ghi_chu_loi = "x".into())
+            .expect_err("legacy key must be ambiguous");
+        assert_eq!(err.code, "ROW_NOT_FOUND");
+
+        // Với 1 dòng duy nhất thì khoá legacy vẫn dùng được (tương thích dữ liệu cũ).
+        let csv_single = dir.join("single.csv");
+        let body_single = format!("{}\r\ncat.png,pA,vA,,,,,,,\r\n", HEADER.join(","));
+        fs::write(&csv_single, body_single.as_bytes()).expect("write single");
+        update_row(&csv_single, "cat.png", |r| r.ghi_chu_loi = "da-sua".into())
+            .expect("legacy key works when unique");
+        let after = read_all(&csv_single).expect("read");
+        assert_eq!(after[0].ghi_chu_loi, "da-sua");
         let _ = fs::remove_dir_all(&dir);
     }
 

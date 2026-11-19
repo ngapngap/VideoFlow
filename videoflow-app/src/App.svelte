@@ -329,7 +329,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.4.0";
+  let appVersion = "1.4.1";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;

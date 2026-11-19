@@ -73,7 +73,10 @@ export interface ProgressEvent {
 }
 
 export interface RowSummary {
+  /** Khóa dòng = `tên ảnh#hash(prompt ảnh + prompt video)` — dùng cho mọi command. */
   row_key: string;
+  /** Tên file ảnh tham chiếu (cột A) — hiển thị cho người dùng. */
+  image_name: string;
   status: string;
   image_file: string;
   video_file: string;

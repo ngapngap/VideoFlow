@@ -650,7 +650,7 @@
       const ok = await ensurePromptsSavedIfDirty();
       if (!ok) return;
       await api.run_row(detail.row.row_key);
-      showToast("info", `Đã bắt đầu chạy dòng ${detail.row.row_key}`);
+      showToast("info", `Đã bắt đầu chạy dòng ${detail.row.image_name}`);
     } catch (e) {
       showToast("error", formatApiError(e));
     } finally {
@@ -669,8 +669,8 @@
       showToast(
         "info",
         step === "anh"
-          ? `Đang chạy lại bước Ảnh + Video cho ${detail.row.row_key}`
-          : `Đang chạy lại riêng bước Video cho ${detail.row.row_key}`
+          ? `Đang chạy lại bước Ảnh + Video cho ${detail.row.image_name}`
+          : `Đang chạy lại riêng bước Video cho ${detail.row.image_name}`
       );
     } catch (e) {
       showToast("error", formatApiError(e));
@@ -709,7 +709,7 @@
       const next = new Set(selected);
       next.delete(updated.row.row_key);
       updateSelection(next);
-      showToast("info", `Đã đánh dấu bỏ qua dòng ${updated.row.row_key}.`);
+      showToast("info", `Đã đánh dấu bỏ qua dòng ${updated.row.image_name}.`);
       await load({ silent: true });
     } catch (e) {
       showToast("error", formatApiError(e));
@@ -1248,7 +1248,7 @@
                   <td>
                     <input
                       type="checkbox"
-                      aria-label={`Chọn dòng ${r.row_key}`}
+                      aria-label={`Chọn dòng ${r.image_name}`}
                       checked={selected.has(r.row_key)}
                       disabled={isLockedRow || $running}
                       title={r.status === "Đã tạo video"
@@ -1257,7 +1257,7 @@
                           ? "Dòng đang bỏ qua — mở Chi tiết để đặt lại trạng thái"
                           : r.attempts_count >= $maxAttemptsStore && !r.prompt_modified
                             ? `Đã chạm giới hạn ${$maxAttemptsStore}/${$maxAttemptsStore} lần thử — mở Chi tiết để đặt lại hoặc sửa prompt`
-                            : `Chọn ${r.row_key}`}
+                            : `Chọn ${r.image_name}`}
                       on:change={() => toggle(r)}
                     />
                   </td>
@@ -1286,7 +1286,7 @@
                         </span>
 
                         <span class="key-meta">
-                          <span class="key-name">{r.row_key}</span>
+                          <span class="key-name">{r.image_name}</span>
                           <span class="key-sub-badges">
                             {#if r.prompt_modified}
                               <span class="badge badge-sua-prompt mini-badge">Đã sửa prompt</span>
@@ -1417,7 +1417,7 @@
                             ? "Dòng đang bỏ qua — mở Chi tiết để đặt lại trạng thái"
                             : r.attempts_count >= $maxAttemptsStore && !r.prompt_modified
                               ? `Đã chạm ${$maxAttemptsStore}/${$maxAttemptsStore} lần thử — mở Chi tiết để đặt lại hoặc sửa prompt`
-                              : `Chạy riêng dòng ${r.row_key}`}
+                              : `Chạy riêng dòng ${r.image_name}`}
                       on:click={() => runOne(r.row_key)}
                     >
                       <Icons name="play" size={12} />
@@ -1477,7 +1477,7 @@
                     <input
                       class="grid-check"
                       type="checkbox"
-                      aria-label={`Chọn dòng ${r.row_key}`}
+                      aria-label={`Chọn dòng ${r.image_name}`}
                       checked={selected.has(r.row_key)}
                       disabled={isLockedRow || $running}
                       on:change={() => toggle(r)}
@@ -1502,7 +1502,7 @@
                       {:else if !orphanRow}
                         <img
                           src={projectFileUrl("input", r.row_key, $assetCacheBust)}
-                          alt={`Ảnh gốc ${r.row_key}`}
+                          alt={`Ảnh gốc ${r.image_name}`}
                           loading="lazy"
                           on:error={() => markThumbBroken(refThumbKey)}
                         />

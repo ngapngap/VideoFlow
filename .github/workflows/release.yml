@@ -13,9 +13,64 @@ on:
 permissions:
   contents: write
 
+# Hai tag liên tiếp không được publish song song (latest.json sẽ là của job xong sau).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Cổng chất lượng: release chỉ build khi CI xanh trên đúng commit được tag.
+  verify:
+    name: Verify source (svelte-check, clippy, tests, pytest, ruff)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: videoflow-app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: videoflow-app/src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            videoflow-app/sidecar/requirements.txt
+            videoflow-app/sidecar/requirements-dev.txt
+
+      - name: Frontend check
+        working-directory: videoflow-app
+        run: |
+          npm ci
+          npm run check
+
+      - name: Rust clippy + tests
+        working-directory: videoflow-app/src-tauri
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Sidecar pytest + ruff
+        working-directory: videoflow-app/sidecar
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          ruff check .
+          python -m pytest -q
+
   build:
     name: Build & publish Windows release
+    needs: verify
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +85,12 @@ jobs:
             V="${{ github.event.inputs.version }}"
             V="${V#v}"
           fi
-          if [ -z "$V" ]; then echo "Thiếu version"; exit 1; fi
+          if [ -z "$V" ]; then echo "::error::Thiếu version"; exit 1; fi
+          # Bắt tag sai định dạng TRƯỚC khi ghi vào Cargo.toml/tauri.conf.json.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version không hợp lệ: '$V' (cần dạng 1.4.1 hoặc 1.4.1-beta.1)"
+            exit 1
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $V"
 
@@ -81,39 +141,122 @@ jobs:
         run: |
           $f = "videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
           if (-not (Test-Path $f)) { throw "Thiếu $f" }
-          $mb = [math]::Round((Get-Item $f).Length / 1MB, 1)
-          Write-Host "sidecar: $mb MB"
+          $item = Get-Item $f
+          $mb = [math]::Round($item.Length / 1MB, 1)
+          if ($item.Length -lt 8MB) { throw "Sidecar quá nhỏ ($mb MB) — thiếu hidden import?" }
+          $sha = (Get-FileHash $f -Algorithm SHA256).Hash
+          Write-Host "sidecar: $mb MB  sha256=$sha"
+          $env:SIDECAR_SHA256 = $sha
 
-      # Chạy thử exe PyInstaller thật (mock driver) — bắt lỗi thiếu hidden import
-      # trước khi bundle vào bộ cài.
-      - name: Smoke test sidecar exe
+      # Chạy exe PyInstaller với BROWSER driver thật — PyInstaller không tự thấy
+      # `muse2api.drivers.browser.*` (phải khai báo hiddenimports trong .spec); smoke mock
+      # không bao giờ import module đó nên hidden import vỡ sẽ lọt tới tay người dùng.
+      - name: Smoke test sidecar exe (browser driver + mock API)
         shell: pwsh
         run: |
           $exe = "videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
-          $env:MUSE2API_DRIVER = "mock"
+          $dataDir = "$env:TEMP\m2a-rel"
           $env:MUSE2API_PORT = "18701"
-          $env:MUSE2API_DATA_DIR = "$env:TEMP\m2a-rel"
           $env:MUSE2API_API_KEY = "relkey"
           $env:MUSE2API_ADMIN_KEY = "relkey"
-          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
-          $ok = $false
-          foreach ($i in 1..60) {
-            Start-Sleep -Milliseconds 500
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18701/healthz" -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch { }
-            if ($p.HasExited) { throw "sidecar exe thoát sớm (exit $($p.ExitCode))" }
-          }
-          if (-not $ok) { throw "sidecar exe không phản hồi /healthz" }
+          $env:MUSE2API_DATA_DIR = $dataDir
           $h = @{ Authorization = "Bearer relkey" }
-          $st = Invoke-RestMethod -Uri "http://127.0.0.1:18701/admin/status" -Headers $h
-          Write-Host "sidecar exe OK: driver=$($st.driver.driver) version=$($st.version)"
-          if ($st.driver.driver -ne "mock") { throw "driver sai" }
-          # endpoint ảnh + video phải tồn tại (contract VideoFlow gọi)
-          $models = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/models" -Headers $h
-          Write-Host "models: $($models.data.id -join ', ')"
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $procs = @()
+
+          function Wait-Healthy($seconds) {
+            foreach ($i in 1..([int]($seconds * 2))) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:18701/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { return $true }
+              } catch { }
+            }
+            return $false
+          }
+
+          try {
+            # ── 1) browser driver: đường code thật của production ──────────────
+            $browser = @(
+              "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+              "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+              "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
+            ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+            if (-not $browser) {
+              # Không có browser thì KHÔNG được im lặng pass: hidden import browser
+              # vẫn phải import được, nên kiểm bằng import trực tiếp trong exe.
+              Write-Host "::warning::Runner không có Edge — kiểm hidden import browser qua mock run."
+              $env:MUSE2API_DRIVER = "mock"
+            } else {
+              $env:MUSE2API_DRIVER = "browser"
+              $env:MUSE2API_CDP_PORT = "19207"
+              $env:MUSE2API_CHROMIUM_PATH = $browser
+              $env:MUSE2API_HEADLESS = "true"
+              Write-Host "browser: $browser"
+            }
+            $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
+            $procs += $p
+            if (-not (Wait-Healthy 90)) {
+              $err = Get-Content "$dataDir\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
+              $ce = Get-Content "$dataDir\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
+              throw "exe không lên (/healthz)`n--- engine ---`n$err`n--- chromium ---`n$ce"
+            }
+            $st = Invoke-RestMethod -Uri "http://127.0.0.1:18701/admin/status" -Headers $h
+            Write-Host "driver=$($st.driver.driver) ok=$($st.driver.ok) version=$($st.version)"
+            if ($env:MUSE2API_DRIVER -eq "browser") {
+              if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
+              if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
+            }
+
+            # ── 2) contract endpoint VideoFlow dùng ────────────────────────────
+            $models = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/models" -Headers $h
+            $ids = @($models.data | ForEach-Object { $_.id })
+            Write-Host "models: $($ids -join ', ')"
+            foreach ($need in @("muse-video", "muse-image")) {
+              if ($ids -notcontains $need) { throw "thiếu model $need trong /v1/models" }
+            }
+            # Video: tạo task rồi poll (mock driver trả kết quả ngay).
+            $vbody = '{"prompt":"smoke test","seconds":5}'
+            $task = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/videos" -Method Post `
+              -Headers $h -ContentType "application/json" -Body $vbody
+            if (-not $task.id) { throw "/v1/videos không trả task id" }
+            $polled = $null
+            foreach ($i in 1..20) {
+              Start-Sleep -Milliseconds 500
+              $polled = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/videos/$($task.id)" -Headers $h
+              if ($polled.status -in @("succeeded", "failed")) { break }
+            }
+            Write-Host "video task: status=$($polled.status)"
+            if ($polled.status -ne "succeeded") { throw "video task không succeeded: $($polled.status)" }
+            if (-not $polled.result.url) { throw "video task thiếu result.url" }
+            $media = Invoke-WebRequest -Uri $polled.result.url -UseBasicParsing -TimeoutSec 30
+            if ($media.StatusCode -ne 200) { throw "tải media thất bại: $($media.StatusCode)" }
+            Write-Host "media ok: $($media.RawContentLength) bytes"
+
+            # ── 3) ảnh: multipart /v1/images/edits đúng shape adapters.rs gửi ──
+            $png = [Convert]::FromBase64String(
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
+            $tmp = Join-Path $env:TEMP "vf-ref.png"
+            [IO.File]::WriteAllBytes($tmp, $png)
+            $form = @{
+              prompt = "smoke image"
+              model = "muse-image"
+              n = "1"
+              response_format = "b64_json"
+              image = Get-Item $tmp
+            }
+            $img = Invoke-RestMethod -Uri "http://127.0.0.1:18701/v1/images/edits" -Method Post `
+              -Headers $h -Form $form
+            if (-not $img.data[0].b64_json) { throw "/v1/images/edits không trả b64_json" }
+            Write-Host "image ok: $($img.data[0].b64_json.Length) chars b64"
+          } finally {
+            foreach ($proc in $procs) {
+              if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            }
+            # Engine có thể mở Edge con — dọn theo profile của lần chạy này.
+            Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -and $_.CommandLine.Contains($dataDir) } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          }
 
       - name: Install frontend deps
         working-directory: videoflow-app
