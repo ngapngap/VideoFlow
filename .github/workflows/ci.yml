@@ -81,13 +81,14 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Thiếu $exe" }
 
           # windows-latest có Edge nhưng không nằm trên PATH — dò các vị trí chuẩn.
+          # Lưu ý cú pháp: biến có ngoặc phải viết ${env:ProgramFiles(x86)}.
           $candidates = @(
-            "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
             "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
             "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
             "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-            "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
-          ) | Where-Object { $_ -and (Test-Path $_) }
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
           if (-not $candidates) {
             Write-Host "::warning::Runner không có Edge/Chrome — bỏ qua smoke browser driver (đã có test spawn ở bước Tests)."
             exit 0
