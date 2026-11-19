@@ -54,6 +54,15 @@ jobs:
           npm ci
           npm run check
 
+      # tauri build script đòi file externalBin tồn tại; verify chỉ cần compile/test
+      # nên dùng stub rỗng (bản thật do job `build` tạo sau khi verify xanh).
+      - name: Stub sidecar binary
+        shell: bash
+        working-directory: videoflow-app/src-tauri
+        run: |
+          mkdir -p binaries
+          touch binaries/videoflow-muse-x86_64-pc-windows-msvc.exe
+
       - name: Rust clippy + tests
         working-directory: videoflow-app/src-tauri
         run: |
