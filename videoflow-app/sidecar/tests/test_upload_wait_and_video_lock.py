@@ -5,23 +5,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from muse2api.accounts.model import Account, AccountStatus
 from muse2api.accounts.pool import AccountPool
 from muse2api.accounts.store import JsonAccountStore
 from muse2api.config import Settings
-from muse2api.drivers.base import InputImage, MediaResult, VideoRequest
+from muse2api.drivers.base import InputImage, VideoRequest
 from muse2api.drivers.browser import dom
 from muse2api.drivers.browser.driver import BrowserDriver, _Tab
 from muse2api.errors import (
     NoAccountAvailable,
     UpstreamError,
-    UpstreamRefused,
     UpstreamTimeout,
     UpstreamVideoLocked,
 )

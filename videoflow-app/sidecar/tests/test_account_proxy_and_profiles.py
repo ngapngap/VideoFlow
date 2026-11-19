@@ -7,22 +7,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from muse2api.accounts.model import Account, AccountStatus
+from muse2api.accounts.model import Account
 from muse2api.accounts.pool import AccountPool
 from muse2api.accounts.store import JsonAccountStore
 from muse2api.api.schemas import AccountCreate, AccountUpdate
 from muse2api.app import create_app
 from muse2api.config import Settings
 from muse2api.drivers.base import MuseDriver
-from muse2api.drivers.browser.chromium import ChromiumProcess, _build_wmi_filter, _kill_stale_browsers
+from muse2api.drivers.browser.chromium import (
+    ChromiumProcess,
+    _build_wmi_filter,
+)
 from muse2api.drivers.browser.driver import (
     BrowserDriver,
-    allocate_cdp_port,
-    release_cdp_port,
     resolve_account_profile_dir,
     resolve_proxy,
 )
-
 
 # =========================================================================
 # 1. Account model & Schema proxy support (P2-3)
@@ -281,7 +281,7 @@ async def test_admin_api_account_proxy_save_and_update(tmp_path: Path):
     settings.ensure_dirs()
 
     store = JsonAccountStore(settings.accounts_file)
-    pool = AccountPool(store, strategy="round_robin", max_concurrency=1)
+    AccountPool(store, strategy="round_robin", max_concurrency=1)
 
     class MockTestDriver(MuseDriver):
         name = "mock_test"

@@ -4535,7 +4535,7 @@ mod tests {
         assert_eq!(plan2.unwrap().steps, vec![Step::B3]);
 
         // 4. Lập kế hoạch duyệt toàn bộ CSV rows chỉ chọn đúng 1 dòng mục tiêu
-        let all_rows = vec![row1.clone(), row2.clone()];
+        let all_rows = [row1.clone(), row2.clone()];
         let planned_for_key1: Vec<_> = all_rows
             .iter()
             .filter_map(|r| plan_row(r, None, &cfg, &cfg_isolated_b3, &img_out, None))

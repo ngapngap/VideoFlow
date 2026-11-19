@@ -1,5 +1,4 @@
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -7,8 +6,8 @@ from httpx import ASGITransport, AsyncClient
 from muse2api.accounts.model import Account, AccountStatus
 from muse2api.accounts.pool import AccountPool
 from muse2api.accounts.store import JsonAccountStore
-from muse2api.app import create_app
 from muse2api.api.deps import require_admin_key
+from muse2api.app import create_app
 from muse2api.auth.keys import KeyStore
 from muse2api.config import Settings
 from muse2api.core.matting import Matting
@@ -127,7 +126,7 @@ async def test_open_login_success(test_services, app):
     acc = Account(id="acc_login_ok", label="Login Acc", proxy="http://proxy:8080")
     await test_services.pool.upsert(acc)
 
-    with patch.object(test_services.interactive, "_run_login_session", new_callable=AsyncMock) as mock_run:
+    with patch.object(test_services.interactive, "_run_login_session", new_callable=AsyncMock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             res = await client.post(f"/admin/accounts/{acc.id}/open-login")
             assert res.status_code == 200
@@ -155,7 +154,7 @@ async def test_open_view_success(test_services, app):
     acc = Account(id="acc_view_ok", label="View Acc", meta={"last_thread_url": "https://muse.ai/thread/123"})
     await test_services.pool.upsert(acc)
 
-    with patch.object(test_services.interactive, "_run_view_session", new_callable=AsyncMock) as mock_run:
+    with patch.object(test_services.interactive, "_run_view_session", new_callable=AsyncMock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             res = await client.post(f"/admin/accounts/{acc.id}/open-view")
             assert res.status_code == 200

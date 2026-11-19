@@ -26,8 +26,8 @@ pub const HEADER: [&str; 10] = [
 ];
 
 /// Kiểm tra xem tên cột có phải là cột nối cảnh hay không (hỗ trợ các biến thể hoa/thường, có/không dấu, gạch dưới/dấu cách).
-pub fn is_noi_canh_header(header: &str) -> bool {
-    let s = header.trim().to_lowercase();
+pub fn is_noi_canh_header(header: impl AsRef<str>) -> bool {
+    let s = header.as_ref().trim().to_lowercase();
     matches!(
         s.as_str(),
         "noi_canh"
@@ -44,10 +44,7 @@ pub fn is_noi_canh_header(header: &str) -> bool {
 /// Parse giá trị chuỗi thành boolean nối cảnh (1/0, true/false, yes/no, có/không).
 pub fn parse_noi_canh_value(val: &str) -> bool {
     let s = val.trim().to_lowercase();
-    match s.as_str() {
-        "1" | "true" | "yes" | "y" | "on" | "có" | "co" => true,
-        _ => false,
-    }
+    matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on" | "có" | "co")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -344,7 +341,7 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
     }
 
     let header_len = headers.len();
-    let noi_canh_col_idx: Option<usize> = headers.iter().position(|h| is_noi_canh_header(h));
+    let noi_canh_col_idx: Option<usize> = headers.iter().position(is_noi_canh_header);
     let mut rows = Vec::new();
     for (idx, rec) in record_iter.records().enumerate() {
         let row_no = idx + 2;

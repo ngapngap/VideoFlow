@@ -812,19 +812,21 @@ pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
                         }
                     }
                 }
-            } else if tag == b"tkhd" && res_out.is_none() && payload_len >= 80 {
-                if reader.seek(SeekFrom::Start(payload_offset)).is_ok() {
-                    let mut buf = [0u8; 96];
-                    let read_len = buf.len().min(payload_len as usize);
-                    if reader.read_exact(&mut buf[..read_len]).is_ok() {
-                        let version = buf[0];
-                        let offset = if version == 0 { 76 } else { 88 };
-                        if read_len >= offset + 8 {
-                            let w = u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]) >> 16;
-                            let h = u32::from_be_bytes([buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]]) >> 16;
-                            if w > 0 && h > 0 {
-                                *res_out = Some(format!("{w}x{h}"));
-                            }
+            } else if tag == b"tkhd"
+                && res_out.is_none()
+                && payload_len >= 80
+                && reader.seek(SeekFrom::Start(payload_offset)).is_ok()
+            {
+                let mut buf = [0u8; 96];
+                let read_len = buf.len().min(payload_len as usize);
+                if reader.read_exact(&mut buf[..read_len]).is_ok() {
+                    let version = buf[0];
+                    let offset = if version == 0 { 76 } else { 88 };
+                    if read_len >= offset + 8 {
+                        let w = u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]) >> 16;
+                        let h = u32::from_be_bytes([buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]]) >> 16;
+                        if w > 0 && h > 0 {
+                            *res_out = Some(format!("{w}x{h}"));
                         }
                     }
                 }

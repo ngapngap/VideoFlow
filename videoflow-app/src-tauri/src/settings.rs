@@ -719,8 +719,10 @@ mod tests {
         let store_file = dir.join("settings.json");
         let store = SettingsStore::with_path(store_file);
 
-        let mut custom = Settings::default();
-        custom.auto_merge = true;
+        let mut custom = Settings {
+            auto_merge: true,
+            ..Default::default()
+        };
         store.save(&custom).expect("save settings with auto_merge = true");
 
         let reloaded = store.load();

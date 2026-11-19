@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from muse2api.config import Settings
 from muse2api.core.media import MediaStore
 from muse2api.drivers.browser import dom
@@ -21,7 +21,7 @@ from muse2api.drivers.browser.driver import (
     verify_and_save_download,
     verify_magic_bytes,
 )
-from muse2api.errors import UpstreamError, UpstreamTimeout
+from muse2api.errors import UpstreamError
 
 
 @pytest.fixture

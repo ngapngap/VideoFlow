@@ -207,9 +207,9 @@ async def verify_and_save_download(data: bytes, kind: str) -> bytes:
             except (FileNotFoundError, OSError) as exc:
                 log.warning("FFmpeg not available or cannot run (%s); falling back to minimum size and magic bytes check", exc)
                 if len(data) < 16 or not verify_magic_bytes(data, "video"):
-                    raise UpstreamError("video failed fallback integrity check: file too small or invalid magic bytes")
-            except asyncio.TimeoutError:
-                raise UpstreamError("FFmpeg decode verification timed out")
+                    raise UpstreamError("video failed fallback integrity check: file too small or invalid magic bytes") from exc
+            except asyncio.TimeoutError as exc:
+                raise UpstreamError("FFmpeg decode verification timed out") from exc
 
         # Atomic rename to official verified file
         partial_path.replace(verified_path)

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from muse2api.accounts.model import Account
 from muse2api.accounts.pool import AccountPool
 from muse2api.config import Settings
