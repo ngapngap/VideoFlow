@@ -79,6 +79,22 @@ jobs:
         run: |
           $exe = "binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
           if (-not (Test-Path $exe)) { throw "Thiếu $exe" }
+
+          # windows-latest có Edge nhưng không nằm trên PATH — dò các vị trí chuẩn.
+          $candidates = @(
+            "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $candidates) {
+            Write-Host "::warning::Runner không có Edge/Chrome — bỏ qua smoke browser driver (đã có test spawn ở bước Tests)."
+            exit 0
+          }
+          $browser = $candidates[0]
+          Write-Host "browser: $browser"
+
           $env:MUSE2API_DRIVER = "browser"
           $env:MUSE2API_PORT = "18703"
           $env:MUSE2API_CDP_PORT = "19203"
@@ -86,22 +102,26 @@ jobs:
           $env:MUSE2API_API_KEY = "bkey"
           $env:MUSE2API_ADMIN_KEY = "bkey"
           $env:MUSE2API_HEADLESS = "true"
-          $env:MUSE2API_CHROMIUM_PATH = (Get-Command msedge.exe -ErrorAction SilentlyContinue).Source
+          $env:MUSE2API_CHROMIUM_PATH = $browser
           $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
           $ok = $false
-          foreach ($i in 1..120) {
+          foreach ($i in 1..150) {
             Start-Sleep -Milliseconds 500
-            if ($p.HasExited) { throw "engine thoát sớm: $((Get-Content "$env:TEMP\m2a-ci-browser\engine-stderr.log" -Raw -ErrorAction SilentlyContinue))" }
+            if ($p.HasExited) {
+              $err = Get-Content "$env:TEMP\m2a-ci-browser\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
+              $ce = Get-Content "$env:TEMP\m2a-ci-browser\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
+              throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
+            }
             try {
               $r = Invoke-WebRequest -Uri "http://127.0.0.1:18703/healthz" -UseBasicParsing -TimeoutSec 2
               if ($r.StatusCode -eq 200) { $ok = $true; break }
             } catch { }
           }
-          if (-not $ok) { throw "engine browser driver không lên được" }
+          if (-not $ok) { throw "engine browser driver không lên được trong 75s" }
           $h = @{ Authorization = "Bearer bkey" }
           $st = Invoke-RestMethod -Uri "http://127.0.0.1:18703/admin/status" -Headers $h
           if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
-          if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver)" }
+          if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
           Write-Host "browser driver OK: tabs=$($st.driver.tabs) busy=$($st.driver.busy_tabs)"
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 
