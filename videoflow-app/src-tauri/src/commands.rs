@@ -622,6 +622,7 @@ pub fn get_rows(
         crate::state_db::open(&p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     let latest_map = engine::load_latest_jobs_map(&conn);
     let media_map = engine::load_current_media_map(&conn);
+    let img_counts = engine::image_counts(&rows);
     let img_dir = p.join("image_out");
     let vid_dir = p.join("video_out");
 
@@ -643,8 +644,11 @@ pub fn get_rows(
             &r.promt_tao_video,
         );
         let key_low = row_key.to_lowercase();
-        let prev = latest_map.get(&key_low);
-        let media = media_map.get(&key_low);
+        let prev_owned = engine::latest_job_for_csv_row(&conn, r, &latest_map, &img_counts);
+        let prev = prev_owned.as_ref();
+        let media = media_map
+            .get(&key_low)
+            .or_else(|| prev.and_then(|j| media_map.get(&j.row_key.to_lowercase())));
         let label = engine::effective_status_label(r, prev);
         let prompt_modified = engine::is_prompt_modified(r, prev);
         let attempts_count = prev.map(|j| j.attempts_count).unwrap_or(0);
@@ -858,9 +862,10 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     );
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    // Tra job: khoá mới trước, fallback dữ liệu cũ (row_key = tên ảnh) khi ảnh duy nhất.
+    // Tra job nhất quán theo actual_key -> file_refs -> legacy (khi ảnh duy nhất).
     let latest_map = engine::load_latest_jobs_map(&conn);
-    let prev_owned = engine::map_lookup_legacy(&latest_map, &rows, row).cloned();
+    let img_counts = engine::image_counts(&rows);
+    let prev_owned = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts);
     let prev = prev_owned.as_ref();
 
     let status_label = engine::effective_status_label(row, prev);
@@ -876,7 +881,9 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let ref_abs_path = clean_abs_path_string(&ref_path);
 
     let media_map = engine::load_current_media_map(&conn);
-    let media_cur = media_map.get(&actual_key.to_lowercase());
+    let media_cur = media_map
+        .get(&actual_key.to_lowercase())
+        .or_else(|| prev.and_then(|j| media_map.get(&j.row_key.to_lowercase())));
 
     let eff_image_file = if let Some(f) = media_cur
         .and_then(|m| m.image_file.as_ref())
@@ -910,9 +917,24 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         None
     };
 
+    // Gom toàn bộ khoá liên quan của dòng (actual_key + khoá job gốc khi sửa prompt / nâng cấp v1.4.0)
+    let mut related_keys: Vec<String> = vec![actual_key.to_lowercase()];
+    if let Some(j) = prev {
+        let jk = j.row_key.to_lowercase();
+        if !related_keys.contains(&jk) {
+            related_keys.push(jk);
+        }
+    }
+    let legacy_low = row.anh_tham_chieu.trim().to_lowercase();
+    if img_counts.get(&legacy_low).copied().unwrap_or(0) == 1 && !related_keys.contains(&legacy_low)
+    {
+        related_keys.push(legacy_low);
+    }
+
     let mut timeline = Vec::new();
+    let mut seen_attempt_ids = std::collections::HashSet::<i64>::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT a.started_at, a.step, a.result, a.error_message,
+        "SELECT a.id, a.started_at, a.step, a.result, a.error_message,
                 j.run_id, a.attempt_no, a.http_status, j.duration_ms
          FROM attempts a
          INNER JOIN jobs j ON j.id = a.job_id
@@ -920,49 +942,67 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
          ORDER BY a.id DESC
          LIMIT 30",
     ) {
-        if let Ok(it) = stmt.query_map(rusqlite::params![actual_key], |r| {
-            Ok(TimelineEntry {
-                ts: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                step: r.get::<_, String>(1)?,
-                result: r.get::<_, String>(2)?,
-                error: r.get::<_, Option<String>>(3)?,
-                run_id: r.get::<_, Option<i64>>(4)?,
-                attempt_no: r.get::<_, Option<i64>>(5)?,
-                http_status: r.get::<_, Option<i64>>(6)?,
-                duration_ms: r.get::<_, Option<i64>>(7)?,
-            })
-        }) {
-            for item in it.flatten() {
-                timeline.push(item);
+        let mut raw_timeline: Vec<(i64, TimelineEntry)> = Vec::new();
+        for rk in &related_keys {
+            if let Ok(it) = stmt.query_map(rusqlite::params![rk], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    TimelineEntry {
+                        ts: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        step: r.get::<_, String>(2)?,
+                        result: r.get::<_, String>(3)?,
+                        error: r.get::<_, Option<String>>(4)?,
+                        run_id: r.get::<_, Option<i64>>(5)?,
+                        attempt_no: r.get::<_, Option<i64>>(6)?,
+                        http_status: r.get::<_, Option<i64>>(7)?,
+                        duration_ms: r.get::<_, Option<i64>>(8)?,
+                    },
+                ))
+            }) {
+                for (aid, item) in it.flatten() {
+                    if seen_attempt_ids.insert(aid) {
+                        raw_timeline.push((aid, item));
+                    }
+                }
             }
         }
+        raw_timeline.sort_by_key(|a| std::cmp::Reverse(a.0));
+        raw_timeline.truncate(30);
+        timeline = raw_timeline.into_iter().map(|(_, e)| e).collect();
     }
 
     let mut files = Vec::new();
+    let mut seen_files = std::collections::HashSet::<(String, String, i64)>::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT kind, file_name, file_path, version, is_current, size_bytes, created_at
          FROM file_refs
          WHERE LOWER(row_key) = LOWER(?1)
          ORDER BY kind ASC, version DESC",
     ) {
-        if let Ok(it) = stmt.query_map(rusqlite::params![actual_key], |r| {
-            let rel_path: String = r.get(2)?;
-            let abs = clean_abs_path_string(&p.join(&rel_path));
-            Ok(FileRef {
-                kind: r.get(0)?,
-                file_name: r.get(1)?,
-                file_path: rel_path,
-                abs_path: abs,
-                version: r.get(3)?,
-                is_current: r.get::<_, i64>(4)? == 1,
-                size_bytes: r.get(5)?,
-                created_at: r.get(6)?,
-            })
-        }) {
-            for item in it.flatten() {
-                files.push(item);
+        for rk in &related_keys {
+            if let Ok(it) = stmt.query_map(rusqlite::params![rk], |r| {
+                let rel_path: String = r.get(2)?;
+                let abs = clean_abs_path_string(&p.join(&rel_path));
+                Ok(FileRef {
+                    kind: r.get(0)?,
+                    file_name: r.get(1)?,
+                    file_path: rel_path,
+                    abs_path: abs,
+                    version: r.get(3)?,
+                    is_current: r.get::<_, i64>(4)? == 1,
+                    size_bytes: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            }) {
+                for item in it.flatten() {
+                    let key = (item.kind.clone(), item.file_name.clone(), item.version);
+                    if seen_files.insert(key) {
+                        files.push(item);
+                    }
+                }
             }
         }
+        files.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| b.version.cmp(&a.version)));
     }
 
     if !files.iter().any(|f| f.kind == "anh") {
@@ -1410,9 +1450,12 @@ pub fn rerun_row_step(
     );
 
     if forced == Step::B3 {
-        // [P0-2] / #27 [P0-3]: Chặn chạy riêng bước Video nếu prompt tạo ảnh đã bị sửa đổi!
+        // [P0-2] / #22: Chặn chạy riêng bước Video nếu prompt tạo ảnh đã bị sửa đổi
+        // (tra qua latest_job_for_csv_row để nhận diện cả khi đã bấm Lưu prompt làm đổi hash row_key).
         if let Ok(conn) = crate::state_db::open(&p) {
-            let prev = engine::latest_job_info(&conn, &key_of_row);
+            let latest_map = engine::load_latest_jobs_map(&conn);
+            let img_counts = engine::image_counts(&rows);
+            let prev = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts);
             let (img_changed, _) = engine::detect_prompt_change(row, prev.as_ref());
             if img_changed {
                 return Err(AppError::new(
@@ -1533,35 +1576,42 @@ fn ensure_seed_run_id(conn: &rusqlite::Connection) -> AppResult<i64> {
 pub fn reset_row_status_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let updated = conn.execute(
-        "UPDATE jobs
-         SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
-             image_prompt_hash = NULL, video_prompt_hash = NULL,
-             video_task_id = NULL, video_download_url = NULL,
-             attempts_count = 0, last_error = NULL
-         WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
-        rusqlite::params![row_key],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    let mut updated = conn
+        .execute(
+            "UPDATE jobs
+             SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
+                 image_prompt_hash = NULL, video_prompt_hash = NULL,
+                 video_task_id = NULL, video_download_url = NULL,
+                 attempts_count = 0, last_error = NULL
+             WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
+            rusqlite::params![row_key],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     if updated == 0 {
         if let Ok(rows) = prompts_csv::read_all(&p.join("prompts.csv")) {
             if let Some(row) = prompts_csv::find_row_by_key(&rows, row_key) {
-                let legacy_key = row.anh_tham_chieu.trim();
-                if !legacy_key.is_empty() && !legacy_key.eq_ignore_ascii_case(row_key) {
-                    let _ = conn.execute(
-                        "UPDATE jobs
-                         SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
-                             image_prompt_hash = NULL, video_prompt_hash = NULL,
-                             video_task_id = NULL, video_download_url = NULL,
-                             attempts_count = 0, last_error = NULL
-                         WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
-                        rusqlite::params![legacy_key],
-                    );
+                let latest_map = engine::load_latest_jobs_map(&conn);
+                let img_counts = engine::image_counts(&rows);
+                if let Some(linked) =
+                    engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts)
+                {
+                    updated = conn
+                        .execute(
+                            "UPDATE jobs
+                             SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
+                                 image_prompt_hash = NULL, video_prompt_hash = NULL,
+                                 video_task_id = NULL, video_download_url = NULL,
+                                 attempts_count = 0, last_error = NULL
+                             WHERE id = ?1",
+                            rusqlite::params![linked.id],
+                        )
+                        .unwrap_or(0);
                 }
             }
         }
     }
+    let _ = updated;
 
     prompts_csv::update_row(&p.join("prompts.csv"), row_key, |r| {
         r.trang_thai = "Đang chờ".into();
@@ -1659,45 +1709,60 @@ pub fn remap_reference_image_at(
     }
 
     let csv_path = p.join("prompts.csv");
+    let before_rows = prompts_csv::read_all(&csv_path)?;
+    let old_row = prompts_csv::find_row_by_key(&before_rows, row_key)
+        .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?
+        .clone();
+    let old_key = prompts_csv::row_key_of(
+        &old_row.anh_tham_chieu,
+        &old_row.promt_tao_image,
+        &old_row.promt_tao_video,
+    );
+    let new_key = prompts_csv::row_key_of(
+        trimmed_new,
+        &old_row.promt_tao_image,
+        &old_row.promt_tao_video,
+    );
+
     prompts_csv::remap_key(&csv_path, row_key, trimmed_new)?;
 
-    if !row_key.eq_ignore_ascii_case(trimmed_new) {
+    if !old_key.eq_ignore_ascii_case(&new_key) {
         let mut conn =
             crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
         let tx = conn
             .transaction()
             .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-        // [P2-5]: Dọn toàn bộ bản ghi mồ côi của `trimmed_new` trong `attempts`, `file_refs`, `jobs`
-        // để không bao giờ còn sót 2 bản ghi `is_current = 1` hoặc đụng UNIQUE(run_id, row_key)!
+        // Chỉ cập nhật từ old_key -> new_key (không xóa bản ghi của dòng anh em dùng chung ảnh mới).
+        // Dọn bản ghi cũ trùng đúng new_key nếu có để tránh đụng UNIQUE(run_id, row_key).
         tx.execute(
             "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![trimmed_new],
+            rusqlite::params![new_key],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
         tx.execute(
             "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)
                 OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![trimmed_new],
+            rusqlite::params![new_key],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
         tx.execute(
             "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
-            rusqlite::params![trimmed_new],
+            rusqlite::params![new_key],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
         tx.execute(
-            "UPDATE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![trimmed_new, row_key],
+            "UPDATE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
+            rusqlite::params![new_key, old_key, row_key],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
 
         tx.execute(
-            "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![trimmed_new, row_key],
+            "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
+            rusqlite::params![new_key, old_key, row_key],
         )
         .map_err(|e| {
             AppError::new(
@@ -1707,8 +1772,8 @@ pub fn remap_reference_image_at(
         })?;
 
         tx.execute(
-            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![trimmed_new, row_key],
+            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
+            rusqlite::params![new_key, old_key, row_key],
         )
         .ok();
 
@@ -1717,15 +1782,15 @@ pub fn remap_reference_image_at(
     } else if let Ok(conn) = crate::state_db::open(p) {
         let _ = conn.execute(
             "UPDATE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![trimmed_new, row_key],
+            rusqlite::params![new_key, old_key],
         );
         let _ = conn.execute(
             "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![trimmed_new, row_key],
+            rusqlite::params![new_key, old_key],
         );
     }
 
-    build_row_detail_at(p, trimmed_new)
+    build_row_detail_at(p, &new_key)
 }
 
 #[tauri::command]
@@ -1893,22 +1958,25 @@ pub fn save_row_prompts_at(
     let conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-    // Di trú bản ghi job của dòng này sang KHOÁ MỚI (khoá chứa hash prompt).
-    //
-    // Áp dụng cho mọi bản ghi "chưa sinh sản phẩm" (dang_cho/bo_qua, attempts = 0,
-    // image/video status = chua_chay): dời khoá + cập nhật hash để không hiện cảnh báo
-    // "prompt đã sửa" ngay sau khi người dùng tự sửa prompt. Bản ghi đã có kết quả
-    // (đã tạo ảnh/video, đã thử) được GIỮ NGUYÊN ở khoá cũ — đó chính là mốc để phát
-    // hiện "prompt đã sửa" về sau.
+    let old_key = prompts_csv::row_key_of(
+        &old_row.anh_tham_chieu,
+        &old_row.promt_tao_image,
+        &old_row.promt_tao_video,
+    );
     let image_low = image_name.trim().to_lowercase();
-    // Ngoặc rõ ràng cho nhóm khoá: `(A OR B) AND <điều kiện chưa chạy>` — thiếu ngoặc thì
-    // `OR` sẽ nuốt mất điều kiện và UPDATE ghi đè cả bản ghi ĐÃ CÓ KẾT QUẢ (hash prompt
-    // lịch sử bị xoá → mất cảnh báo "prompt đã sửa").
-    let moved = conn
-        .execute(
+    let same_image = engine::image_counts(&before)
+        .get(&image_low)
+        .copied()
+        .unwrap_or(0);
+
+    // Di trú bản ghi job "chưa sinh sản phẩm" của CHÍNH dòng này sang khoá mới.
+    // Chỉ khớp chính xác `old_key` (và fallback tên ảnh trần khi `same_image == 1`);
+    // TUYỆT ĐỐI không dùng `LIKE image_low || '#%'` để tránh cướp/xóa dòng anh em dùng chung ảnh.
+    if same_image == 1 {
+        conn.execute(
             "UPDATE jobs
              SET row_key = ?1, image_prompt_hash = ?2, video_prompt_hash = ?3
-             WHERE (LOWER(row_key) = LOWER(?4) OR LOWER(row_key) LIKE ?5 || '#%')
+             WHERE (LOWER(row_key) = LOWER(?4) OR LOWER(row_key) = LOWER(?5))
                AND status IN ('dang_cho', 'bo_qua')
                AND attempts_count = 0
                AND image_status = 'chua_chay'
@@ -1917,26 +1985,29 @@ pub fn save_row_prompts_at(
                 new_key,
                 engine::sha2hex(trimmed_img),
                 engine::sha2hex(trimmed_vid),
-                row_key,
+                old_key,
                 image_low
             ],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    // Nếu sau khi dời còn nhiều bản ghi cùng tên ảnh ở trạng thái "chưa chạy" thì giữ
-    // lại đúng một bản (khoá mới) để dry-run không đếm trùng.
-    conn.execute(
-        "DELETE FROM jobs
-         WHERE LOWER(row_key) LIKE ?1 || '#%'
-           AND LOWER(row_key) <> LOWER(?2)
-           AND status IN ('dang_cho', 'bo_qua')
-           AND attempts_count = 0
-           AND image_status = 'chua_chay'
-           AND video_status = 'chua_chay'",
-        rusqlite::params![image_low, new_key],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let _ = moved;
+    } else {
+        conn.execute(
+            "UPDATE jobs
+             SET row_key = ?1, image_prompt_hash = ?2, video_prompt_hash = ?3
+             WHERE LOWER(row_key) = LOWER(?4)
+               AND status IN ('dang_cho', 'bo_qua')
+               AND attempts_count = 0
+               AND image_status = 'chua_chay'
+               AND video_status = 'chua_chay'",
+            rusqlite::params![
+                new_key,
+                engine::sha2hex(trimmed_img),
+                engine::sha2hex(trimmed_vid),
+                old_key
+            ],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
     build_row_detail_at(p, &new_key)
 }
 
@@ -3449,6 +3520,68 @@ mod tests {
         assert_eq!(detail.prompt_video, "prompt_vid");
         assert_eq!(detail.video_duration, Some(5.0));
         assert_eq!(detail.video_resolution, Some("720x1280".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_issue_22_multi_row_same_image_save_prompt_remap_and_file_refs_lookup() {
+        let dir = std::env::temp_dir().join(format!(
+            "vf_issue22_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("input")).unwrap();
+        std::fs::create_dir_all(dir.join("image_out")).unwrap();
+        std::fs::create_dir_all(dir.join("video_out")).unwrap();
+        std::fs::write(dir.join("input").join("shared.png"), b"png1").unwrap();
+        std::fs::write(dir.join("input").join("other.png"), b"png2").unwrap();
+        std::fs::write(dir.join("image_out").join("shared_r1.png"), b"gen1").unwrap();
+
+        let csv_path = dir.join("prompts.csv");
+        std::fs::write(
+            &csv_path,
+            "anh_tham_chieu,promt_tao_image,promt_tao_video,anh_da_tao,video_da_tao,ngay_tao_idea,ngay_tao_anh,ngay_tao_video,trang_thai,ghi_chu_loi\n\
+             shared.png,img_p1,vid_p1,shared_r1.png,,,,2026-11-20,Đã tạo image,\n\
+             shared.png,img_p2,vid_p2,,,,,,Đang chờ,\n",
+        )
+        .unwrap();
+
+        let k1 = prompts_csv::row_key_of("shared.png", "img_p1", "vid_p1");
+        let k2 = prompts_csv::row_key_of("shared.png", "img_p2", "vid_p2");
+
+        // Bỏ qua dòng 2 và ghi nhận job + file_ref cho dòng 1
+        let _ = skip_row_at(&dir, &k2).unwrap();
+        {
+            let conn = crate::state_db::open(&dir).unwrap();
+            let run_id = ensure_seed_run_id(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash, attempts_count)
+                 VALUES (?1, ?2, 2, 'da_tao_image', 'xong', 'chua_chay', ?3, ?4, 1)",
+                rusqlite::params![run_id, k1, engine::sha2hex("img_p1"), engine::sha2hex("vid_p1")],
+            )
+            .unwrap();
+            let jid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, ?2, 'anh', 'shared_r1.png', 'image_out/shared_r1.png', 1, 1, '2026-11-20T10:00:00+07:00')",
+                rusqlite::params![jid, k1],
+            )
+            .unwrap();
+        }
+
+        // Sửa prompt ảnh dòng 1 -> không được cướp/xóa trạng thái bo_qua của dòng 2
+        let d1_after = save_row_prompts_at(&dir, &k1, "img_p1_edited", "vid_p1").unwrap();
+        assert!(d1_after.row.prompt_modified, "dòng 1 phải bật prompt_modified sau khi sửa prompt ảnh");
+        assert_eq!(d1_after.files.len(), 1, "không được mất file_refs lịch sử sau khi sửa prompt");
+
+        let d2_check = build_row_detail_at(&dir, &k2).unwrap();
+        assert_eq!(d2_check.row.status, "Bỏ qua", "dòng 2 dùng chung ảnh không được mất trạng thái Bỏ qua");
+
+        // Remap dòng 2 sang other.png -> key mới có dạng other.png#hash và giữ nguyên dữ liệu dòng 1
+        let d2_remapped = remap_reference_image_at(&dir, &k2, "other.png").unwrap();
+        assert!(d2_remapped.row.row_key.starts_with("other.png#"));
+        assert_eq!(d2_remapped.row.status, "Bỏ qua");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

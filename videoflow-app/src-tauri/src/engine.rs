@@ -126,8 +126,107 @@ pub fn job_for_row<'a>(
     let prefix = format!("{legacy}#");
     map.iter()
         .filter(|(k, _)| k.starts_with(&prefix))
-        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .max_by_key(|(_, v)| v.id)
         .map(|(_, v)| v)
+}
+
+/// Đếm số dòng CSV dùng chung mỗi `anh_tham_chieu` (lowercase) để phân biệt ảnh duy nhất
+/// với ảnh dùng chung cho nhiều dòng.
+pub fn image_counts(rows: &[prompts_csv::Row]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for r in rows {
+        if r.is_example() || r.is_empty_content() {
+            continue;
+        }
+        let img = r.anh_tham_chieu.trim().to_lowercase();
+        if !img.is_empty() {
+            *counts.entry(img).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Nạp `LatestJobInfo` theo `jobs.id` cụ thể.
+pub fn load_job_info_by_id(conn: &Connection, job_id: i64) -> Option<LatestJobInfo> {
+    conn.query_row(
+        "SELECT id, row_key, status, image_status, video_status,
+                image_prompt_hash, video_prompt_hash, attempts_count,
+                last_error, video_task_id, video_download_url
+         FROM jobs
+         WHERE id = ?1",
+        rusqlite::params![job_id],
+        |r| {
+            Ok(LatestJobInfo {
+                id: r.get(0)?,
+                row_key: r.get(1)?,
+                status: r.get(2)?,
+                image_status: r.get(3)?,
+                video_status: r.get(4)?,
+                image_prompt_hash: r.get(5)?,
+                video_prompt_hash: r.get(6)?,
+                attempts_count: r.get(7)?,
+                last_error: r.get(8)?,
+                video_task_id: r.get(9)?,
+                video_download_url: r.get(10)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Tra `LatestJobInfo` nhất quán cho một dòng CSV:
+/// 1. Khớp chính xác `row_key` (`tên_ảnh#hash`).
+/// 2. Nếu chưa khớp và dòng đã có `anh_da_tao` / `video_da_tao`, tra `file_refs` để tìm đúng `job_id`
+///    (định danh chính xác kể cả khi nhiều dòng dùng chung 1 ảnh gốc và prompt đã bị sửa).
+/// 3. Nếu ảnh chỉ dùng cho đúng 1 dòng (`same_image == 1`), fallback sang tên ảnh trần (v1.4.0)
+///    hoặc bản ghi mới nhất theo `job.id` có cùng prefix `{image}#`.
+pub fn latest_job_for_csv_row(
+    conn: &Connection,
+    row: &prompts_csv::Row,
+    latest_map: &HashMap<String, LatestJobInfo>,
+    img_counts: &HashMap<String, usize>,
+) -> Option<LatestJobInfo> {
+    let key = row_key_low(row);
+    if let Some(j) = latest_map.get(&key) {
+        return Some(j.clone());
+    }
+
+    for fname in [row.anh_da_tao.trim(), row.video_da_tao.trim()] {
+        if fname.is_empty() {
+            continue;
+        }
+        let job_id: Option<i64> = conn
+            .query_row(
+                "SELECT job_id FROM file_refs
+                 WHERE LOWER(file_name) = LOWER(?1) AND job_id IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![fname],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(jid) = job_id {
+            if let Some(info) = load_job_info_by_id(conn, jid) {
+                return Some(info);
+            }
+        }
+    }
+
+    let legacy = row.anh_tham_chieu.trim().to_lowercase();
+    if legacy.is_empty() {
+        return None;
+    }
+    if img_counts.get(&legacy).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    if let Some(j) = latest_map.get(&legacy) {
+        return Some(j.clone());
+    }
+    let prefix = format!("{legacy}#");
+    latest_map
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .max_by_key(|(_, v)| v.id)
+        .map(|(_, v)| v.clone())
 }
 
 /// Như `job_for_row` nhưng cho map bất kỳ (media refs, …) — cùng quy tắc legacy:
@@ -178,6 +277,7 @@ pub fn row_key_low(row: &prompts_csv::Row) -> String {
 #[derive(Debug, Clone)]
 pub struct LatestJobInfo {
     pub id: i64,
+    pub row_key: String,
     pub status: String,
     pub image_status: String,
     pub video_status: String,
@@ -201,10 +301,12 @@ pub fn load_latest_jobs_map(conn: &Connection) -> HashMap<String, LatestJobInfo>
         return map;
     };
     let Ok(rows) = stmt.query_map([], |r| {
+        let rk: String = r.get(1)?;
         Ok((
-            r.get::<_, String>(1)?,
+            rk.clone(),
             LatestJobInfo {
                 id: r.get(0)?,
+                row_key: rk,
                 status: r.get(2)?,
                 image_status: r.get(3)?,
                 video_status: r.get(4)?,
@@ -229,7 +331,7 @@ pub fn load_latest_jobs_map(conn: &Connection) -> HashMap<String, LatestJobInfo>
 /// Truy vấn bản ghi `jobs` mới nhất cho một `row_key`
 pub fn latest_job_info(conn: &Connection, row_key: &str) -> Option<LatestJobInfo> {
     conn.query_row(
-        "SELECT id, status, image_status, video_status,
+        "SELECT id, row_key, status, image_status, video_status,
                 image_prompt_hash, video_prompt_hash, attempts_count,
                 last_error, video_task_id, video_download_url
          FROM jobs
@@ -239,15 +341,16 @@ pub fn latest_job_info(conn: &Connection, row_key: &str) -> Option<LatestJobInfo
         |r| {
             Ok(LatestJobInfo {
                 id: r.get(0)?,
-                status: r.get(1)?,
-                image_status: r.get(2)?,
-                video_status: r.get(3)?,
-                image_prompt_hash: r.get(4)?,
-                video_prompt_hash: r.get(5)?,
-                attempts_count: r.get(6)?,
-                last_error: r.get(7)?,
-                video_task_id: r.get(8)?,
-                video_download_url: r.get(9)?,
+                row_key: r.get(1)?,
+                status: r.get(2)?,
+                image_status: r.get(3)?,
+                video_status: r.get(4)?,
+                image_prompt_hash: r.get(5)?,
+                video_prompt_hash: r.get(6)?,
+                attempts_count: r.get(7)?,
+                last_error: r.get(8)?,
+                video_task_id: r.get(9)?,
+                video_download_url: r.get(10)?,
             })
         },
     )
@@ -1230,6 +1333,7 @@ pub fn run_with_emitter_and_hook(
     let _ = sync_rows_from_state_db(project_path, &conn, &mut rows);
     let latest_map = load_latest_jobs_map(&conn);
     let media_map = load_current_media_map(&conn);
+    let img_counts = image_counts(&rows);
 
     // B1: chọn dòng & lập kế hoạch bước chạy TRƯỚC khi tạo bản ghi mới
     let mut planned_rows: VecDeque<(prompts_csv::Row, RowPlan)> = VecDeque::new();
@@ -1241,9 +1345,13 @@ pub fn run_with_emitter_and_hook(
         if key_low.is_empty() || !seen_keys.insert(key_low.clone()) {
             continue;
         }
-        let prev = job_for_row(&latest_map, &rows, r);
-        // media_map dùng chung khoá với jobs; fallback tên ảnh khi ảnh duy nhất.
-        let db_img = map_lookup_legacy(&media_map, &rows, r)
+        let prev_owned = latest_job_for_csv_row(&conn, r, &latest_map, &img_counts);
+        let prev = prev_owned.as_ref();
+        // media_map dùng chung khoá với jobs; fallback theo job.row_key hoặc tên ảnh khi ảnh duy nhất.
+        let db_img = media_map
+            .get(&key_low)
+            .or_else(|| prev.and_then(|p| media_map.get(&p.row_key.to_lowercase())))
+            .or_else(|| map_lookup_legacy(&media_map, &rows, r))
             .and_then(|m| m.image_file.as_deref());
         if let Some(plan) = plan_row(r, prev, cfg, &engine_cfg, &image_out, db_img) {
             planned_rows.push_back((r.clone(), plan));
@@ -3094,9 +3202,15 @@ pub fn dry_run(project_path: &Path, cfg: &Settings) -> AppResult<DryRunResult> {
         }
     };
 
+    let img_counts = image_counts(&rows);
     for r in &rows {
-        let prev = job_for_row(&latest_map, &rows, r);
-        let db_img = map_lookup_legacy(&media_map, &rows, r)
+        let key_low = row_key_low(r);
+        let prev_owned = latest_job_for_csv_row(&conn, r, &latest_map, &img_counts);
+        let prev = prev_owned.as_ref();
+        let db_img = media_map
+            .get(&key_low)
+            .or_else(|| prev.and_then(|p| media_map.get(&p.row_key.to_lowercase())))
+            .or_else(|| map_lookup_legacy(&media_map, &rows, r))
             .and_then(|m| m.image_file.as_deref());
         let mut r_eff = r.clone();
         if r_eff.anh_da_tao.is_empty() {
@@ -3184,6 +3298,7 @@ mod tests {
 
         let prev = LatestJobInfo {
             id: 1,
+            row_key: "hero.png".into(),
             status: "da_tao_video".into(),
             image_status: "xong".into(),
             video_status: "xong".into(),
@@ -3237,6 +3352,7 @@ mod tests {
 
         let prev_skipped = LatestJobInfo {
             id: 1,
+            row_key: "item.png".into(),
             status: "bo_qua".into(),
             image_status: "chua_chay".into(),
             video_status: "chua_chay".into(),

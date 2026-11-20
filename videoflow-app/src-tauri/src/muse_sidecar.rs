@@ -679,6 +679,13 @@ fn log_info(msg: &str) {
 mod tests {
     use super::*;
 
+    static TEST_SIDECAR_LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+    fn test_sidecar_guard() -> parking_lot::MutexGuard<'static, ()> {
+        TEST_SIDECAR_LOCK
+            .get_or_init(|| parking_lot::Mutex::new(()))
+            .lock()
+    }
+
     #[test]
     fn api_key_dinh_dang_vf_hex() {
         let k = generate_api_key();
@@ -708,6 +715,7 @@ mod tests {
     /// Bỏ qua (skip, không fail) khi thiếu exe để `cargo test` trên máy dev trống vẫn xanh.
     #[test]
     fn spawn_sidecar_that_roi_dung_lai_duoc() {
+        let _serial = test_sidecar_guard();
         // CI verify job chỉ tạo stub rỗng để build script hài lòng; engine thật do job
         // `build` tạo ra và được smoke test riêng. Bỏ qua khi exe không phải engine thật.
         let Ok(exe) = sidecar_exe_path() else {
@@ -756,6 +764,7 @@ mod tests {
 
     #[test]
     fn start_khi_da_chay_khong_deadlock() {
+        let _serial = test_sidecar_guard();
         // Giả lập sidecar_cell() đã có handle rồi gọi start(&cfg): trước bản sửa #28,
         // start() giữ read lock rồi gọi status() (cần write lock) -> self-deadlock vĩnh viễn.
         #[cfg(target_os = "windows")]
