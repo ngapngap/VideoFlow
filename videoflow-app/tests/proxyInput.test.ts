@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   buildProxyInput,
   formatHostPort,
+  isProxyBusy,
   isValidIpv6Address,
   parseProxyPaste,
+  resolveLiveProxy,
   validateProxyHost,
 } from "../src/lib/proxyInput.js";
 
@@ -201,5 +203,36 @@ describe("formatHostPort", () => {
     assert.equal(formatHostPort("::1", 1080), "[::1]:1080");
     assert.equal(formatHostPort("2001:db8::1", 8080), "[2001:db8::1]:8080");
     assert.equal(formatHostPort("[::1]", 1080), "[::1]:1080");
+  });
+});
+
+describe("isProxyBusy and resolveLiveProxy", () => {
+  it("tracks live proxy snapshots and blocks deletion when an assigned account becomes busy or batch runs", () => {
+    const staleSnapshot = { id: "px1", name: "Old", assigned_account_ids: [] as string[] };
+    const refreshedList = [
+      { id: "px1", name: "Refreshed", assigned_account_ids: ["acc1"] },
+    ];
+
+    const live = resolveLiveProxy(staleSnapshot, refreshedList);
+    assert.deepEqual(live, refreshedList[0]);
+    assert.deepEqual(resolveLiveProxy(staleSnapshot, []), staleSnapshot);
+    assert.equal(resolveLiveProxy(null, refreshedList), null);
+
+    const idleAccounts = new Map([["acc1", { busy: false }]]);
+    assert.equal(isProxyBusy(live, false, idleAccounts), false);
+
+    // 5s poll marks assigned account busy while modal is open
+    const busyAccounts = new Map([["acc1", { busy: true }]]);
+    assert.equal(isProxyBusy(live, false, busyAccounts), true);
+
+    // Batch running blocks any proxy even with no assigned accounts
+    assert.equal(isProxyBusy(staleSnapshot, true, idleAccounts), true);
+
+    // Nullish proxy is never busy; missing/idle accounts do not block, partial busy blocks
+    assert.equal(isProxyBusy(null, true, idleAccounts), false);
+    assert.equal(isProxyBusy(undefined, false, idleAccounts), false);
+    const mixedProxy = { id: "px2", name: "Mixed", assigned_account_ids: ["missing", "acc1"] };
+    assert.equal(isProxyBusy(mixedProxy, false, idleAccounts), false);
+    assert.equal(isProxyBusy(mixedProxy, false, busyAccounts), true);
   });
 });

@@ -53,22 +53,64 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _win_short_path(path_str: str) -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        buf_len = ctypes.windll.kernel32.GetShortPathNameW(path_str, None, 0)
+        if buf_len <= 0:
+            return None
+        buf = ctypes.create_unicode_buffer(buf_len)
+        written = ctypes.windll.kernel32.GetShortPathNameW(path_str, buf, buf_len)
+        if written > 0:
+            return buf.value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _profile_path_variants(profile_dir: Path) -> list[str]:
+    candidates: list[str] = [str(profile_dir)]
+    if profile_dir.exists():
+        with contextlib.suppress(OSError):
+            resolved = str(profile_dir.resolve())
+            if resolved:
+                candidates.append(resolved)
+        for p in list(candidates):
+            short = _win_short_path(p)
+            if short:
+                candidates.append(short)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for cand in candidates:
+        norm = os.path.normpath(cand)
+        key = norm.casefold() if os.name == "nt" else norm
+        if key not in seen:
+            seen.add(key)
+            unique.append(norm)
+    return unique
+
+
 def _build_wmi_filter(profile_dir: Path, port: int | None = None) -> str:
-    """Build a boundary-aware case-insensitive PowerShell filter matching only processes of this profile/port."""
-    full = str(profile_dir).replace("'", "''")
-    parent_esc = str(profile_dir.parent).replace("'", "''")
-    # Match exact --user-data-dir=<full> followed by quote, whitespace, or end-of-line
-    # so acc_1 never matches acc_10.
-    cond_parts: list[str] = [
-        f"($_.CommandLine -imatch ('--user-data-dir=\"?' + [regex]::Escape('{full}') + '(\"|\\s|$)'))"
-    ]
-    if port:
-        # Require this app's profile parent dir alongside --remote-debugging-port so
-        # unrelated user browsers using the same port are never matched.
-        cond_parts.append(
-            f"(($_.CommandLine -imatch [regex]::Escape('{parent_esc}')) -and ($_.CommandLine -imatch '--remote-debugging-port={port}(\\s|$)'))"
+    """Build a boundary-aware case-insensitive PowerShell filter matching only processes of this profile."""
+    # Match exact --user-data-dir=<profile_dir> (including long & Windows 8.3 short variants)
+    # followed by quote, whitespace, or end-of-line so acc_1 never matches acc_10 and
+    # never matches another account sharing profile_dir.parent.
+    dir_clauses: list[str] = []
+    for variant in _profile_path_variants(profile_dir):
+        escaped = variant.replace("'", "''")
+        dir_clauses.append(
+            f"($_.CommandLine -imatch ('--user-data-dir=\"?' + [regex]::Escape('{escaped}') + '(\"|\\s|$)'))"
         )
-    return " -or ".join(cond_parts)
+    dir_cond = " -or ".join(dir_clauses)
+    if port:
+        return (
+            f"(({dir_cond}) -or "
+            f"(({dir_cond}) -and ($_.CommandLine -imatch '--remote-debugging-port={port}(\\s|$)')))"
+        )
+    return dir_cond
 
 
 def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:

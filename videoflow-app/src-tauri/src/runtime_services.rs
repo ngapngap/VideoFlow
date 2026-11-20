@@ -252,8 +252,11 @@ fn start_background_loop(app: AppHandle) {
                             }),
                         );
                     } else if let Some(ref proj) = current_proj {
+                        if st.exit_requested.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if engine::dry_run(proj, &cfg).is_ok_and(|d| d.total > 0) {
-                            let _ = commands::spawn_engine_internal(
+                            if let Err(e) = commands::spawn_engine_internal(
                                 app.clone(),
                                 &st,
                                 EngineConfig {
@@ -262,7 +265,11 @@ fn start_background_loop(app: AppHandle) {
                                     force_step: None,
                                     reset_error_attempts: false,
                                 },
-                            );
+                            ) {
+                                if e.code == "APP_EXITING" {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

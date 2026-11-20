@@ -18,7 +18,7 @@ git push origin v1.5.1        # ← trigger Release workflow (hoặc chạy tay 
 
 `release.yml` chạy qua 2 giai đoạn trên runner `windows-latest` (khóa `concurrency` nhóm `release-windows`, không chạy song song hai bản phát hành):
 
-- **Job `verify` (Cổng chất lượng)**: chạy `npm ci` + `npm run check` (`svelte-check`), tạo stub `videoflow-muse-x86_64-pc-windows-msvc.exe` để `tauri-build` biên dịch, chạy `cargo clippy --all-targets -- -D warnings` + `cargo test`, và cài dependencies Python để chạy `ruff check .` + `python -m pytest -q` trên đúng commit được gắn tag (hoặc nhánh khi chạy `workflow_dispatch`).
+- **Job `verify` (Cổng chất lượng)**: chạy `npm ci` + `npm run check` (`svelte-check`) + `npm test`, tạo stub `videoflow-muse-x86_64-pc-windows-msvc.exe` để `tauri-build` biên dịch, chạy `cargo clippy --all-targets -- -D warnings` + `cargo test`, và cài dependencies Python để chạy `ruff check .` + `python -m pytest -q` trên đúng commit được gắn tag (hoặc nhánh khi chạy `workflow_dispatch`).
 - **Job `build` (chỉ chạy sau khi `verify` xanh)**:
   1. `Resolve version` & `Sync version into manifests` — lấy version từ tag `v*` (hoặc input `version` của `workflow_dispatch`), kiểm tra định dạng semver (`X.Y.Z` hoặc `X.Y.Z-prerelease`), rồi ghi đè version vào cả **5 manifest** trong workspace runner trước khi build:
      - `videoflow-app/package.json` (`version`)
@@ -59,7 +59,7 @@ tự cập nhật được nữa (phải cài tay 1 lần).
 
 | Job | Nội dung |
 |---|---|
-| `frontend` | `npm ci` → `npm run check` (`svelte-check`) → `npm run build` |
+| `frontend` | `npm ci` → `npm run check` (`svelte-check`) → `npm test` → `npm run build` |
 | `rust` | Build sidecar exe thật bằng PyInstaller → `cargo clippy --all-targets -- -D warnings` → `cargo test -- --nocapture` (gồm test spawn engine thật) → smoke `/admin/status` với `driver=browser, ok=true` trên Edge headless |
 | `sidecar` | Cài `requirements.txt` + `requirements-dev.txt` → `python -m compileall -q muse2api` → `python -m ruff check .` → `python -m pytest -q` → chạy API mock kiểm `/healthz`, `/admin/status` và chặn trùng session |
 

@@ -1,4 +1,4 @@
-import type { ProxyInput } from "./api";
+import type { MuseAccount, ProxyInput, ProxyItem } from "./api";
 
 export interface ParsedProxyPaste {
   kind?: "http" | "socks5";
@@ -258,4 +258,24 @@ export function formatHostPort(host: string, port: number): string {
   const formattedHost =
     h.includes(":") && !(h.startsWith("[") && h.endsWith("]")) ? `[${h}]` : h;
   return `${formattedHost}:${port}`;
+}
+
+/** Returns true when a batch run is active or any assigned Muse account is currently busy. */
+export function isProxyBusy(
+  proxy: Pick<ProxyItem, "assigned_account_ids"> | null | undefined,
+  isRunning: boolean,
+  accMap: ReadonlyMap<string, Pick<MuseAccount, "busy">>
+): boolean {
+  if (!proxy) return false;
+  if (isRunning) return true;
+  return proxy.assigned_account_ids.some((id) => accMap.get(id)?.busy === true);
+}
+
+/** Resolves the freshest proxy object from `proxies` by `id`, falling back to `target`. */
+export function resolveLiveProxy<T extends { id: string }>(
+  target: T | null,
+  proxies: readonly T[]
+): T | null {
+  if (!target) return null;
+  return proxies.find((p) => p.id === target.id) ?? target;
 }

@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import {
   createSeqGuard,
   isAccountActionBlocked,
+  isRowLockedForBatch,
   mergeSingleTestedProxy,
+  pruneSelectedKeys,
+  runStartupProjectAutoOpen,
   runWithLoadingGuard,
   shouldSyncSelectedProxy,
 } from "../src/lib/asyncGuard.js";
@@ -188,5 +191,150 @@ describe("runWithLoadingGuard", () => {
     await p1;
     assert.equal(loading, false);
     assert.equal(errors.length, 0);
+  });
+});
+
+describe("pruneSelectedKeys", () => {
+  it("drops completed, skipped, max-attempts-exhausted, and missing rows while keeping prompt-modified rows", () => {
+    const rows = [
+      { row_key: "r-ok", status: "Đang chờ", attempts_count: 0 },
+      { row_key: "r-done", status: "Đã tạo video", attempts_count: 1 },
+      { row_key: "r-skip", status: "Bỏ qua", attempts_count: 0 },
+      { row_key: "r-maxed", status: "Lỗi tạo video", attempts_count: 3, prompt_modified: false },
+      { row_key: "r-edited", status: "Lỗi tạo video", attempts_count: 3, prompt_modified: true },
+    ];
+    assert.equal(isRowLockedForBatch(rows[0], 3), false);
+    assert.equal(isRowLockedForBatch(rows[1], 3), true);
+    assert.equal(isRowLockedForBatch(rows[2], 3), true);
+    assert.equal(isRowLockedForBatch(rows[3], 3), true);
+    assert.equal(isRowLockedForBatch(rows[4], 3), false);
+
+    const initial = new Set(["r-ok", "r-done", "r-skip", "r-maxed", "r-edited", "r-missing"]);
+    const pruned = pruneSelectedKeys(initial, rows, 3);
+    assert.deepEqual(Array.from(pruned), ["r-ok", "r-edited"]);
+    assert.equal(initial.size, 6);
+
+    const unchanged = pruneSelectedKeys(pruned, rows, 3);
+    assert.equal(unchanged, pruned);
+
+    // Lowering maxAttempts reactively locks rows that hit the new threshold unless prompt_modified
+    const tightenedRows = [
+      ...rows,
+      { row_key: "r-border", status: "Lỗi tạm thời", attempts_count: 2 },
+    ];
+    const withBorder = new Set(["r-ok", "r-border", "r-edited"]);
+    assert.deepEqual(Array.from(pruneSelectedKeys(withBorder, tightenedRows, 2)), [
+      "r-ok",
+      "r-edited",
+    ]);
+  });
+});
+
+describe("runStartupProjectAutoOpen", () => {
+  it("opens the first existing recent project when no manual project load occurs", async () => {
+    let current: { path: string } | null = null;
+    const seq = 1;
+    const applied: string[] = [];
+
+    const opened = await runStartupProjectAutoOpen({
+      hasCurrentProject: () => current !== null,
+      getProjectSeq: () => seq,
+      listRecentProjects: async () => [
+        { path: "E:\\Missing", exists: false },
+        { path: "E:\\Recent1", exists: true },
+      ],
+      loadProject: async (path) => ({ path }),
+      applyProject: (info) => {
+        current = info;
+        applied.push(info.path);
+      },
+    });
+
+    assert.equal(opened, true);
+    assert.deepEqual(applied, ["E:\\Recent1"]);
+    assert.deepEqual(current, { path: "E:\\Recent1" });
+  });
+
+  it("aborts before listRecentProjects when a project is already open", async () => {
+    let listCalls = 0;
+    let loadCalls = 0;
+    const opened = await runStartupProjectAutoOpen({
+      hasCurrentProject: () => true,
+      getProjectSeq: () => 1,
+      listRecentProjects: async () => {
+        listCalls += 1;
+        return [{ path: "E:\\Recent1", exists: true }];
+      },
+      loadProject: async (path) => {
+        loadCalls += 1;
+        return { path };
+      },
+      applyProject: () => {},
+    });
+
+    assert.equal(opened, false);
+    assert.equal(listCalls, 0);
+    assert.equal(loadCalls, 0);
+  });
+
+  it("aborts before loadProject when user initiates a manual switch while listing recents", async () => {
+    let current: { path: string } | null = null;
+    let seq = 1;
+    let loadCalls = 0;
+    const gate = deferred<void>();
+
+    const bootPromise = runStartupProjectAutoOpen({
+      hasCurrentProject: () => current !== null,
+      getProjectSeq: () => seq,
+      listRecentProjects: async () => {
+        await gate.promise;
+        return [{ path: "E:\\Recent1", exists: true }];
+      },
+      loadProject: async (path) => {
+        loadCalls += 1;
+        return { path };
+      },
+      applyProject: (info) => {
+        current = info;
+      },
+    });
+
+    // Manual switch starts (in flight, current still null until manual load finishes)
+    seq += 1;
+    gate.resolve(undefined);
+
+    const opened = await bootPromise;
+    assert.equal(opened, false);
+    assert.equal(loadCalls, 0);
+    assert.equal(current, null);
+  });
+
+  it("aborts auto-open without overwriting when user manually opens a project mid-bootstrap", async () => {
+    let current: { path: string } | null = null;
+    let seq = 1;
+    const gate = deferred<void>();
+
+    const bootPromise = runStartupProjectAutoOpen({
+      hasCurrentProject: () => current !== null,
+      getProjectSeq: () => seq,
+      listRecentProjects: async () => [{ path: "E:\\Recent1", exists: true }],
+      loadProject: async (path) => {
+        await gate.promise;
+        return { path };
+      },
+      applyProject: (info) => {
+        current = info;
+      },
+    });
+
+    // User manually opens another project while bootstrap loadProject is in flight
+    await Promise.resolve();
+    seq += 1;
+    current = { path: "E:\\ManualChoice" };
+
+    gate.resolve(undefined);
+    const opened = await bootPromise;
+    assert.equal(opened, false);
+    assert.deepEqual(current, { path: "E:\\ManualChoice" });
   });
 });

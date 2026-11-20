@@ -114,6 +114,10 @@ async def _read_http_head(reader: asyncio.StreamReader, *, is_request: bool = Tr
         except asyncio.IncompleteReadError as exc:
             if not buf and not exc.partial:
                 return b""
+            if not is_request:
+                raise _UpstreamProxyError(
+                    "Upstream closed with truncated HTTP response headers"
+                ) from exc
             raise
         except asyncio.LimitOverrunError as exc:
             raise err_cls("HTTP header line exceeds limit") from exc
@@ -257,8 +261,8 @@ def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
     if is_request and has_te and te_values != ["chunked"]:
         raise _HttpValidationError("Unsupported request Transfer-Encoding")
     is_chunked = has_te and te_values[-1] == "chunked"
-    if is_request and cl is not None and has_te:
-        raise _HttpValidationError("Conflicting Content-Length and Transfer-Encoding headers")
+    if cl is not None and has_te:
+        raise err_cls("Conflicting Content-Length and Transfer-Encoding headers")
 
     return _ParsedHeaders(
         content_length=cl,

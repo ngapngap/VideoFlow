@@ -92,3 +92,87 @@ export function mergeSingleTestedProxy<T extends { id: string }>(
   });
   return found ? next : [...proxies];
 }
+
+export interface BatchSelectableRow {
+  row_key: string;
+  status: string;
+  attempts_count: number;
+  prompt_modified?: boolean;
+}
+
+/** Returns true when a row cannot be queued in a batch run (completed, skipped, or exhausted attempts without prompt edit). */
+export function isRowLockedForBatch(row: BatchSelectableRow, maxAttempts: number): boolean {
+  return (
+    row.status === "Đã tạo video" ||
+    row.status === "Bỏ qua" ||
+    (row.attempts_count >= maxAttempts && !row.prompt_modified)
+  );
+}
+
+/**
+ * Drops selected keys missing from `rows` or locked by `isRowLockedForBatch`.
+ * Returns the original `Set` reference when unchanged to avoid redundant reactive updates.
+ */
+export function pruneSelectedKeys(
+  selected: Set<string>,
+  rows: readonly BatchSelectableRow[],
+  maxAttempts: number
+): Set<string> {
+  if (selected.size === 0) return selected;
+  const eligible = new Set<string>();
+  for (const row of rows) {
+    if (!isRowLockedForBatch(row, maxAttempts)) {
+      eligible.add(row.row_key);
+    }
+  }
+  let changed = false;
+  const next = new Set<string>();
+  for (const key of selected) {
+    if (eligible.has(key)) {
+      next.add(key);
+    } else {
+      changed = true;
+    }
+  }
+  return changed ? next : selected;
+}
+
+export interface StartupAutoOpenDeps<
+  TRecent extends { path: string; exists: boolean },
+  TProject,
+> {
+  hasCurrentProject: () => boolean;
+  getProjectSeq: () => number;
+  listRecentProjects: () => Promise<TRecent[]>;
+  loadProject: (path: string) => Promise<TProject>;
+  applyProject: (info: TProject) => void;
+  isAborted?: () => boolean;
+}
+
+/**
+ * Auto-opens the first existing recent project at startup only if no project was
+ * opened or switched concurrently while metadata/project IPC calls were in flight.
+ */
+export async function runStartupProjectAutoOpen<
+  TRecent extends { path: string; exists: boolean },
+  TProject,
+>(deps: StartupAutoOpenDeps<TRecent, TProject>): Promise<boolean> {
+  const startSeq = deps.getProjectSeq();
+  const canProceed = () =>
+    !deps.isAborted?.() &&
+    !deps.hasCurrentProject() &&
+    deps.getProjectSeq() === startSeq;
+
+  if (!canProceed()) return false;
+  const recents = await deps.listRecentProjects();
+  if (!canProceed()) return false;
+
+  const firstExisting = recents.find((r) => r.exists);
+  if (!firstExisting) return false;
+
+  const info = await deps.loadProject(firstExisting.path);
+  if (!canProceed()) return false;
+
+  deps.applyProject(info);
+  return true;
+}

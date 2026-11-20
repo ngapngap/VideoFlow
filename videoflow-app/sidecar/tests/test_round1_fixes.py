@@ -348,6 +348,8 @@ async def test_browser_driver_startup_cleans_up_chromium_and_port_on_failure(tmp
     assert drv._chromium is None
     assert drv._browser is None
     assert 19560 not in _USED_PORTS
+    assert 19561 in _USED_PORTS
+    await drv.shutdown()
     assert 19561 not in _USED_PORTS
 
 

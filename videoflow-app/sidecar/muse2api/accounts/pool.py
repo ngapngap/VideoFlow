@@ -145,11 +145,27 @@ class AccountPool:
         self.is_blocked_cb = is_blocked_cb
         self._accounts: dict[str, Account] = {}
         self._inflight: dict[str, int] = defaultdict(int)
+        self._quota_inflight: dict[str, int] = defaultdict(int)
         self._cond = asyncio.Condition()
         self._persist_lock = asyncio.Lock()
 
     def is_inflight(self, account_id: str) -> bool:
-        return self._inflight.get(account_id, 0) > 0
+        return (
+            self._inflight.get(account_id, 0) > 0
+            or self._quota_inflight.get(account_id, 0) > 0
+        )
+
+    def begin_quota(self, account_id: str) -> None:
+        """Reserve ``account_id`` for a quota lookup (caller holds ``self._cond``)."""
+        self._quota_inflight[account_id] += 1
+
+    def end_quota(self, account_id: str) -> None:
+        """Release a quota reservation (caller holds ``self._cond``)."""
+        cur = self._quota_inflight.get(account_id, 0)
+        if cur <= 1:
+            self._quota_inflight.pop(account_id, None)
+        else:
+            self._quota_inflight[account_id] = cur - 1
 
     # ---- lifecycle / CRUD ----
     async def load(self) -> None:
@@ -266,7 +282,7 @@ class AccountPool:
             if not acc.is_available(now):  # cooling down
                 back_at = acc.cooldown_until if back_at is None else min(back_at, acc.cooldown_until)
                 continue
-            if self._inflight[acc.id] >= self.max_concurrency:
+            if self._inflight[acc.id] >= self.max_concurrency or self._quota_inflight.get(acc.id, 0) > 0:
                 busy = True
                 continue
             free.append(acc)

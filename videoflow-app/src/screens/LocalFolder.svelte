@@ -1,6 +1,7 @@
 <script lang="ts">
   // Màn hình Thư mục Local (6.7, 6.7b): 5 mục kiểm tra cấu trúc, báo lỗi CSV, mở thẳng dự án đủ cấu trúc
   import {
+    beginProjectSwitch,
     formatApiError,
     project,
     resetProjectRunState,
@@ -109,6 +110,7 @@
 
   async function switchProject(path: string) {
     if ($running) return;
+    beginProjectSwitch();
     try {
       const info = await api.load_project(path);
       resetProjectRunState();
@@ -139,6 +141,7 @@
     try {
       const dir = await api.pick_folder();
       if (!dir) return;
+      beginProjectSwitch();
       const probe = await api.probe_folder(dir);
       const writeItem = probe.checklist.find((i) => i.key === "write");
       if (writeItem && !writeItem.ok) {
@@ -147,6 +150,7 @@
       }
 
       if (probe.has_full_structure && probe.prompts_valid !== false) {
+        beginProjectSwitch();
         const info = await api.load_project(dir);
         resetProjectRunState();
         lastSyncedProjectPath = info.path;
@@ -171,6 +175,7 @@
   async function confirmProjectAction() {
     if (!selectedDir || !probeResult) return;
     creating = true;
+    beginProjectSwitch();
     try {
       const info =
         probeResult.has_full_structure &&

@@ -1228,11 +1228,17 @@ pub fn start_dry_run(state: State<'_, AppState>) -> AppResult<engine::DryRunResu
     engine::dry_run(&p, &cfg)
 }
 
-pub(crate) fn spawn_engine_internal(
-    app: AppHandle,
-    state: &AppState,
-    engine_cfg: EngineConfig,
-) -> AppResult<i64> {
+fn app_exiting_error() -> AppError {
+    AppError::new(
+        "APP_EXITING",
+        "Ứng dụng đang thoát hoặc khởi động lại — không thể bắt đầu lượt chạy mới.",
+    )
+}
+
+pub(crate) fn try_begin_run(state: &AppState) -> AppResult<()> {
+    if state.exit_requested.load(Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
     state
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1242,6 +1248,48 @@ pub(crate) fn spawn_engine_internal(
                 "Lượt chạy đang thực hiện - Stop hoặc chờ chạy xong (6.12).",
             )
         })?;
+    if state.exit_requested.load(Ordering::SeqCst) {
+        state.running.store(false, Ordering::SeqCst);
+        return Err(app_exiting_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn begin_app_update_restart(state: &AppState) -> AppResult<()> {
+    if state.exit_requested.swap(true, Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
+    if state.running.load(Ordering::SeqCst) {
+        state.exit_requested.store(false, Ordering::SeqCst);
+        return Err(AppError::new(
+            "RUN_IN_PROGRESS",
+            "Pipeline vừa bắt đầu chạy trong lúc tải bản cập nhật — hãy dừng (STOP) rồi khởi động lại app.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_app_update_restart_with<FStop, FRestart>(
+    state: &AppState,
+    stop_sidecar: FStop,
+    restart_app: FRestart,
+) -> AppResult<bool>
+where
+    FStop: FnOnce(),
+    FRestart: FnOnce(),
+{
+    begin_app_update_restart(state)?;
+    stop_sidecar();
+    restart_app();
+    Ok(true)
+}
+
+pub(crate) fn spawn_engine_internal(
+    app: AppHandle,
+    state: &AppState,
+    engine_cfg: EngineConfig,
+) -> AppResult<i64> {
+    try_begin_run(state)?;
 
     let p = match project_path(state) {
         Ok(p) => p,
@@ -1273,6 +1321,13 @@ pub(crate) fn spawn_engine_internal(
     let (rid_tx, rid_rx) = std::sync::mpsc::sync_channel::<i64>(1);
     let created_run_id = Arc::new(AtomicI64::new(0));
     let created_rid_bg = created_run_id.clone();
+
+    let mut thr_guard = state.engine_thread.lock();
+    if state.exit_requested.load(Ordering::SeqCst) {
+        *state.stop_flag.write() = None;
+        state.running.store(false, Ordering::SeqCst);
+        return Err(app_exiting_error());
+    }
 
     let app2 = app.clone();
     let handle = std::thread::spawn(move || {
@@ -1392,7 +1447,8 @@ pub(crate) fn spawn_engine_internal(
         let _ = app2.emit("run_finished", deferred_finish);
     });
 
-    *state.engine_thread.lock() = Some(handle);
+    *thr_guard = Some(handle);
+    drop(thr_guard);
     let actual_run_id = rid_rx
         .recv_timeout(Duration::from_millis(400))
         .unwrap_or(0);
@@ -3486,6 +3542,9 @@ pub async fn install_app_update(
 ) -> AppResult<bool> {
     use tauri_plugin_updater::UpdaterExt;
 
+    if state.exit_requested.load(Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
     if state.running.load(Ordering::SeqCst) {
         return Err(AppError::new(
             "RUN_IN_PROGRESS",
@@ -3529,16 +3588,15 @@ pub async fn install_app_update(
             AppError::new("UPDATE_INSTALL_FAIL", format!("Cài bản cập nhật thất bại: {e}"))
         })?;
 
-    if state.running.load(Ordering::SeqCst) {
-        return Err(AppError::new(
-            "RUN_IN_PROGRESS",
-            "Pipeline vừa bắt đầu chạy trong lúc tải bản cập nhật — hãy dừng (STOP) rồi khởi động lại app.",
-        ));
-    }
-    log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
-    // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
-    crate::muse_sidecar::stop_for_quit();
-    app.restart();
+    finish_app_update_restart_with(
+        &state,
+        || {
+            log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
+            // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
+            crate::muse_sidecar::stop_for_quit();
+        },
+        || app.restart(),
+    )
 }
 
 fn log_info_app(msg: &str) {
@@ -5908,6 +5966,175 @@ mod tests {
         let _ = tx_release.send(());
 
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_begin_run_and_update_restart_reject_when_exit_requested() {
+        let dir = temp_proj("begin_run_exit_guard");
+        let state = AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(true),
+            active_run_id: AtomicI64::new(0),
+            stop_flag: parking_lot::RwLock::new(None),
+            engine_thread: parking_lot::Mutex::new(None),
+        };
+
+        let err = try_begin_run(&state).unwrap_err();
+        assert_eq!(err.code, "APP_EXITING");
+        assert!(
+            !state.running.load(Ordering::SeqCst),
+            "running must remain false when exit_requested is true"
+        );
+
+        // If a run is already stopping during exit, try_begin_run refuses without clearing running
+        state.running.store(true, Ordering::SeqCst);
+        let exiting_while_running = try_begin_run(&state).unwrap_err();
+        assert_eq!(exiting_while_running.code, "APP_EXITING");
+        assert!(state.running.load(Ordering::SeqCst));
+
+        // If exit_requested was already true, finish_app_update_restart_with rejects without restarting or clearing exit_requested
+        let mut stopped = false;
+        let mut restarted = false;
+        let already_exiting_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(already_exiting_err.code, "APP_EXITING");
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(!stopped);
+        assert!(!restarted);
+
+        state.running.store(false, Ordering::SeqCst);
+        let already_exiting_idle_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(already_exiting_idle_err.code, "APP_EXITING");
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(!stopped);
+        assert!(!restarted);
+
+        // When not exiting, try_begin_run sets running=true and blocks concurrent runs & update restart
+        state.exit_requested.store(false, Ordering::SeqCst);
+        try_begin_run(&state).expect("try_begin_run succeeds when idle and not exiting");
+        assert!(state.running.load(Ordering::SeqCst));
+
+        let dup_err = try_begin_run(&state).unwrap_err();
+        assert_eq!(dup_err.code, "RUN_IN_PROGRESS");
+
+        let upd_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(upd_err.code, "RUN_IN_PROGRESS");
+        assert!(
+            !state.exit_requested.load(Ordering::SeqCst),
+            "exit_requested must roll back to false when update restart aborts due to RUN_IN_PROGRESS"
+        );
+        assert!(!stopped);
+        assert!(!restarted);
+
+        // Once idle, finish_app_update_restart_with locks exit_requested=true BEFORE stop_for_quit and restart
+        state.running.store(false, Ordering::SeqCst);
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<&'static str>::new()));
+        let ev_stop = Arc::clone(&events);
+        let ev_restart = Arc::clone(&events);
+        let ok = finish_app_update_restart_with(
+            &state,
+            || {
+                assert!(
+                    state.exit_requested.load(Ordering::SeqCst),
+                    "exit_requested must be true before stop_for_quit"
+                );
+                let race_err = try_begin_run(&state).unwrap_err();
+                assert_eq!(race_err.code, "APP_EXITING");
+                assert!(!state.running.load(Ordering::SeqCst));
+                ev_stop.lock().push("stop_sidecar");
+            },
+            || {
+                assert!(
+                    state.exit_requested.load(Ordering::SeqCst),
+                    "exit_requested must remain true before app.restart"
+                );
+                ev_restart.lock().push("restart_app");
+            },
+        )
+        .expect("update restart succeeds when idle");
+        assert!(ok);
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert_eq!(*events.lock(), vec!["stop_sidecar", "restart_app"]);
+
+        let post_upd_err = try_begin_run(&state).unwrap_err();
+        assert_eq!(post_upd_err.code, "APP_EXITING");
+        assert!(!state.running.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_begin_run_and_update_restart_are_mutually_exclusive_under_race() {
+        let dir = temp_proj("begin_run_update_race");
+        let state = Arc::new(AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
+            active_run_id: AtomicI64::new(0),
+            stop_flag: parking_lot::RwLock::new(None),
+            engine_thread: parking_lot::Mutex::new(None),
+        });
+
+        for _ in 0..64 {
+            state.running.store(false, Ordering::SeqCst);
+            state.exit_requested.store(false, Ordering::SeqCst);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let s1 = Arc::clone(&state);
+            let b1 = Arc::clone(&barrier);
+            let t_run = std::thread::spawn(move || {
+                b1.wait();
+                try_begin_run(&s1)
+            });
+
+            let s2 = Arc::clone(&state);
+            let b2 = Arc::clone(&barrier);
+            let t_upd = std::thread::spawn(move || {
+                b2.wait();
+                begin_app_update_restart(&s2)
+            });
+
+            let run_res = t_run.join().unwrap();
+            let upd_res = t_upd.join().unwrap();
+
+            assert!(
+                !(run_res.is_ok() && upd_res.is_ok()),
+                "try_begin_run and begin_app_update_restart must never both succeed"
+            );
+            if upd_res.is_ok() {
+                assert!(state.exit_requested.load(Ordering::SeqCst));
+                assert!(!state.running.load(Ordering::SeqCst));
+            }
+            if run_res.is_ok() {
+                assert!(state.running.load(Ordering::SeqCst));
+                assert!(!state.exit_requested.load(Ordering::SeqCst));
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

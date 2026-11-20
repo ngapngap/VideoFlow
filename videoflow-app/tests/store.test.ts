@@ -1,16 +1,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { get } from "svelte/store";
-import type { MuseAccount, MuseStatusView } from "../src/lib/api.js";
+import type { MuseAccount, MuseStatusView, ProjectInfo } from "../src/lib/api.js";
+import { runStartupProjectAutoOpen } from "../src/lib/asyncGuard.js";
 import {
   activeRows,
   assetCacheBust,
+  beginProjectSwitch,
   bumpRowAssetRev,
   clearEventLockedAccount,
   currentRun,
   dismissToast,
   eventLockedAccount,
   formatApiError,
+  getProjectSwitchSeq,
   lastRunFinished,
   museAccounts,
   museLoading,
@@ -19,6 +22,7 @@ import {
   progressPercent,
   progressStep,
   progressText,
+  project,
   refreshMuseState,
   resetProjectRunState,
   resumeToast,
@@ -362,5 +366,56 @@ describe("refreshMuseState and clearEventLockedAccount", () => {
         assert.equal(get(museLoading), false);
       }
     );
+  });
+});
+
+describe("beginProjectSwitch with runStartupProjectAutoOpen", () => {
+  it("prevents startup auto-open from overwriting an in-flight manual project switch", async () => {
+    const makeProject = (path: string, name: string): ProjectInfo => ({
+      path,
+      name,
+      checklist: [],
+      row_count: 1,
+    });
+
+    project.set(null);
+    let releaseBootLoad!: () => void;
+    const bootLoadGate = new Promise<void>((res) => {
+      releaseBootLoad = res;
+    });
+
+    try {
+      const bootPromise = runStartupProjectAutoOpen({
+        hasCurrentProject: () => Boolean(get(project)),
+        getProjectSeq: getProjectSwitchSeq,
+        listRecentProjects: async () => [
+          { path: "E:\\Recent", name: "Recent", exists: true, is_current: false },
+        ],
+        loadProject: async (path) => {
+          await bootLoadGate;
+          return makeProject(path, "Recent");
+        },
+        applyProject: (info) => {
+          resetProjectRunState();
+          project.set(info);
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Manual switch starts (e.g. from Dashboard onboarding) before bootstrap finishes
+      const manualSeq = beginProjectSwitch();
+      assert.ok(manualSeq > 0);
+      const manualInfo = makeProject("E:\\Manual", "Manual");
+      resetProjectRunState();
+      project.set(manualInfo);
+
+      releaseBootLoad();
+      const opened = await bootPromise;
+      assert.equal(opened, false);
+      assert.deepEqual(get(project), manualInfo);
+    } finally {
+      project.set(null);
+    }
   });
 });

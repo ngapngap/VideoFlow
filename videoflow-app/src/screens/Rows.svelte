@@ -31,7 +31,12 @@
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
-  import { createSeqGuard, runWithLoadingGuard } from "../lib/asyncGuard";
+  import {
+    createSeqGuard,
+    isRowLockedForBatch,
+    pruneSelectedKeys,
+    runWithLoadingGuard,
+  } from "../lib/asyncGuard";
 
   const filterChips: { key: string; label: string }[] = [
     { key: "Tất cả", label: "Tất cả" },
@@ -127,8 +132,14 @@
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   const loadGuard = createSeqGuard();
   let mounted = false;
+  let hasLoadedRows = false;
+  let lastPrunedMaxAttempts = get(maxAttemptsStore);
   let lastProjectPath: string | null = null;
   let lastTick = -1;
+
+  $: if (mounted && hasLoadedRows && $maxAttemptsStore !== lastPrunedMaxAttempts) {
+    pruneSelection($maxAttemptsStore);
+  }
 
   $: if (!$running) {
     stoppingRun = false;
@@ -269,12 +280,12 @@
     selectedRows.set(new Set(next));
   }
 
-  function isRowLockedForBatch(r: RowSummary, maxAtt: number): boolean {
-    return (
-      r.status === "Đã tạo video" ||
-      r.status === "Bỏ qua" ||
-      (r.attempts_count >= maxAtt && !r.prompt_modified)
-    );
+  function pruneSelection(maxAtt: number): void {
+    lastPrunedMaxAttempts = maxAtt;
+    const pruned = pruneSelectedKeys(selected, rows, maxAtt);
+    if (pruned !== selected) {
+      updateSelection(pruned);
+    }
   }
 
   function isRowOrphan(r: RowSummary, brokenMap: Record<string, boolean>): boolean {
@@ -326,6 +337,7 @@
     if (curPath !== lastProjectPath) {
       lastProjectPath = curPath;
       lastTick = curTick;
+      hasLoadedRows = false;
       const resetUi = get(rowsUiState);
       page = resetUi.page || 1;
       pageSize = resetUi.pageSize || pageSize;
@@ -342,6 +354,7 @@
         void load();
       } else {
         loadGuard.invalidate();
+        hasLoadedRows = false;
         loading = false;
         rows = [];
         total = 0;
@@ -382,6 +395,7 @@
   export async function load(opts?: { silent?: boolean }): Promise<void> {
     if (!$project) {
       loadGuard.invalidate();
+      hasLoadedRows = false;
       loading = false;
       rows = [];
       total = 0;
@@ -422,6 +436,8 @@
           pageCount = nextPageCount;
           counts = res.status_counts ?? counts;
         }
+        hasLoadedRows = true;
+        pruneSelection($maxAttemptsStore);
         loadError = null;
       },
       (e) => {

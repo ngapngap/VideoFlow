@@ -118,6 +118,10 @@ async def generate_images(body: ImageGenerationRequest, request: Request,
     return await _generate(body, loaded, request, svc)
 
 
+class _RequestTooLargeError(OSError):
+    """Raised when a streamed/chunked upload exceeds the maximum allowed body size."""
+
+
 @router.post("/v1/images/edits")
 async def edit_images(request: Request, svc: Services = Depends(get_services)) -> dict:
     """OpenAI-style multipart edit: ``image`` / ``image[]`` files plus a prompt.
@@ -137,7 +141,27 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
         if cl_val > max_body:
             raise InvalidRequest("request body too large")
 
-    form = await request.form(max_files=MAX_REFERENCE_IMAGES + 2)
+    orig_receive = getattr(request, "_receive", None)
+    if orig_receive is not None:
+        total_bytes = 0
+
+        async def _bounded_receive():
+            nonlocal total_bytes
+            message = await orig_receive()
+            if message.get("type") == "http.request":
+                total_bytes += len(message.get("body", b""))
+                if total_bytes > max_body:
+                    raise _RequestTooLargeError("request body too large")
+            return message
+
+        request._receive = _bounded_receive
+    try:
+        form = await request.form(max_files=MAX_REFERENCE_IMAGES + 2)
+    except _RequestTooLargeError as exc:
+        raise InvalidRequest("request body too large") from exc
+    finally:
+        if orig_receive is not None:
+            request._receive = orig_receive
     try:
         if form.get("mask") is not None:
             raise InvalidRequest("mask is not supported; muse.ai cannot inpaint a region")

@@ -7,7 +7,9 @@
   import {
     buildProxyInput,
     formatHostPort,
+    isProxyBusy,
     parseProxyPaste,
+    resolveLiveProxy,
     validateProxyHost,
   } from "../lib/proxyInput";
   import {
@@ -82,6 +84,8 @@
   }
 
   $: accountMap = new Map($museAccounts.map((a) => [a.id, a]));
+  $: liveDeleteTarget = resolveLiveProxy(deleteTarget, proxies);
+  $: deleteTargetBusy = isProxyBusy(liveDeleteTarget, $running, accountMap);
 
   // Map exit_ip -> danh sách account IDs đang dùng exit_ip đó (qua mọi proxy)
   $: exitIpAccountsMap = (() => {
@@ -99,15 +103,6 @@
     }
     return m;
   })();
-
-  function isProxyBusy(
-    p: ProxyItem,
-    isRunning: boolean,
-    accMap: Map<string, MuseAccount>
-  ): boolean {
-    if (isRunning) return true;
-    return p.assigned_account_ids.some((id) => accMap.get(id)?.busy === true);
-  }
 
   function accountDisplayName(accId: string, accMap: Map<string, MuseAccount>): string {
     const a = accMap.get(accId);
@@ -249,8 +244,15 @@
   }
 
   async function confirmDeleteProxy() {
-    if (!deleteTarget || deleting || $running) return;
-    const target = deleteTarget;
+    const target = resolveLiveProxy(deleteTarget, proxies);
+    if (!target || deleting) return;
+    if (isProxyBusy(target, $running, accountMap)) {
+      showToast(
+        "warn",
+        "Không thể xoá proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận."
+      );
+      return;
+    }
     deleting = true;
     try {
       const res = await api.proxy_delete(target.id);
@@ -737,26 +739,31 @@
 
 <!-- Modal Xác nhận xoá Proxy -->
 <Modal
-  open={deleteTarget !== null}
+  open={liveDeleteTarget !== null}
   title="Xác nhận xoá Proxy"
   width="460px"
   disableClose={deleting}
   on:close={() => (deleteTarget = null)}
 >
-  {#if deleteTarget}
+  {#if liveDeleteTarget}
     <div class="del-body">
-      {#if deleteTarget.assigned_account_ids.length > 0}
+      {#if liveDeleteTarget.assigned_account_ids.length > 0}
         <p>
-          Proxy <b>{deleteTarget.name}</b> (<code>{formatHostPort(deleteTarget.host, deleteTarget.port)}</code>) đang được gán cho
-          <b>{deleteTarget.assigned_account_ids.length} tài khoản</b>:
-          <b>{deleteTarget.assigned_account_ids.map((id) => accountDisplayName(id, accountMap)).join(", ")}</b>.
+          Proxy <b>{liveDeleteTarget.name}</b> (<code>{formatHostPort(liveDeleteTarget.host, liveDeleteTarget.port)}</code>) đang được gán cho
+          <b>{liveDeleteTarget.assigned_account_ids.length} tài khoản</b>:
+          <b>{liveDeleteTarget.assigned_account_ids.map((id) => accountDisplayName(id, accountMap)).join(", ")}</b>.
         </p>
         <p>
           Xác nhận xoá proxy này và chuyển các tài khoản đó về kết nối <b>Trực tiếp (không dùng proxy)</b>?
         </p>
       {:else}
         <p>
-          Bạn có chắc chắn muốn xoá proxy <b>{deleteTarget.name}</b> (<code>{formatHostPort(deleteTarget.host, deleteTarget.port)}</code>) khỏi hệ thống?
+          Bạn có chắc chắn muốn xoá proxy <b>{liveDeleteTarget.name}</b> (<code>{formatHostPort(liveDeleteTarget.host, liveDeleteTarget.port)}</code>) khỏi hệ thống?
+        </p>
+      {/if}
+      {#if deleteTargetBusy}
+        <p class="proxy-delete-busy-warn" role="alert">
+          Không thể xoá proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận.
         </p>
       {/if}
     </div>
@@ -773,7 +780,7 @@
     <button
       type="button"
       class="btn-danger"
-      disabled={deleting || $running}
+      disabled={deleting || deleteTargetBusy}
       on:click={confirmDeleteProxy}
     >
       {deleting ? "Đang xoá..." : "Xác nhận xoá"}
@@ -1211,6 +1218,16 @@
     font-size: 13px;
     line-height: 1.5;
     color: var(--c-text);
+  }
+  .del-body p.proxy-delete-busy-warn {
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
   }
 
   .modal-footer-actions {

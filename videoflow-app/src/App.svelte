@@ -5,14 +5,18 @@
 <script lang="ts">
   // Khung chung 6.1: header 56px, sidebar 232px/64px, statusbar 28px, Toast, Switcher & Close-Guard
   import { onDestroy, onMount } from "svelte";
+  import { get } from "svelte/store";
+  import { runStartupProjectAutoOpen } from "./lib/asyncGuard";
   import {
     activeRows,
+    beginProjectSwitch,
     clearEventLockedAccount,
     closeConfirmOpen,
     confirmStartEnabled,
     endpointStatus,
     eventLockedAccount,
     formatApiError,
+    getProjectSwitchSeq,
     lastRunFinished,
     maxAttemptsStore,
     museAccounts,
@@ -204,6 +208,9 @@
   let probeInfo: ProbeResult | null = null;
   let probeMode: "giu_lai" | "ghi_de" = "giu_lai";
   let probeApplying = false;
+  const unsubProjectSeq = project.subscribe(() => {
+    beginProjectSwitch();
+  });
 
   async function openSwitcher() {
     if ($running) return;
@@ -221,6 +228,7 @@
   async function switchRecentProject(r: RecentProject) {
     if ($running || switchingProject || r.is_current) return;
     switchingProject = true;
+    beginProjectSwitch();
     try {
       const info = await api.load_project(r.path);
       resetProjectRunState();
@@ -263,6 +271,7 @@
     try {
       const dir = await api.pick_folder();
       if (!dir) return;
+      beginProjectSwitch();
       const probe = await api.probe_folder(dir);
       const writeItem = probe.checklist.find((i) => i.key === "write");
       if (writeItem && !writeItem.ok) {
@@ -272,6 +281,7 @@
 
       // Mục 6.7b: nếu thư mục đã đủ cấu trúc và prompts.csv hợp lệ -> mở thẳng luôn!
       if (probe.has_full_structure && probe.prompts_valid !== false) {
+        beginProjectSwitch();
         const info = await api.load_project(dir);
         resetProjectRunState();
         project.set(info);
@@ -294,6 +304,7 @@
   async function confirmProbeCreate() {
     if (!probedPath || !probeInfo) return;
     probeApplying = true;
+    beginProjectSwitch();
     try {
       const info =
         probeInfo.has_full_structure && probeInfo.prompts_valid !== false && probeMode === "giu_lai"
@@ -312,6 +323,7 @@
   }
 
   async function bootstrapApp() {
+    const bootProjectSeq = getProjectSwitchSeq();
     try {
       appVersion = await api.app_version();
     } catch {
@@ -339,15 +351,23 @@
       // bỏ qua nếu chưa sẵn sàng
     }
 
+    if (destroyed || get(project) || getProjectSwitchSeq() !== bootProjectSeq) {
+      return;
+    }
+
     try {
-      const recents = await api.list_recent_projects();
-      const firstExisting = recents.find((r) => r.exists);
-      if (firstExisting) {
-        const info = await api.load_project(firstExisting.path);
-        resetProjectRunState();
-        project.set(info);
-        rowChangedTick.update((n) => n + 1);
-      }
+      await runStartupProjectAutoOpen({
+        hasCurrentProject: () => Boolean(get(project)),
+        getProjectSeq: getProjectSwitchSeq,
+        isAborted: () => destroyed,
+        listRecentProjects: () => api.list_recent_projects(),
+        loadProject: (path) => api.load_project(path),
+        applyProject: (info) => {
+          resetProjectRunState();
+          project.set(info);
+          rowChangedTick.update((n) => n + 1);
+        },
+      });
     } catch (e) {
       console.warn("[VideoFlow] Không tự mở được dự án gần đây:", e);
     }
@@ -458,6 +478,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    unsubProjectSeq();
     if (unlistenUpdateProgress) unlistenUpdateProgress();
     if (stopMusePolling) {
       stopMusePolling();

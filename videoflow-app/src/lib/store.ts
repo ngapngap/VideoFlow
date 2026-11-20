@@ -273,6 +273,19 @@ export function resetProjectRunState(): void {
   }));
 }
 
+let projectSwitchSeq = 0;
+
+/** Advances and returns the monotonic project-switch sequence counter. */
+export function beginProjectSwitch(): number {
+  projectSwitchSeq += 1;
+  return projectSwitchSeq;
+}
+
+/** Returns the current monotonic project-switch sequence counter. */
+export function getProjectSwitchSeq(): number {
+  return projectSwitchSeq;
+}
+
 export type ToastType = "success" | "warn" | "error" | "info";
 
 export interface ToastItem {

@@ -22,6 +22,7 @@ import socket
 import tempfile
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,7 @@ from ...config import Settings
 from ...core.prompt import followup_text
 from ...errors import (
     Muse2APIError,
+    NotFound,
     UpstreamAuthError,
     UpstreamError,
     UpstreamQuotaError,
@@ -67,6 +69,7 @@ def _is_port_in_use(port: int) -> bool:
 
 
 _USED_PORTS: set[int] = set()
+_PORT_OWNERS: weakref.WeakValueDictionary[int, BrowserDriver] = weakref.WeakValueDictionary()
 _UNSET = object()
 
 
@@ -108,6 +111,7 @@ def allocate_cdp_port(base_port: int) -> int:
 
 def release_cdp_port(port: int) -> None:
     _USED_PORTS.discard(port)
+    _PORT_OWNERS.pop(port, None)
 
 POLL_INTERVAL = 0.15
 STABLE_POLLS_DONE = 4
@@ -349,6 +353,7 @@ class BrowserDriver(MuseDriver):
         self._recovery_lock = asyncio.Lock()
         self._coordinator_ready = False
         self._closed = False
+        self._port_reserved = False
         self._account_lookup: Callable[[str], Account | None] | None = None
         self._account_blocked_cb: Callable[[str], bool] | None = None
 
@@ -378,6 +383,13 @@ class BrowserDriver(MuseDriver):
             return self
         lock = self._driver_locks.setdefault(account.id, asyncio.Lock())
         async with lock:
+            if self._closed:
+                raise UpstreamError("browser driver is closed")
+            if self._account_lookup is not None and self._account_lookup(account.id) is None:
+                stale_drv = self._account_drivers.pop(account.id, None)
+                if stale_drv is not None:
+                    await stale_drv.shutdown()
+                raise NotFound(f"account '{account.id}' not found")
             expected_proxy = resolve_proxy(account, self.settings.browser_proxy)
             drv = self._account_drivers.get(account.id)
             if drv is not None and drv.proxy != expected_proxy:
@@ -400,6 +412,8 @@ class BrowserDriver(MuseDriver):
                     profile_dir=pdir,
                     proxy=expected_proxy,
                 )
+                _PORT_OWNERS[port] = drv
+                drv._port_reserved = True
                 drv.set_account_guards(
                     lookup=self._account_lookup,
                     is_blocked=self._account_blocked_cb,
@@ -502,6 +516,8 @@ class BrowserDriver(MuseDriver):
                 profile_dir=pdir,
                 proxy=expected_proxy,
             )
+            _PORT_OWNERS[port] = drv
+            drv._port_reserved = True
             drv.set_account_guards(
                 lookup=self._account_lookup,
                 is_blocked=self._account_blocked_cb,
@@ -592,6 +608,14 @@ class BrowserDriver(MuseDriver):
                 exe,
             )
             return
+        owner = _PORT_OWNERS.get(self.port)
+        if (owner is not None and owner is not self and not owner._closed) or (
+            (self.port not in _USED_PORTS or not self._port_reserved) and _is_port_in_use(self.port)
+        ):
+            self.port = allocate_cdp_port(self.port + 1)
+        _USED_PORTS.add(self.port)
+        _PORT_OWNERS[self.port] = self
+        self._port_reserved = True
         chromium = ChromiumProcess(
             exe, self.port, self.profile_dir, self.settings.headless,
             proxy=self.proxy,
@@ -600,9 +624,12 @@ class BrowserDriver(MuseDriver):
         try:
             ws_url = await chromium.start()
             if chromium.port != self.port:
-                release_cdp_port(self.port)
+                if _PORT_OWNERS.get(self.port) is self:
+                    release_cdp_port(self.port)
                 self.port = chromium.port
-            _USED_PORTS.add(self.port)
+                _USED_PORTS.add(self.port)
+                _PORT_OWNERS[self.port] = self
+                self._port_reserved = True
             if self._closed:
                 raise UpstreamError("browser driver is closed")
             self._browser = await CDPSession.connect(ws_url)
@@ -617,7 +644,6 @@ class BrowserDriver(MuseDriver):
             finally:
                 if self._chromium is chromium:
                     self._chromium = None
-                release_cdp_port(self.port)
             raise
         log.info("browser driver ready (account=%s, profile=%s, proxy=%s, port=%d)",
                  self.account_id or "default", self.profile_dir, mask_proxy(self.proxy), self.port)
@@ -655,8 +681,11 @@ class BrowserDriver(MuseDriver):
                 with contextlib.suppress(Exception):
                     await self._chromium.stop()
                 self._chromium = None
-            if self.account is not None or self.port != self.settings.cdp_port:
-                release_cdp_port(self.port)
+            if self._port_reserved or self.account is not None or self.port != self.settings.cdp_port:
+                owner = _PORT_OWNERS.get(self.port)
+                if owner is None or owner is self:
+                    release_cdp_port(self.port)
+            self._port_reserved = False
 
     async def health(self) -> dict[str, Any]:
         if self.account is None and self._account_drivers:
@@ -1320,21 +1349,26 @@ class BrowserDriver(MuseDriver):
         finally:
             # Only a named conversation is kept: an anonymous one can never be
             # continued, so holding it would just keep the tab from counting as fresh.
-            if finished and req.conversation_hint:
-                url = ""
-                for _ in range(10):
-                    url = await self._href(tab)
-                    if is_thread_url(url):
-                        break
-                    await asyncio.sleep(0.2)
-                self._save_hot(tab, account, req, url if is_thread_url(url) else "")
-                if tab.thread_url:
-                    log.info("saved hot page %s", tab.thread_url)
+            try:
+                if finished and req.conversation_hint:
+                    url = ""
+                    for _ in range(10):
+                        url = await self._href(tab)
+                        if is_thread_url(url):
+                            break
+                        await asyncio.sleep(0.2)
+                    self._save_hot(tab, account, req, url if is_thread_url(url) else "")
+                    if tab.thread_url:
+                        log.info("saved hot page %s", tab.thread_url)
+                    else:
+                        log.info("reply finished but the thread url was not ready yet")
                 else:
-                    log.info("reply finished but the thread url was not ready yet")
-            else:
+                    self._forget(tab)
+            except BaseException:
                 self._forget(tab)
-            await self._checkin(tab)
+                raise
+            finally:
+                await asyncio.shield(self._checkin(tab))
             if finished and not errored:
                 self.prewarm(account)
 
@@ -1381,11 +1415,14 @@ class BrowserDriver(MuseDriver):
                     if not drv._can_prewarm(account):
                         return
                     if not drv.browser_alive:
-                        async with drv._recovery_lock:
-                            if not drv._closed and not drv.browser_alive:
-                                if not drv._can_prewarm(account):
+                        if drv._chromium is None and drv._browser is None:
+                            async with drv._recovery_lock:
+                                if drv._closed or not drv._can_prewarm(account):
                                     return
-                                await drv.startup()
+                                if drv._chromium is None and drv._browser is None:
+                                    await drv.startup()
+                        if not drv._closed and not drv.browser_alive and drv._can_prewarm(account):
+                            await drv._recover_browser()
                     if drv._can_prewarm(account):
                         drv.prewarm(account)
                 except asyncio.CancelledError:

@@ -42,7 +42,7 @@ The project focuses on **clean engineering and easy collaboration**:
 
 ## Status
 
-> **Current**: the unit and mock-driver test suite passes locally (235 tests, no network access) and CI runs on every push/PR; the browser driver and direct-protocol integrations have smoke coverage in CI/release workflows.
+> **Current**: the unit and mock-driver test suite passes locally without network access and CI runs on every push/PR; the browser driver and direct-protocol integrations have smoke coverage in CI/release workflows.
 
 | Module | Status | Notes |
 |---|---|---|

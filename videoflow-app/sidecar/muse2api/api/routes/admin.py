@@ -6,6 +6,7 @@ extension for one-click cookie import (served by ``GET /admin/extension.zip``).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 import io
@@ -78,7 +79,15 @@ def _build_account(item: AccountCreate) -> Account:
         cookies, expires = parse_cookies(item.cookies)
         cookies = {k: v for k, v in cookies.items() if v}
         expires = {k: v for k, v in expires.items() if k in cookies}
-    status = AccountStatus.ACTIVE if cookies else AccountStatus.INVALID
+    if cookies and not (missing := missing_session_cookies(cookies)):
+        status = AccountStatus.ACTIVE
+        last_error = None
+    elif not cookies:
+        status = AccountStatus.INVALID
+        last_error = None
+    else:
+        status = AccountStatus.INVALID
+        last_error = f"missing session cookies: {', '.join(missing)}"
     proxy_val = item.proxy.strip() if item.proxy and item.proxy.strip() else None
     return Account(
         label=item.label,
@@ -86,6 +95,7 @@ def _build_account(item: AccountCreate) -> Account:
         cookie_expires={**expires, **item.cookie_expires},
         enabled=item.enabled,
         status=status,
+        last_error=last_error,
         proxy=proxy_val,
     )
 
@@ -395,34 +405,69 @@ async def account_quota(account_id: str, refresh: bool = False,
     409 while every tab of the account is serving a request. Drivers that do not
     implement ``MuseDriver.quota`` raise ``FeatureNotImplemented`` (HTTP 501).
     """
-    if hasattr(svc.pool, "snapshot"):
-        acc = await svc.pool.snapshot(account_id)
-        if acc is None:
-            raise NotFound(f"account '{account_id}' not found")
-    else:
-        acc = _get(svc, account_id)
-    if svc.interactive and svc.interactive.is_session_active(account_id):
-        raise AccountBusy(f"account '{account_id}' is busy in an interactive browser session")
-    if hasattr(svc.pool, "is_inflight") and svc.pool.is_inflight(account_id):
-        raise AccountBusy(f"account '{account_id}' is currently serving a request")
-    if refresh and (forget := getattr(svc.driver, "forget_quota", None)):
-        forget(acc.id)
-    snapshot = await svc.driver.quota(acc)
-    quota_entry = {"checked_at": time.time(), **snapshot}
-    if hasattr(svc.pool, "try_update"):
-        def _set_quota(latest: Account) -> tuple[bool, dict]:
-            latest.meta["quota"] = quota_entry
-            return True, latest.meta["quota"]
+    interactive = getattr(svc, "interactive", None)
+    interactive_lock = getattr(interactive, "_lock", None) if interactive is not None else None
+    cond = getattr(svc.pool, "_cond", None)
 
-        found, saved_quota = await svc.pool.try_update(account_id, _set_quota)
-        if not found:
-            raise NotFound(f"account '{account_id}' not found")
-        return {"account_id": account_id, "quota": saved_quota}
+    reserved = False
+    async with (interactive_lock if interactive_lock is not None else contextlib.nullcontext()):
+        async with (cond if cond is not None else contextlib.nullcontext()):
+            if cond is not None:
+                raw_acc = svc.pool.get(account_id)
+                if raw_acc is None:
+                    raise NotFound(f"account '{account_id}' not found")
+                acc = raw_acc.model_copy(deep=True)
+            elif hasattr(svc.pool, "snapshot"):
+                acc = await svc.pool.snapshot(account_id)
+                if acc is None:
+                    raise NotFound(f"account '{account_id}' not found")
+            else:
+                acc = _get(svc, account_id)
+            if interactive is not None and interactive.is_session_active(account_id):
+                raise AccountBusy(f"account '{account_id}' is busy in an interactive browser session")
+            if hasattr(svc.pool, "is_inflight") and svc.pool.is_inflight(account_id):
+                raise AccountBusy(f"account '{account_id}' is currently serving a request")
+            driver = getattr(svc, "driver", None)
+            if (
+                driver is not None
+                and hasattr(driver, "is_account_busy")
+                and driver.is_account_busy(account_id)
+            ):
+                raise AccountBusy(f"account '{account_id}' is currently busy")
+            if hasattr(svc.pool, "begin_quota"):
+                svc.pool.begin_quota(account_id)
+                reserved = True
+                if cond is not None:
+                    cond.notify_all()
 
-    latest = _get(svc, account_id)
-    latest.meta["quota"] = quota_entry
-    await svc.pool.upsert(latest)
-    return {"account_id": latest.id, "quota": latest.meta["quota"]}
+    try:
+        if refresh and (forget := getattr(svc.driver, "forget_quota", None)):
+            forget(acc.id)
+        snapshot = await svc.driver.quota(acc)
+        quota_entry = {"checked_at": time.time(), **snapshot}
+        if hasattr(svc.pool, "try_update"):
+            def _set_quota(latest: Account) -> tuple[bool, dict]:
+                latest.meta["quota"] = quota_entry
+                return True, latest.meta["quota"]
+
+            found, saved_quota = await svc.pool.try_update(account_id, _set_quota)
+            if not found:
+                raise NotFound(f"account '{account_id}' not found")
+            return {"account_id": account_id, "quota": saved_quota}
+
+        latest = _get(svc, account_id)
+        latest.meta["quota"] = quota_entry
+        await svc.pool.upsert(latest)
+        return {"account_id": latest.id, "quota": latest.meta["quota"]}
+    finally:
+        if reserved:
+            async def _release_quota() -> None:
+                async with (cond if cond is not None else contextlib.nullcontext()):
+                    svc.pool.end_quota(account_id)
+                    if cond is not None:
+                        cond.notify_all()
+
+            await asyncio.shield(_release_quota())
 
 
 @router.get("/extension.zip")
