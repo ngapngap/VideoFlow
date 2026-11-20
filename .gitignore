@@ -24,7 +24,9 @@ videoflow-app/sidecar/.venv/
 # Khoá updater (không bao giờ commit)
 .updater-key.pem
 .updater-key.pem.pub
+.updater-key.*
 .updater-pass.new
+.updater-pass.*
 
 # Build artifacts
 *.exe
@@ -47,9 +49,6 @@ Thumbs.db
 
 # PDF tài liệu thiết kế — giữ local
 *.pdf
-
-# Updater signing key (never commit)
-.updater-key.*
 
 # Giữ thư mục binaries/ (sidecar build local, *.exe bị ignore)
 !videoflow-app/src-tauri/binaries/

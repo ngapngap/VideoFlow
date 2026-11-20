@@ -1,8 +1,4 @@
-<h1 align="center">muse2api</h1>
-
-<p align="center">
-  <b>English</b> | <a href="README.zh-CN.md">中文</a>
-</p>
+<h1 align="center">muse2api (VideoFlow Muse Sidecar)</h1>
 
 <p align="center">
   An async gateway that exposes the <a href="https://muse.ai">muse.ai</a> web app as an <b>OpenAI-compatible API</b>
@@ -66,7 +62,7 @@ The project focuses on **clean engineering and easy collaboration**:
 | Web dashboard, request log, multiple API keys | ✅ Implemented | Dashboard at `/dashboard`; key CRUD at `/admin/keys`; per-request log and aggregates |
 | Quota lookup | ✅ Implemented | Browser driver reads Settings → Usage (plan, weekly %, reset, extra allowance; en / zh-CN / zh-TW) on an idle tab, cached 30 min; mock driver returns a fake snapshot; http driver not wired up |
 | VM wake confirmation | ✅ Implemented | After a wake (keepalive or `/admin/accounts/{id}/renew`) the session is polled until the VM is `RUNNING`; an account whose VM is seen down gets no video for 10 min |
-| Cookie import browser extension | ✅ Implemented | MV3 popup in `src/muse2api/web/extension/`, downloadable from the dashboard |
+| Cookie import browser extension | ✅ Implemented | MV3 popup in `muse2api/web/extension/`, downloadable from the dashboard |
 | Storage backends (SQLite / Redis) | 🚧 Reserved | Accounts still use a JSON store; the request log is SQLite |
 | Prometheus metrics | 🚧 Reserved | Basic aggregates exist at `/admin/stats` |
 
@@ -115,13 +111,13 @@ flowchart TB
 
 For streaming requests, the first chunk is fetched before returning 200. Errors such as "no account available" or "upstream authentication failed" therefore come back with a proper HTTP status code instead of a stream that breaks halfway.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
+See [`BUGFIXES.md`](BUGFIXES.md) for VideoFlow-specific sidecar patches and architecture notes.
 
 ## Project layout
 
 ```
-muse2api/
-├── src/muse2api/
+sidecar/
+├── muse2api/
 │   ├── app.py                 # FastAPI app factory and lifespan
 │   ├── config.py              # Settings (environment variables / .env)
 │   ├── errors.py              # Error hierarchy → HTTP status + OpenAI error body
@@ -138,14 +134,13 @@ muse2api/
 │   ├── drivers/
 │   │   ├── base.py            # MuseDriver interface and data types
 │   │   ├── mock.py
-│   │   ├── browser/           # cdp.py / chromium.py / dom.py / driver.py
+│   │   ├── browser/           # cdp.py / chromium.py / dom.py / driver.py / interactive.py / proxy_relay.py
 │   │   └── http/              # Reserved
 │   └── upstream/muse.py       # Upstream constants and session renewal
-├── tests/                     # Mock-driver tests, no network access
-├── docs/ARCHITECTURE.md
-├── TODO.md                    # Task board for contributors
-├── Dockerfile · docker-compose.yml · .env.example
-└── CONTRIBUTING.md
+├── tests/                     # Unit & mock-driver tests, no network access
+├── BUGFIXES.md                # VideoFlow Desktop patches & build guide
+├── muse2api.spec              # PyInstaller onefile spec
+└── pyproject.toml
 ```
 
 ## Quick start
@@ -302,20 +297,20 @@ Each account card shows its quota (usage bar, plan, reset date, age of the readi
 
 #### Cookie-import extension
 
-The muse.ai session cookies are httpOnly, so page scripts cannot read them; a small Chrome / Edge extension (Manifest V3, in `src/muse2api/web/extension/`) can.
+The muse.ai session cookies are httpOnly, so page scripts cannot read them; a small Chrome / Edge extension (Manifest V3, in `muse2api/web/extension/`) can.
 
 1. On the dashboard's Accounts page, click **Tải extension** (download extension). It downloads `muse2api-extension.zip`, also served at `GET /admin/extension.zip`. Unzip it.
 2. Open `chrome://extensions`, turn on **Developer mode** and click **Load unpacked** on the unzipped folder.
 3. Sign in to [muse.ai](https://muse.ai/) in that browser.
 4. Open the extension popup, enter the gateway URL (e.g. `http://localhost:18610`) and the admin key, optionally a label, and click import.
 
-The extension reads the muse.ai cookies with their expiry and posts them to `POST /admin/accounts`. Its only fixed host permission is `muse.ai`; it asks for the gateway's origin when you save it, and never stores the cookies. See [its README](src/muse2api/web/extension/README.md) for details.
+The extension reads the muse.ai cookies with their expiry and posts them to `POST /admin/accounts`. Its only fixed host permission is `muse.ai`; it asks for the gateway's origin when you save it, and never stores the cookies. See [its README](muse2api/web/extension/README.md) for details.
 
 Besides the admin key and `MUSE2API_API_KEY` (still accepted, logged as `legacy`), `/v1/*` accepts any non-revoked key created on the dashboard or with `POST /admin/keys {"name": "..."}`. Keys look like `m2a-...` and are shown once; `data/keys.json` stores only their SHA-256 hash and an 8-character prefix. Every `/v1/*` request (except `/v1/media/*` downloads) is recorded in `data/requests.db` (SQLite) with its key, model, account, status, latency and client IP (`CF-Connecting-IP` / `X-Forwarded-For` aware). Task status polls are flagged so the dashboard and stats can leave them out.
 
 ## Configuration
 
-All settings come from environment variables (prefix `MUSE2API_`) or a `.env` file. See [.env.example](.env.example) for the full list. The most common ones:
+All settings come from environment variables (prefix `MUSE2API_`) or a `.env` file. The most common ones:
 
 | Variable | Default | Description |
 |---|---|---|
@@ -327,7 +322,7 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_MEDIA_RETENTION_DAYS` | `14` | Days generated media files are kept in `data/media`; `0` disables automatic cleanup |
 | `MUSE2API_STREAM_HEARTBEAT_INTERVAL` | `0` | SSE `: keepalive` comment interval (seconds) while waiting for the first stream token; `0` disables |
 | `MUSE2API_PUBLIC_BASE` | empty | Public base URL used in media links; derived from the request when empty |
-| `MUSE2API_POOL_STRATEGY` | `lru` | Account scheduling: `lru` / `round_robin` / `affinity` |
+| `MUSE2API_POOL_STRATEGY` | `affinity` | Account scheduling: `affinity` / `lru` / `round_robin` |
 | `MUSE2API_MAX_FAILOVER` | `2` | Maximum number of retries on another account |
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `4` | Parallel requests per account (browser driver: one tab each, about 300 MB of memory per tab) |
 | `MUSE2API_WARM_THREADS` | `2` | Pre-started threads kept per account. A new muse.ai thread takes 20-40s to answer its first message, a started one about 5s, so chats that need a new thread go into a warm one. Each costs one extra short message of quota; needs a concurrency of at least 2 |
@@ -340,21 +335,16 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 
 ## Roadmap
 
-All reserved modules and outstanding work are tracked in **[TODO.md](TODO.md)**, in four groups:
+Future extension points include:
 
-- **Verification and live testing (do first)**: get the tests passing, test the browser driver against real accounts, and verify image/video generation and session renewal.
 - **Drivers**: direct HTTP protocol driver, conversation thread reuse, quota-aware scheduling.
 - **Protocol**: `/v1/responses`, mask-based inpainting, emulated tool calling.
 - **Accounts, admin and operations**: storage backends, per-key rate limits, Prometheus metrics.
 
-Each task lists its location, approach and definition of done. Places marked `TODO(contributors)` in the code are the reserved extension points.
-
-## Contributing
-
-You are welcome to pick up any task in [TODO.md](TODO.md). Please open an issue describing what you plan to do before you start; see [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
+## Testing & Linting
 
 ```bash
-pytest           # all tests use the mock driver
+pytest -q        # unit & mock-driver tests
 ruff check .     # lint
 ```
 
@@ -368,4 +358,4 @@ This project is for learning and technical research only. Please comply with mus
 
 ## License
 
-[MIT](LICENSE)
+MIT

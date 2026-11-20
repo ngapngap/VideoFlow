@@ -703,11 +703,12 @@ mod tests {
 
     #[test]
     fn find_free_port_khong_trung() {
-        // Chiếm một listener ở port bất kỳ, preferred bị bận → phải trả port khác.
+        // Chiếm một listener ở port bất kỳ, preferred bị bận → phải trả port khác hợp lệ.
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let busy = listener.local_addr().unwrap().port();
-        // Trả về port khác hoặc đúng busy nếu OS cho bind kép — chỉ cần không panic.
-        let _ = find_free_port(busy);
+        let chosen = find_free_port(busy).expect("phải chọn được port rảnh");
+        assert!(chosen > 0);
+        assert_ne!(chosen, busy, "port đang bị giữ phải được đổi sang port rảnh khác");
     }
 
     /// Chạy khi có exe engine cạnh app (dev: `binaries/`) — CI release build exe trước

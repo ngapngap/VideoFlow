@@ -1326,6 +1326,35 @@ pub fn run_with_emitter(
     run_with_emitter_and_hook(emitter, None, cfg, project_path, engine_cfg, stop_flag)
 }
 
+fn initial_job_image_state(
+    row: &prompts_csv::Row,
+    base_st: prompts_csv::RowStatus,
+    plan: &RowPlan,
+    img_dir: &Path,
+) -> (&'static str, &'static str) {
+    let init_img_status = if !plan.force_new_image
+        && matches!(
+            base_st,
+            prompts_csv::RowStatus::DaTaoImage
+                | prompts_csv::RowStatus::DaTaoVideo
+                | prompts_csv::RowStatus::LoiVideo
+                | prompts_csv::RowStatus::LoiTamThoi
+        )
+        && !row.anh_da_tao.is_empty()
+        && img_dir.join(&row.anh_da_tao).is_file()
+    {
+        "xong"
+    } else {
+        "chua_chay"
+    };
+    let init_db_status = if init_img_status == "xong" {
+        "da_tao_image"
+    } else {
+        "dang_cho"
+    };
+    (init_img_status, init_db_status)
+}
+
 /// Nhân thực thi cốt lõi của Run Engine (hỗ trợ hook nhận `run_id` tức thì và chạy song song `1..=3` luồng).
 pub fn run_with_emitter_and_hook(
     emitter: EventEmitter<'_>,
@@ -1474,23 +1503,8 @@ pub fn run_with_emitter_and_hook(
                     let prev_before_insert = latest_job_info(&w_conn, &row_key);
                     let base_st = effective_row_status(&row, prev_before_insert.as_ref())
                         .unwrap_or_else(|| row.status());
-                    let init_img_status = if !plan.force_new_image
-                        && matches!(
-                            base_st,
-                            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
-                        )
-                        && !row.anh_da_tao.is_empty()
-                        && img_ref.join(&row.anh_da_tao).is_file()
-                    {
-                        "xong"
-                    } else {
-                        "chua_chay"
-                    };
-                    let init_db_status = if init_img_status == "xong" {
-                        "da_tao_image"
-                    } else {
-                        "dang_cho"
-                    };
+                    let (init_img_status, init_db_status) =
+                        initial_job_image_state(&row, base_st, &plan, img_ref);
 
                     // [P0-2]: Khởi tạo `image_prompt_hash` và `video_prompt_hash` bằng hash LỊCH SỬ (`prev_*_hash`),
                     // CHỈ cập nhật sang hash mới sau khi từng bước thực sự hoàn tất!
@@ -4266,27 +4280,9 @@ mod tests {
         assert_eq!(plan.steps, vec![Step::B3]);
         assert!(!plan.force_new_image);
 
-        // Pattern match logic at engine.rs:1346
-        let base_st = row.status();
-        let init_img_status = if !plan.force_new_image
-            && matches!(
-                base_st,
-                RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
-            )
-            && !row.anh_da_tao.is_empty()
-            && img_out.join(&row.anh_da_tao).is_file()
-        {
-            "xong"
-        } else {
-            "chua_chay"
-        };
+        let (init_img_status, init_db_status) =
+            initial_job_image_state(&row, row.status(), &plan, &img_out);
         assert_eq!(init_img_status, "xong");
-
-        let init_db_status = if init_img_status == "xong" {
-            "da_tao_image"
-        } else {
-            "dang_cho"
-        };
         assert_eq!(init_db_status, "da_tao_image");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4542,17 +4538,18 @@ mod tests {
             ..Default::default()
         };
 
-        // Khi các file video không phải là stream MP4 hợp lệ hoặc FFmpeg không chạy được trên dữ liệu giả lập,
-        // auto_merge_batch trả về Err, nhưng toàn bộ các clip gốc trong video_out/ phải hoàn toàn nguyên vẹn!
+        // Khi các file video không phải là stream MP4 hợp lệ, auto_merge_batch bắt buộc trả về Err,
+        // nhưng toàn bộ các clip gốc trong video_out/ phải hoàn toàn nguyên vẹn!
         let merge_res = auto_merge_batch(&dir, Some(1), None, &cfg);
-        // Có thể trả về Err do FFmpeg thất bại khi decode "original-content" giả
-        if merge_res.is_err() {
-            // Xác nhận clips lẻ vẫn nguyên vẹn 100%
-            assert!(vid1.is_file(), "clip1 phải luôn được bảo toàn");
-            assert!(vid2.is_file(), "clip2 phải luôn được bảo toàn");
-            assert_eq!(std::fs::read(&vid1).unwrap(), b"original-content-1");
-            assert_eq!(std::fs::read(&vid2).unwrap(), b"original-content-2");
-        }
+        assert!(
+            merge_res.is_err(),
+            "auto_merge_batch phải báo lỗi khi clip giả không phải MP4 hợp lệ"
+        );
+        // Xác nhận clips lẻ vẫn nguyên vẹn 100%
+        assert!(vid1.is_file(), "clip1 phải luôn được bảo toàn");
+        assert!(vid2.is_file(), "clip2 phải luôn được bảo toàn");
+        assert_eq!(std::fs::read(&vid1).unwrap(), b"original-content-1");
+        assert_eq!(std::fs::read(&vid2).unwrap(), b"original-content-2");
 
         // Kiểm tra trường hợp chỉ có 1 video thành phẩm -> auto_merge_batch trả về Ok(None) bỏ qua an toàn
         let dir_single = make_temp_project("p2_2_single");

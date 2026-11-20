@@ -64,10 +64,10 @@ port DevTools không bao giờ mở → `RuntimeError: Chromium did not expose a
 
 **Sửa:**
 - `chromium.py`: thêm `_kill_stale_browsers(profile_dir)` — taskkill `/T /F` mọi `msedge.exe`
-  khớp **2 needle** (đường dẫn profile đầy đủ, HOẶC bộ ba `VideoFlowDesktop` +
-  `muse` + `browser-profile`) vì process con của Edge có thể báo path dạng 8.3
-  (`NAMDM~1.DAN`) nên chỉ so path đầy đủ sẽ bỏ sót. Không bao giờ khớp browser của
-  người dùng. Chờ 1.5s cho Windows nhả singleton mutex.
+  khớp ranh giới đường dẫn profile (hoặc bộ ba `VideoFlowDesktop` +
+  `muse` + `<profile_name>`) vì process con của Edge trên Windows có thể báo path dạng 8.3
+  (`USER~1`) nên chỉ so path đầy đủ sẽ bỏ sót. Không bao giờ khớp browser của
+  người dùng hay cắt nhầm giữa `browser-profile-acc_1` và `browser-profile-acc_10`. Chờ 1.5s cho Windows nhả singleton mutex.
 - `start()`: 3 lần thử — lần 1 dọn stale + xoá lock; lần 3 **xoá hẳn profile** (cookie
   nằm ở `accounts.json` riêng, profile chỉ là cache của browser); mỗi lần chờ CDP 60s.
 - stderr của Edge giờ ghi ra `<data>/chromium-stderr.log` và **log 800 ký tự cuối khi
