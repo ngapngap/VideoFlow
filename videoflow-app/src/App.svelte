@@ -304,6 +304,12 @@
 
   async function bootstrapApp() {
     try {
+      appVersion = await api.app_version();
+    } catch {
+      // giữ mặc định
+    }
+
+    try {
       const view = await api.get_settings();
       endpointStatus.set({
         imageConfigured:
@@ -339,7 +345,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.5.0";
+  let appVersion = "1.5.1";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;
@@ -515,7 +521,7 @@
 
 <div
   class="layout"
-  style="--w-sidebar-current: var({sidebarCollapsed ? '--w-sidebar-collapsed' : '--w-sidebar'});"
+  style="--w-sidebar-current: var({sidebarCollapsed ? '--w-sidebar-collapsed' : '--w-sidebar'}); --h-top-offset: calc(var(--h-titlebar) + {lockedAccount ? '40px' : '0px'});"
 >
   <aside class="sidebar" class:collapsed={sidebarCollapsed}>
     <div class="sidebar-top">
@@ -1777,13 +1783,16 @@
     background: #fdf2f2;
     border-bottom: 1px solid #f8b4b4;
     color: #9b1c1c;
-    padding: 8px 16px;
+    min-height: 40px;
+    box-sizing: border-box;
+    padding: 6px 16px;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     font-size: 13px;
-    z-index: 35;
+    position: relative;
+    z-index: 42;
     box-shadow: 0 1px 3px rgba(155, 28, 28, 0.08);
   }
   .video-lock-left {

@@ -56,6 +56,7 @@ class TaskManager:
         self.on_finish = on_finish
         self._tasks: dict[str, Task] = {}
         self._running: dict[str, asyncio.Task] = {}
+        self._write_lock = asyncio.Lock()
 
     async def load(self) -> None:
         if not self.path.is_file():
@@ -103,8 +104,9 @@ class TaskManager:
         self._write_payload(payload)
 
     async def _persist_async(self) -> None:
-        payload = self._prune_and_snapshot()
-        await asyncio.to_thread(self._write_payload, payload)
+        async with self._write_lock:
+            payload = self._prune_and_snapshot()
+            await asyncio.to_thread(self._write_payload, payload)
 
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
@@ -115,7 +117,6 @@ class TaskManager:
     def submit(self, kind: str, request: dict[str, Any], runner: Runner) -> Task:
         task = Task(kind=kind, request=request)
         self._tasks[task.id] = task
-        self._persist()
         self._running[task.id] = asyncio.create_task(self._run(task, runner))
         return task
 
@@ -125,6 +126,10 @@ class TaskManager:
             task.updated_at = time.time()
 
         task.status = TaskStatus.RUNNING
+        try:
+            await self._persist_async()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to persist initial task %s", task.id)
         try:
             task.result = await runner(progress)
             task.status = TaskStatus.SUCCEEDED

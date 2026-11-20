@@ -185,7 +185,10 @@
     activeVideoVersion?.file_name ?? detail?.row.video_file ?? "";
 
   $: lightboxUrl = lightboxAbsPath
-    ? toAssetUrl(lightboxAbsPath, $assetCacheBust)
+    ? toAssetUrl(
+        lightboxAbsPath,
+        rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)
+      )
     : "";
 
   // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
@@ -211,7 +214,7 @@
     revs: Record<string, number>,
     baseBust: number
   ): number {
-    return (rowKey && revs[rowKey]) || baseBust;
+    return Math.max((rowKey && revs[rowKey]) || 0, baseBust);
   }
 
   function formatAspectRatio(w: number, h: number): string {
@@ -761,11 +764,17 @@
   async function confirmResetStatus(): Promise<void> {
     if (!detail || $running || actionBusy) return;
     actionBusy = true;
+    const wasDirty = promptsDirty;
     try {
       const updated = await api.reset_row_status(detail.row.row_key);
       resetConfirmOpen = false;
       detail = updated;
-      syncPromptsFromDetail(updated);
+      if (wasDirty) {
+        origPromptImage = updated.prompt_image;
+        origPromptVideo = updated.prompt_video;
+      } else {
+        syncPromptsFromDetail(updated);
+      }
       showToast(
         "success",
         `Đã đặt lại trạng thái về Đang chờ (0/${$maxAttemptsStore} lần thử).`
@@ -801,6 +810,7 @@
   async function remapRowByKey(targetKey: string): Promise<void> {
     if ($running || actionBusy) return;
     actionBusy = true;
+    const wasDirty = detail?.row.row_key === targetKey && promptsDirty;
     try {
       const picked = await api.pick_image_in_input();
       if (!picked) return;
@@ -809,13 +819,23 @@
       assetCacheBust.set(Date.now());
       if (detail && detail.row.row_key === targetKey) {
         detail = updated;
-        syncPromptsFromDetail(updated);
+        if (wasDirty) {
+          origPromptImage = updated.prompt_image;
+          origPromptVideo = updated.prompt_video;
+        } else {
+          syncPromptsFromDetail(updated);
+        }
         previewFileOverride = null;
         previewTab = "ref";
       }
-      const next = new Set(selected);
-      next.delete(targetKey);
-      updateSelection(next);
+      if (selected.has(targetKey)) {
+        const next = new Set(selected);
+        next.delete(targetKey);
+        if (!isRowLockedForBatch(updated.row, $maxAttemptsStore)) {
+          next.add(updated.row.row_key);
+        }
+        updateSelection(next);
+      }
       showToast("success", `Đã cập nhật ảnh tham chiếu thành "${picked}".`);
       await load({ silent: true });
     } catch (e) {
@@ -2800,20 +2820,21 @@
         </div>
 
         {#if compareLeftItem}
+          {@const compareRev = rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)}
           <div class="compare-stage">
             {#if compareKind === "video"}
-              {#key `left-${compareLeftItem.abs_path}-${$assetCacheBust}`}
+              {#key `left-${compareLeftItem.abs_path}-${compareRev}`}
                 <video
                   controls
                   preload="metadata"
-                  src={toAssetUrl(compareLeftItem.abs_path, $assetCacheBust)}
+                  src={toAssetUrl(compareLeftItem.abs_path, compareRev)}
                 >
                   <track kind="captions" />
                 </video>
               {/key}
             {:else}
               <img
-                src={toAssetUrl(compareLeftItem.abs_path, $assetCacheBust)}
+                src={toAssetUrl(compareLeftItem.abs_path, compareRev)}
                 alt={`Phiên bản v${compareLeftItem.version}`}
               />
             {/if}
@@ -2857,20 +2878,21 @@
         </div>
 
         {#if compareRightItem}
+          {@const compareRev = rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)}
           <div class="compare-stage">
             {#if compareKind === "video"}
-              {#key `right-${compareRightItem.abs_path}-${$assetCacheBust}`}
+              {#key `right-${compareRightItem.abs_path}-${compareRev}`}
                 <video
                   controls
                   preload="metadata"
-                  src={toAssetUrl(compareRightItem.abs_path, $assetCacheBust)}
+                  src={toAssetUrl(compareRightItem.abs_path, compareRev)}
                 >
                   <track kind="captions" />
                 </video>
               {/key}
             {:else}
               <img
-                src={toAssetUrl(compareRightItem.abs_path, $assetCacheBust)}
+                src={toAssetUrl(compareRightItem.abs_path, compareRev)}
                 alt={`Phiên bản v${compareRightItem.version}`}
               />
             {/if}
@@ -3771,10 +3793,10 @@
     font-weight: 500;
   }
 
-  /* Ngăn trượt Chi tiết 440px: chỉ phủ vùng nội dung (dưới Titlebar 56px, phải Sidebar) */
+  /* Ngăn trượt Chi tiết 440px: chỉ phủ vùng nội dung (dưới Titlebar / Banner, phải Sidebar) */
   .drawer-backdrop {
     position: fixed;
-    top: var(--h-titlebar);
+    top: var(--h-top-offset, var(--h-titlebar));
     left: var(--w-sidebar-current, var(--w-sidebar));
     right: 0;
     bottom: var(--h-statusbar);
@@ -3785,7 +3807,7 @@
   .drawer {
     position: fixed;
     right: 0;
-    top: var(--h-titlebar);
+    top: var(--h-top-offset, var(--h-titlebar));
     bottom: var(--h-statusbar);
     width: min(var(--w-detail-drawer), calc(100vw - var(--w-sidebar-current, var(--w-sidebar))));
     background: var(--c-card);

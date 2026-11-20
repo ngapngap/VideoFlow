@@ -233,6 +233,10 @@ async def create_response(body: ResponseRequest, request: Request,
         first = await anext(stream)
     except StopAsyncIteration:
         first = ""
+    except BaseException:
+        cancel.set()
+        await stream.aclose()
+        raise
 
     return StreamingResponse(events(first), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

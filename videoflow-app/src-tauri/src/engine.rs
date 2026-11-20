@@ -209,6 +209,20 @@ pub fn latest_job_for_csv_row(
                 return Some(info);
             }
         }
+        let ref_rk: Option<String> = conn
+            .query_row(
+                "SELECT row_key FROM file_refs
+                 WHERE LOWER(file_name) = LOWER(?1)
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![fname],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(rk) = ref_rk {
+            if let Some(info) = latest_map.get(&rk.to_lowercase()) {
+                return Some(info.clone());
+            }
+        }
     }
 
     let legacy = row.anh_tham_chieu.trim().to_lowercase();
@@ -1114,16 +1128,23 @@ pub fn sync_rows_from_state_db(
             continue;
         }
         let key_low = row_key_low(r);
-        // Fallback dữ liệu cũ: jobs/file_refs lưu theo tên ảnh.
+        // Fallback dữ liệu cũ: jobs/file_refs lưu theo tên ảnh hoặc thông qua file_refs hiện có.
         let legacy_key = r.anh_tham_chieu.trim().to_lowercase();
         let legacy_only = image_counts.get(&legacy_key).copied().unwrap_or(0) == 1;
-        let mut image_lookup_key = key_low.clone();
-        if !media_map.contains_key(&key_low) && legacy_only && !legacy_key.is_empty() {
-            image_lookup_key = legacy_key.clone();
-        }
+        let prev = latest_job_for_csv_row(conn, r, &latest_map, &image_counts);
+        let media_entry = media_map
+            .get(&key_low)
+            .or_else(|| prev.as_ref().and_then(|p| media_map.get(&p.row_key.to_lowercase())))
+            .or_else(|| {
+                if legacy_only && !legacy_key.is_empty() {
+                    media_map.get(&legacy_key)
+                } else {
+                    None
+                }
+            });
         let mut changed = false;
 
-        if let Some(m) = media_map.get(&image_lookup_key) {
+        if let Some(m) = media_entry {
             if let Some(ref img_f) = m.image_file {
                 if !img_f.is_empty() && image_out.join(img_f).is_file() {
                     if r.anh_da_tao != *img_f {
@@ -1158,16 +1179,7 @@ pub fn sync_rows_from_state_db(
             }
         }
 
-        // Ở đây `rows` đang bị mượn mut → tự quyết định lookup key bằng image_counts
-        // (giống quy tắc job_for_row) thay vì gọi hàm cần &[Row].
-        let job_lookup_key = if latest_map.contains_key(&key_low) {
-            key_low.clone()
-        } else if legacy_only && !legacy_key.is_empty() {
-            legacy_key.clone()
-        } else {
-            key_low.clone()
-        };
-        if let Some(j) = latest_map.get(&job_lookup_key) {
+        if let Some(ref j) = prev {
             let csv_label = match j.status.as_str() {
                 "dang_cho" | "bo_qua" => Some("Đang chờ"),
                 "da_tao_image" => Some("Đã tạo image"),
@@ -1933,7 +1945,8 @@ fn run_b2(
         }
     };
 
-    let stem = Path::new(&row_key)
+    let img_name = crate::prompts_csv::row_key_image_name(&row_key);
+    let stem = Path::new(img_name)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anh".into());
@@ -1956,9 +1969,20 @@ fn run_b2(
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu ảnh: {e}"),
     })?;
+    let prev_img = row.anh_da_tao.trim();
+    if !prev_img.is_empty() {
+        let _ = tx.execute(
+            "UPDATE file_refs
+             SET row_key = ?1
+             WHERE LOWER(row_key) IN (
+                 SELECT LOWER(row_key) FROM file_refs WHERE LOWER(file_name) = LOWER(?2)
+             )",
+            rusqlite::params![row_key, prev_img],
+        );
+    }
     tx.execute(
-        "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'anh'",
-        rusqlite::params![row_key],
+        "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'anh'",
+        rusqlite::params![row_key, ctx.job_id],
     )
     .map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
@@ -2137,7 +2161,8 @@ fn download_and_commit_video(
         "Đang tải video về video_out/".to_string(),
     );
 
-    let stem = Path::new(&row_key)
+    let img_name = crate::prompts_csv::row_key_image_name(&row_key);
+    let stem = Path::new(img_name)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anh".into());
@@ -2158,9 +2183,21 @@ fn download_and_commit_video(
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu video: {e}"),
     })?;
+    for fname in [row.video_da_tao.trim(), row.anh_da_tao.trim()] {
+        if !fname.is_empty() {
+            let _ = tx.execute(
+                "UPDATE file_refs
+                 SET row_key = ?1
+                 WHERE LOWER(row_key) IN (
+                     SELECT LOWER(row_key) FROM file_refs WHERE LOWER(file_name) = LOWER(?2)
+                 )",
+                rusqlite::params![row_key, fname],
+            );
+        }
+    }
     tx.execute(
-        "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video'",
-        rusqlite::params![row_key],
+        "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'video'",
+        rusqlite::params![row_key, ctx.job_id],
     )
     .map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
@@ -2353,11 +2390,16 @@ pub fn collect_batch_video_paths_filtered(
 
     let mut videos = Vec::new();
     for row in rows {
+        if row.is_example() || row.is_empty_content() {
+            continue;
+        }
         let key = prompts_csv::row_key_of(&row.anh_tham_chieu, &row.promt_tao_image, &row.promt_tao_video);
         if let Some(keys) = filter_keys {
             if !keys.contains(&key) && !keys.contains(&row.anh_tham_chieu) {
                 continue;
             }
+        } else if row.trang_thai.trim().eq_ignore_ascii_case("Bỏ qua") {
+            continue;
         }
         let vname = row.video_da_tao.trim();
         if !vname.is_empty() {
@@ -2578,7 +2620,47 @@ pub fn auto_merge_batch(
         return Ok(None);
     }
 
-    let video_paths = collect_batch_video_paths(&csv_path, &video_out)?;
+    let video_paths = if let Some(c) = conn {
+        let rows = prompts_csv::read_all(&csv_path)
+            .map_err(|e| format!("Không đọc được prompts.csv: {e}"))?;
+        let latest_map = load_latest_jobs_map(c);
+        let media_map = load_current_media_map(c);
+        let img_counts = image_counts(&rows);
+        let mut paths = Vec::new();
+        for row in &rows {
+            if row.is_example() || row.is_empty_content() {
+                continue;
+            }
+            if row.trang_thai.trim().eq_ignore_ascii_case("Bỏ qua") {
+                continue;
+            }
+            let prev = latest_job_for_csv_row(c, row, &latest_map, &img_counts);
+            if prev.as_ref().map(|j| j.status.as_str()) == Some("bo_qua") {
+                continue;
+            }
+            let key_low = row_key_low(row);
+            let mut vname = row.video_da_tao.trim().to_string();
+            if vname.is_empty() || !video_out.join(&vname).is_file() {
+                let db_vid = media_map
+                    .get(&key_low)
+                    .or_else(|| prev.as_ref().and_then(|p| media_map.get(&p.row_key.to_lowercase())))
+                    .or_else(|| map_lookup_legacy(&media_map, &rows, row))
+                    .and_then(|m| m.video_file.as_deref());
+                if let Some(vf) = db_vid {
+                    vname = vf.trim().to_string();
+                }
+            }
+            if !vname.is_empty() {
+                let vpath = video_out.join(&vname);
+                if vpath.is_file() {
+                    paths.push(vpath);
+                }
+            }
+        }
+        paths
+    } else {
+        collect_batch_video_paths(&csv_path, &video_out)?
+    };
     if video_paths.len() < 2 {
         if let Some(c) = conn {
             crate::settings::log(
@@ -3264,8 +3346,15 @@ pub fn dry_run(project_path: &Path, cfg: &Settings) -> AppResult<DryRunResult> {
     };
 
     let img_counts = image_counts(&rows);
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &rows {
+        if r.is_example() || r.is_empty_content() {
+            continue;
+        }
         let key_low = row_key_low(r);
+        if !seen_keys.insert(key_low.clone()) {
+            continue;
+        }
         let prev_owned = latest_job_for_csv_row(&conn, r, &latest_map, &img_counts);
         let prev = prev_owned.as_ref();
         let db_img = media_map

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Request
 
 from ...core.media import load_image_ref
@@ -42,7 +44,7 @@ async def create_video(body: VideoCreateRequest, request: Request,
                            duration=body.duration or body.seconds, first_frame=first_frame,
                            timeout=svc.settings.video_timeout, on_progress=progress)
         result = await svc.gateway.generate_video(req)
-        name = svc.media.save(result.data, result.mime, prefix="vid")
+        name = await asyncio.to_thread(svc.media.save, result.data, result.mime, prefix="vid")
         return {"url": f"{base}/v1/media/{name}", "mime": result.mime,
                 "width": result.width, "height": result.height}
 

@@ -126,17 +126,18 @@
 
       // 2. Tạo tài khoản mới
       const label = newLabel.trim() || `Tài khoản Muse ${accounts.length + 1}`;
+      const proxyToSet = newProxy.trim();
       const res = await api.muse_add_cookie(label, {}, allowDuplicate);
       const acc = res.account;
-
-      // 3. Nếu có proxy, cập nhật proxy
-      if (newProxy.trim()) {
-        await api.muse_update_account(acc.id, undefined, undefined, newProxy.trim());
-      }
-
       newLabel = "";
       newProxy = "";
       allowDuplicate = false;
+
+      // 3. Nếu có proxy, cập nhật proxy
+      if (proxyToSet) {
+        await api.muse_update_account(acc.id, undefined, undefined, proxyToSet);
+      }
+
       showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
 
       // 4. Mở trình duyệt có giao diện để đăng nhập ngay

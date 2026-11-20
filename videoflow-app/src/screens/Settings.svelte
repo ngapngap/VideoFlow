@@ -119,7 +119,16 @@
 
   /** Dừng rồi khởi động lại engine để áp dụng Cài đặt mới (port/chromium/headless). */
   async function museRestart() {
-    if (museSidecarBusy || $running) return;
+    if (museSidecarBusy || $running || saving) return;
+    if (dirty) {
+      if (!formValid) {
+        museErr = validationErrors[0] || "Cấu hình chưa hợp lệ.";
+        showToast("error", museErr);
+        return;
+      }
+      await save();
+      if (dirty) return;
+    }
     museSidecarBusy = true;
     museErr = "";
     try {

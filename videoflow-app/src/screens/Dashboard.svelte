@@ -158,11 +158,28 @@
     }
   }
 
+  function joinCsvPath(base: string): string {
+    const sep = base.includes("\\") ? "\\" : "/";
+    return `${base.replace(/[\\/]+$/, "")}${sep}prompts.csv`;
+  }
+
+  async function revealProbedCsv(): Promise<void> {
+    if (!probedPath) return;
+    try {
+      await api.open_path_in_explorer(joinCsvPath(probedPath), true);
+    } catch (e) {
+      showToast("error", formatApiError(e));
+    }
+  }
+
   async function confirmOnboardingCreate(): Promise<void> {
     if (!probedPath || !probeInfo || probeApplying) return;
     probeApplying = true;
     try {
-      const info = await api.create_project(probedPath, probeMode);
+      const info =
+        probeInfo.has_full_structure && probeInfo.prompts_valid !== false && probeMode === "giu_lai"
+          ? await api.load_project(probedPath)
+          : await api.create_project(probedPath, probeMode);
       resetProjectRunState();
       project.set(info);
       rowChangedTick.update((n) => n + 1);
@@ -723,6 +740,12 @@
             <Icons name="alert" size={17} />
             <div>
               <strong>Phát hiện vấn đề trong prompts.csv:</strong> {probeInfo.prompts_error}
+              <div style="margin-top: 6px;">
+                <button type="button" class="btn-secondary small-btn" on:click={revealProbedCsv}>
+                  <Icons name="folder-open" size={13} />
+                  Hiện prompts.csv trong Explorer
+                </button>
+              </div>
             </div>
           </div>
         {/if}

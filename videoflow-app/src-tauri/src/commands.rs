@@ -1142,21 +1142,58 @@ pub fn set_current_file_version_at(
         }
     };
 
+    let csv_path = p.join("prompts.csv");
+    let rows = prompts_csv::read_all(&csv_path)?;
+    let row = prompts_csv::find_row_by_key(&rows, row_key)
+        .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?;
+    let actual_key = prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
+
     let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let file_name: String = conn
-        .query_row(
-            "SELECT file_name FROM file_refs
-             WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2 AND version = ?3",
-            rusqlite::params![row_key, db_kind, version],
-            |r| r.get(0),
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let img_counts = engine::image_counts(&rows);
+    let prev_owned = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts);
+
+    let mut related_keys: Vec<String> = vec![actual_key.to_lowercase()];
+    let req_low = row_key.trim().to_lowercase();
+    if !req_low.is_empty() && !related_keys.contains(&req_low) {
+        related_keys.push(req_low);
+    }
+    if let Some(ref j) = prev_owned {
+        let jk = j.row_key.to_lowercase();
+        if !related_keys.contains(&jk) {
+            related_keys.push(jk);
+        }
+    }
+    let legacy_low = row.anh_tham_chieu.trim().to_lowercase();
+    if img_counts.get(&legacy_low).copied().unwrap_or(0) == 1 && !related_keys.contains(&legacy_low)
+    {
+        related_keys.push(legacy_low);
+    }
+
+    let mut found_ref: Option<(i64, String)> = None;
+    for rk in &related_keys {
+        if let Ok(hit) = conn.query_row(
+            "SELECT id, file_name FROM file_refs
+             WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2 AND version = ?3
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![rk, db_kind, version],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            found_ref = Some(hit);
+            break;
+        }
+    }
+    let (target_ref_id, file_name) = found_ref.ok_or_else(|| {
+        AppError::new(
+            "VERSION_NOT_FOUND",
+            format!("Không tìm thấy phiên bản v{version} của '{row_key}'."),
         )
-        .map_err(|_| {
-            AppError::new(
-                "VERSION_NOT_FOUND",
-                format!("Không tìm thấy phiên bản v{version} của '{row_key}'."),
-            )
-        })?;
+    })?;
 
     if !p.join(sub_dir).join(&file_name).is_file() {
         return Err(AppError::new(
@@ -1168,21 +1205,24 @@ pub fn set_current_file_version_at(
     let tx = conn
         .transaction()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    for rk in &related_keys {
+        tx.execute(
+            "UPDATE file_refs SET is_current = 0, row_key = ?1
+             WHERE LOWER(row_key) = LOWER(?2) AND kind = ?3",
+            rusqlite::params![actual_key, rk, db_kind],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
     tx.execute(
-        "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2",
-        rusqlite::params![row_key, db_kind],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    tx.execute(
-        "UPDATE file_refs SET is_current = 1 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2 AND version = ?3",
-        rusqlite::params![row_key, db_kind, version],
+        "UPDATE file_refs SET is_current = 1, row_key = ?1 WHERE id = ?2",
+        rusqlite::params![actual_key, target_ref_id],
     )
     .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     tx.commit()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-    prompts_csv::set_active_media_file(&p.join("prompts.csv"), row_key, csv_kind, &file_name)?;
-    build_row_detail_at(p, row_key)
+    prompts_csv::set_active_media_file(&csv_path, &actual_key, csv_kind, &file_name)?;
+    build_row_detail_at(p, &actual_key)
 }
 
 #[tauri::command]
@@ -1668,7 +1708,7 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     let note = "Bị bỏ qua bởi người dùng";
 
-    let updated = conn
+    let mut updated = conn
         .execute(
             "UPDATE jobs
              SET status = 'bo_qua', last_error = ?1
@@ -1676,6 +1716,31 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
             rusqlite::params![note, actual_key],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    if updated == 0 {
+        let latest_map = engine::load_latest_jobs_map(&conn);
+        let img_counts = engine::image_counts(&rows);
+        if let Some(linked) = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts) {
+            updated = conn
+                .execute(
+                    "UPDATE OR IGNORE jobs
+                     SET status = 'bo_qua', last_error = ?1, row_key = ?2
+                     WHERE id = ?3",
+                    rusqlite::params![note, actual_key, linked.id],
+                )
+                .unwrap_or(0);
+            if updated == 0 {
+                updated = conn
+                    .execute(
+                        "UPDATE jobs
+                         SET status = 'bo_qua', last_error = ?1
+                         WHERE id = ?2",
+                        rusqlite::params![note, linked.id],
+                    )
+                    .unwrap_or(0);
+            }
+        }
+    }
 
     if updated == 0 {
         let seed_run_id = ensure_seed_run_id(&conn)?;
@@ -1987,10 +2052,13 @@ pub fn save_row_prompts_at(
         &old_row.promt_tao_video,
     );
     let image_low = image_name.trim().to_lowercase();
-    let same_image = engine::image_counts(&before)
+    let img_counts = engine::image_counts(&before);
+    let same_image = img_counts
         .get(&image_low)
         .copied()
         .unwrap_or(0);
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let prev_job = engine::latest_job_for_csv_row(&conn, old_row, &latest_map, &img_counts);
 
     // Di trú bản ghi job "chưa sinh sản phẩm" của CHÍNH dòng này sang khoá mới.
     // Chỉ khớp chính xác `old_key` (và fallback tên ảnh trần khi `same_image == 1`);
@@ -2030,6 +2098,31 @@ pub fn save_row_prompts_at(
             ],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
+
+    // Với các bản ghi job đã từng chạy và file_refs của chính dòng này: cập nhật `row_key` sang `new_key`
+    // nhưng GIỮ NGUYÊN `image_prompt_hash` / `video_prompt_hash` lịch sử để cờ `prompt_modified`
+    // tiếp tục phát hiện chính xác prompt đã sửa.
+    if !old_key.eq_ignore_ascii_case(&new_key) {
+        let mut migrate_keys = vec![old_key.clone()];
+        if let Some(ref pj) = prev_job {
+            if !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&pj.row_key)) {
+                migrate_keys.push(pj.row_key.clone());
+            }
+        }
+        if same_image == 1 && !image_low.is_empty() && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&image_low)) {
+            migrate_keys.push(image_low.clone());
+        }
+        for mk in &migrate_keys {
+            let _ = conn.execute(
+                "UPDATE OR IGNORE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
+                rusqlite::params![new_key, mk],
+            );
+            let _ = conn.execute(
+                "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
+                rusqlite::params![new_key, mk],
+            );
+        }
     }
     build_row_detail_at(p, &new_key)
 }

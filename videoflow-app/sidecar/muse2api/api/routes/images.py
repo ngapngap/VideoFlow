@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import mimetypes
 import time
+from collections.abc import Callable
 from dataclasses import replace
 
 from fastapi import APIRouter, Depends, Request
@@ -28,12 +30,12 @@ MAX_REFERENCE_IMAGES = 4
 _CUTOUT_HINT = "Isolated subject on a plain, uncluttered studio background."
 
 
-def _image_item(r: MediaResult, fmt: str, svc: Services, base: str) -> dict:
+async def _image_item(r: MediaResult, fmt: str, svc: Services, base: str) -> dict:
     item: dict = {"revised_prompt": r.revised_prompt}
     if fmt == "b64_json":
         item["b64_json"] = base64.b64encode(r.data).decode()
     else:
-        name = svc.media.save(r.data, r.mime, prefix="img")
+        name = await asyncio.to_thread(svc.media.save, r.data, r.mime, prefix="img")
         item["url"] = f"{base}/v1/media/{name}"
     return item
 
@@ -69,7 +71,7 @@ def _submit(body: ImageGenerationRequest, refs: list[InputImage], request: Reque
     base = public_base(request)
 
     async def runner(progress) -> dict:
-        return await _run(body, refs, base, svc)
+        return await _run(body, refs, base, svc, on_progress=progress)
 
     meta = {"model": spec.id, "prompt": body.prompt, "size": body.size, "n": body.n,
             "references": len(refs)}
@@ -78,20 +80,32 @@ def _submit(body: ImageGenerationRequest, refs: list[InputImage], request: Reque
     return _task_view(task)
 
 
-async def _run(body: ImageGenerationRequest, refs: list[InputImage], base: str,
-               svc: Services) -> dict:
+async def _run(
+    body: ImageGenerationRequest,
+    refs: list[InputImage],
+    base: str,
+    svc: Services,
+    on_progress: Callable[[int], None] | None = None,
+) -> dict:
     spec = resolve_model(body.model, "image")
     transparent = body.background == "transparent"
     prompt = f"{body.prompt.rstrip('. ')}. {_CUTOUT_HINT}" if transparent else body.prompt
-    req = ImageRequest(prompt=prompt, model=spec.id, size=body.size, n=body.n,
-                       reference_images=refs, timeout=svc.settings.image_timeout)
+    req = ImageRequest(
+        prompt=prompt,
+        model=spec.id,
+        size=body.size,
+        n=body.n,
+        reference_images=refs,
+        timeout=svc.settings.image_timeout,
+        on_progress=on_progress,
+    )
     results = await svc.gateway.generate_image(req)
     if transparent:
         # After the gateway call, so the account is not held during matting.
         results = [replace(r, data=await svc.matting.remove(r.data), mime="image/png")
                    for r in results]
     return {"created": int(time.time()),
-            "data": [_image_item(r, body.response_format, svc, base) for r in results]}
+            "data": [await _image_item(r, body.response_format, svc, base) for r in results]}
 
 
 @router.post("/v1/images/generations")

@@ -528,7 +528,7 @@ class BrowserDriver(MuseDriver):
                 with contextlib.suppress(Exception):
                     await self._chromium.stop()
                 self._chromium = None
-            if self.port != self.settings.cdp_port:
+            if self.account is not None or self.port != self.settings.cdp_port:
                 release_cdp_port(self.port)
 
     async def health(self) -> dict[str, Any]:
@@ -660,8 +660,10 @@ class BrowserDriver(MuseDriver):
         for attempt in (1, 2):
             if not self._browser or self._browser.closed:
                 if self._chromium is None and self._browser is None:
-                    await self.startup()
-                else:
+                    async with self._recovery_lock:
+                        if self._chromium is None and self._browser is None:
+                            await self.startup()
+                if not self._browser or self._browser.closed:
                     await self._recover_browser()
             assert self._browser and self._chromium
             target_id: str | None = None
@@ -1358,7 +1360,7 @@ class BrowserDriver(MuseDriver):
                     text_done_at = time.monotonic()
                 elif time.monotonic() - text_done_at >= grace:
                     if kind == "video" and not asked_to_attach:
-                        await self._wait_video_mount(tab, timeout=6.0)
+                        await self._wait_video_mount(tab, timeout=6.0, existing_urls=existing_urls)
                         st = await self._state(tab)
                         new_atts = st.get("attachments", [])[base_atts:]
                         fresh = [
