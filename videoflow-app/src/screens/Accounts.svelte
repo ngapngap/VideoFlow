@@ -1,14 +1,16 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { api, formatError, type MuseAccount, type MuseStatusView } from "../lib/api";
+  import { api, type MuseAccount, type MuseQuotaSnapshot, type MuseStatusView } from "../lib/api";
   import AccountCard from "../lib/AccountCard.svelte";
   import Icons from "../lib/Icons.svelte";
-  import { running, showToast } from "../lib/store";
+  import { formatApiError, running, showToast } from "../lib/store";
 
   let accounts: MuseAccount[] = [];
   let loading = false;
   let statusView: MuseStatusView | null = null;
   let startingEngine = false;
+  let stoppingEngine = false;
+  let downloadingExt = false;
 
   // Form Thêm tài khoản
   let newLabel = "";
@@ -25,62 +27,90 @@
   let addErr = "";
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let loadSeq = 0;
+  let destroyed = false;
+  let polling = false;
 
   async function loadData() {
+    const seq = ++loadSeq;
     loading = true;
     try {
-      statusView = await api.muse_sidecar_status();
-      if (statusView.sidecar.running) {
+      const nextStatus = await api.muse_sidecar_status();
+      if (destroyed || seq !== loadSeq) return;
+      statusView = nextStatus;
+      if (nextStatus.sidecar.running) {
         const res = await api.muse_list_accounts();
+        if (destroyed || seq !== loadSeq) return;
         accounts = res.data ?? [];
       } else {
         accounts = [];
       }
     } catch {
+      if (destroyed || seq !== loadSeq) return;
       accounts = [];
     } finally {
-      loading = false;
+      if (!destroyed && seq === loadSeq) {
+        loading = false;
+      }
+    }
+  }
+
+  async function pollAccounts() {
+    if (destroyed || polling || loading) return;
+    polling = true;
+    try {
+      const st = await api.muse_sidecar_status();
+      if (destroyed) return;
+      statusView = st;
+      if (st.sidecar.running) {
+        const res = await api.muse_list_accounts();
+        if (destroyed) return;
+        accounts = res.data ?? [];
+      } else {
+        accounts = [];
+      }
+    } catch {
+      // bỏ qua lỗi tạm thời khi poll nền
+    } finally {
+      polling = false;
     }
   }
 
   onMount(() => {
     loadData();
-    refreshTimer = setInterval(() => {
-      // Tự động cập nhật danh sách (hữu ích khi người dùng đăng nhập trên trình duyệt headed)
-      if (statusView?.sidecar.running) {
-        api.muse_list_accounts().then((res) => {
-          accounts = res.data ?? [];
-        }).catch(() => {});
-      }
-    }, 5000);
+    refreshTimer = setInterval(pollAccounts, 5000);
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (refreshTimer) clearInterval(refreshTimer);
   });
 
   async function startEngine() {
-    if (startingEngine || $running) return;
+    if (startingEngine || stoppingEngine || $running) return;
     startingEngine = true;
     try {
       await api.muse_start_sidecar();
       showToast("success", "Đã khởi động engine VideoFlow Muse.");
       await loadData();
     } catch (e) {
-      showToast("error", `Không thể khởi động engine: ${formatError(e)}`);
+      showToast("error", `Không thể khởi động engine: ${formatApiError(e)}`);
     } finally {
       startingEngine = false;
     }
   }
 
   async function stopEngine() {
-    if ($running) return;
+    if (stoppingEngine || startingEngine || $running) return;
+    stoppingEngine = true;
     try {
       await api.muse_stop_sidecar();
       showToast("info", "Đã dừng engine VideoFlow Muse.");
       await loadData();
     } catch (e) {
-      showToast("error", `Không thể dừng engine: ${formatError(e)}`);
+      showToast("error", `Không thể dừng engine: ${formatApiError(e)}`);
+    } finally {
+      stoppingEngine = false;
     }
   }
 
@@ -106,16 +136,17 @@
 
       newLabel = "";
       newProxy = "";
+      allowDuplicate = false;
       showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
 
       // 4. Mở trình duyệt có giao diện để đăng nhập ngay
       await api.muse_open_login(acc.id);
-      await loadData();
     } catch (e) {
-      addErr = formatError(e);
+      addErr = formatApiError(e);
       showToast("error", `Lỗi thêm tài khoản: ${addErr}`);
     } finally {
       loginBusy = false;
+      await loadData();
     }
   }
 
@@ -152,12 +183,13 @@
       cookieSess = "";
       cookieDevice = "";
       cookieVml = "";
+      allowDuplicate = false;
       dupPending = false;
       showManualCookies = false;
       showToast("success", `Đã thêm tài khoản "${label}".`);
       await loadData();
     } catch (e) {
-      const msg = formatError(e);
+      const msg = formatApiError(e);
       if (/trùng|belongs to account/i.test(msg) && !allowDuplicate) {
         dupPending = true;
         addErr = "Cookie trùng session với tài khoản đã có. Tick 'Cho phép trùng session' nếu bạn muốn tiếp tục.";
@@ -171,12 +203,33 @@
   }
 
   async function handleDownloadExtension() {
+    if (downloadingExt || $running) return;
+    downloadingExt = true;
     try {
       const path = await api.muse_download_extension();
       showToast("success", `Đã tải extension: ${path}`);
     } catch (e) {
-      showToast("error", `Lỗi tải extension: ${formatError(e)}`);
+      showToast("error", `Lỗi tải extension: ${formatApiError(e)}`);
+    } finally {
+      downloadingExt = false;
     }
+  }
+
+  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
+    if (!q) return false;
+    const pct =
+      q.weekly_used_pct != null
+        ? q.weekly_used_pct
+        : q.messages_used != null && q.messages_limit
+          ? Math.round((q.messages_used / q.messages_limit) * 100)
+          : null;
+    if (pct == null || pct < 100) return false;
+    if (q.extra_left && /[1-9]/.test(q.extra_left)) return false;
+    if (q.resets_at) {
+      const parsed = Date.parse(q.resets_at.trim());
+      if (!Number.isNaN(parsed) && parsed <= Date.now()) return false;
+    }
+    return true;
   }
 
   function museAccStateKey(a: MuseAccount): string {
@@ -190,6 +243,7 @@
     if (a.status === "cooling" && a.cooldown_until > now) {
       return isQuota ? "quota" : "cooling";
     }
+    if (isQuotaExhausted(a.meta?.quota)) return "quota";
     return "active";
   }
 
@@ -236,7 +290,7 @@
           Sidecar Engine: {statusView?.sidecar.running ? "Đang hoạt động" : "Đã dừng"}
         </span>
         {#if statusView?.sidecar.running}
-          <span class="engine-sub">Port {statusView.sidecar.cfg_port || 18610} · Profile riêng từng tài khoản</span>
+          <span class="engine-sub">Port {statusView.sidecar.port ?? statusView.sidecar.cfg_port ?? 18610} · Profile riêng từng tài khoản</span>
         {:else}
           <span class="engine-sub">Khởi động engine để kiểm tra hạn mức và đăng nhập tài khoản</span>
         {/if}
@@ -248,18 +302,18 @@
         <button
           type="button"
           class="btn-secondary"
-          disabled={$running}
+          disabled={stoppingEngine || startingEngine || $running}
           on:click={stopEngine}
           title="Dừng tiến trình sidecar engine"
         >
           <Icons name="stop" size={14} />
-          <span>Dừng engine</span>
+          <span>{stoppingEngine ? "Đang dừng..." : "Dừng engine"}</span>
         </button>
       {:else}
         <button
           type="button"
           class="btn-primary"
-          disabled={startingEngine || $running}
+          disabled={startingEngine || stoppingEngine || $running}
           on:click={startEngine}
           title="Khởi động tiến trình sidecar engine"
         >
@@ -338,12 +392,12 @@
       <button
         type="button"
         class="btn-ghost download-ext-btn"
-        disabled={$running}
+        disabled={downloadingExt || $running}
         on:click={handleDownloadExtension}
         title="Tải extension xuất cookie cho Edge/Chrome"
       >
         <Icons name="link" size={14} />
-        <span>Tải extension import</span>
+        <span>{downloadingExt ? "Đang tải..." : "Tải extension import"}</span>
       </button>
     </div>
 

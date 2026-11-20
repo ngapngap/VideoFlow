@@ -42,6 +42,14 @@
 
   let dirty = false;
   let saveMsg = "";
+  let saveMsgTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearSaveMsgTimer() {
+    if (saveMsgTimer) {
+      clearTimeout(saveMsgTimer);
+      saveMsgTimer = null;
+    }
+  }
 
   // Trạng thái kiểm tra kết nối & danh sách model riêng biệt cho từng tab
   let testingImage = false;
@@ -94,7 +102,7 @@
   }
 
   async function museStart() {
-    if (museSidecarBusy) return;
+    if (museSidecarBusy || $running) return;
     museSidecarBusy = true;
     museErr = "";
     try {
@@ -111,7 +119,7 @@
 
   /** Dừng rồi khởi động lại engine để áp dụng Cài đặt mới (port/chromium/headless). */
   async function museRestart() {
-    if (museSidecarBusy) return;
+    if (museSidecarBusy || $running) return;
     museSidecarBusy = true;
     museErr = "";
     try {
@@ -137,7 +145,7 @@
   }
 
   async function museStop() {
-    if (museSidecarBusy) return;
+    if (museSidecarBusy || $running) return;
     museSidecarBusy = true;
     try {
       await api.muse_stop_sidecar();
@@ -151,14 +159,14 @@
   }
 
   /** Các trường cấu hình engine đã đổi so với lúc spawn (dùng cho banner cảnh báo). */
-  function museChangedFields(): string[] {
-    const st = museStatus?.sidecar;
-    if (!st?.running || !s) return [];
+  function museChangedFields(status: MuseStatusView | null, cfg: Settings | null): string[] {
+    const st = status?.sidecar;
+    if (!st?.running || !cfg) return [];
     const out: string[] = [];
-    if (st.cfg_port != null && Number(s.muse_sidecar_port) !== st.cfg_port) {
-      out.push(`Port ${st.cfg_port} → ${s.muse_sidecar_port}`);
+    if (st.cfg_port != null && Number(cfg.muse_sidecar_port) !== st.cfg_port) {
+      out.push(`Port ${st.cfg_port} → ${cfg.muse_sidecar_port}`);
     }
-    const curChrome = (s.muse_chromium_path || "").trim();
+    const curChrome = (cfg.muse_chromium_path || "").trim();
     const spawnedChrome = (st.cfg_chromium || "").trim();
     // Chuẩn hoá để so sánh: bỏ tiền tố verbatim `\\?\`, quy `/` → `\`, bỏ hoa/thường.
     // Gõ đúng đường dẫn đang dùng (chỉ khác dấu) thì KHÔNG báo "đã đổi".
@@ -168,15 +176,17 @@
         .replace(/\//g, "\\")
         .replace(/\\+$/, "")
         .toLowerCase();
-    const effective = norm(curChrome || museStatus?.chromium_path || "");
-    if (effective !== norm(spawnedChrome || museStatus?.chromium_path || "")) {
+    const effective = norm(curChrome || status?.chromium_path || "");
+    if (effective !== norm(spawnedChrome || status?.chromium_path || "")) {
       out.push(`Edge/Chrome → ${curChrome || "tự dò"}`);
     }
-    if (st.cfg_headless != null && Boolean(s.muse_headless) !== st.cfg_headless) {
-      out.push(s.muse_headless ? "bật headless" : "tắt headless");
+    if (st.cfg_headless != null && Boolean(cfg.muse_headless) !== st.cfg_headless) {
+      out.push(cfg.muse_headless ? "bật headless" : "tắt headless");
     }
     return out;
   }
+
+  $: museChanged = museChangedFields(museStatus, s);
 
   // Khi mở tab Video lần đầu: nạp status sidecar (chưa spawn — chỉ đọc trạng thái)
   let museLoadedOnce = false;
@@ -254,6 +264,7 @@
   }
 
   onDestroy(() => {
+    clearSaveMsgTimer();
     hideAllKeyVisibility();
     if (!dirty) settingsDirty.set(false);
   });
@@ -352,8 +363,8 @@
     pendingClearVideoKey = false;
 
     endpointStatus.set({
-      imageConfigured: hasImageKey,
-      videoConfigured: hasVideoKey,
+      imageConfigured: cloned.image_source === "internal" || hasImageKey,
+      videoConfigured: cloned.video_source === "internal" || hasVideoKey,
     });
     confirmStartEnabled.set(Boolean(cloned.confirm_start));
     maxAttemptsStore.set(Math.max(1, Number(cloned.max_attempts) || 3));
@@ -379,6 +390,7 @@
 
   function mark() {
     dirty = true;
+    clearSaveMsgTimer();
     saveMsg = "";
   }
 
@@ -476,7 +488,9 @@
       }
       saveMsg = "Đã lưu cài đặt thành công";
       showToast("success", "Đã lưu cấu hình hệ thống.");
-      setTimeout(() => {
+      clearSaveMsgTimer();
+      saveMsgTimer = setTimeout(() => {
+        saveMsgTimer = null;
         if (!dirty) saveMsg = "";
       }, 3000);
     } catch (e) {
@@ -488,6 +502,7 @@
 
   async function cancel() {
     if ($running) return;
+    clearSaveMsgTimer();
     await loadSettings();
     saveMsg = "";
     showToast("info", "Đã hoàn tác các thay đổi chưa lưu.");
@@ -865,8 +880,8 @@
         {#if s.image_source === "internal"}
           <div class="hint" style="margin-bottom:8px">
             Ảnh được tạo trực tiếp bằng model <code>muse-image</code> của muse.ai qua engine
-            VideoFlow Muse (chung engine với video). Cookie quản lý ở tab
-            <b>Endpoint video</b> → panel "VideoFlow Muse (nội bộ)"; engine tự khởi động khi chạy.
+            VideoFlow Muse (chung engine với video). Tài khoản &amp; cookie quản lý ở mục
+            <b>Tài khoản</b> trên thanh điều hướng; engine tự khởi động khi chạy.
           </div>
         {:else}
         <label class="label" for="cfg-img-base-url">Địa chỉ gốc (Base URL)</label>
@@ -1005,8 +1020,8 @@
             </span>
           {/if}
         </div>
-        {/if}
         <div class="hint">Kiểm tra trực tiếp Base URL và API key hiện có trên biểu mẫu.</div>
+        {/if}
 
       {:else if tab === "video"}
         <div class="label" id="video-source-label">Nguồn sinh video</div>
@@ -1168,7 +1183,7 @@
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy}
+                disabled={museSidecarBusy || $running}
                 on:click={museStart}
               >
                 <Icons name="play" size={14} />
@@ -1177,7 +1192,7 @@
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy || !museStatus?.sidecar.running}
+                disabled={museSidecarBusy || $running || !museStatus?.sidecar.running}
                 on:click={museStop}
               >
                 <Icons name="stop" size={14} />
@@ -1207,7 +1222,7 @@
               <Icons name="alert" size={14} />
               <span>
                 Engine đang chạy với cấu hình cũ:
-                {#each museChangedFields() as f, i (f)}
+                {#each (museChanged.length > 0 ? museChanged : ["cấu hình engine"]) as f, i (f)}
                   {i > 0 ? ", " : ""}<b>{f}</b>
                 {/each}.
                 Bấm <b>"Áp dụng &amp; khởi động lại"</b> để có hiệu lực.
@@ -1922,6 +1937,11 @@
     border-radius: 8px;
     padding: 7px 10px;
     margin-top: 4px;
+  }
+  .feedback-line.bad {
+    color: var(--c-danger);
+    background: var(--c-danger-bg);
+    border-color: #edb8b3;
   }
 
   .check {

@@ -416,14 +416,24 @@ export const api = {
   muse_open_view: (accountId: string) =>
     invoke<{ ok: boolean; message?: string }>("muse_open_view", { accountId }),
   muse_delete_account: (accountId: string) =>
-    invoke<{ ok: boolean }>("muse_delete_account", { accountId }),
+    invoke<{ deleted: string }>("muse_delete_account", { accountId }),
   muse_renew_account: (accountId: string) =>
-    invoke<{ account: MuseAccount }>("muse_renew_account", { accountId }),
+    invoke<{
+      ok: boolean;
+      error?: string;
+      meta?: Record<string, unknown>;
+      account?: MuseAccount;
+    }>("muse_renew_account", { accountId }),
+  muse_reset_account: (accountId: string) =>
+    invoke<{ account: MuseAccount }>("muse_reset_account", { accountId }),
   muse_account_quota: (accountId: string, refresh = false) =>
-    invoke<{ account_id: string; quota: MuseQuotaSnapshot }>("muse_account_quota", {
-      accountId,
-      refresh,
-    }),
+    invoke<{ account_id: string; quota: MuseQuotaSnapshot; cached?: boolean }>(
+      "muse_account_quota",
+      {
+        accountId,
+        refresh,
+      }
+    ),
   muse_download_extension: () => invoke<string>("muse_download_extension"),
   // ━━ Cập nhật ứng dụng ━━
   app_version: () => invoke<string>("app_version"),

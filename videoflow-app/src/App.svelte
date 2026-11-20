@@ -186,6 +186,7 @@
   // Modal Đổi dự án nhanh trên thanh tiêu đề (Phụ lục v1.3.1 Q4 - 420px)
   let switcherOpen = false;
   let switcherLoading = false;
+  let switchingProject = false;
   let switcherRecents: RecentProject[] = [];
 
   // Hộp xác nhận khi thư mục mới rỗng, thiếu thành phần hoặc lỗi prompts.csv (6.7b)
@@ -208,10 +209,11 @@
     }
   }
 
-  async function switchRecentProject(path: string) {
-    if ($running) return;
+  async function switchRecentProject(r: RecentProject) {
+    if ($running || switchingProject || r.is_current) return;
+    switchingProject = true;
     try {
-      const info = await api.load_project(path);
+      const info = await api.load_project(r.path);
       resetProjectRunState();
       project.set(info);
       rowChangedTick.update((n) => n + 1);
@@ -219,6 +221,8 @@
       showToast("success", `Đã mở dự án "${info.name}" (${info.row_count} dòng).`);
     } catch (e) {
       showToast("error", formatApiError(e));
+    } finally {
+      switchingProject = false;
     }
   }
 
@@ -302,8 +306,10 @@
     try {
       const view = await api.get_settings();
       endpointStatus.set({
-        imageConfigured: Boolean(view.has_image_key),
-        videoConfigured: Boolean(view.has_video_key),
+        imageConfigured:
+          view.settings?.image_source === "internal" || Boolean(view.has_image_key),
+        videoConfigured:
+          view.settings?.video_source === "internal" || Boolean(view.has_video_key),
       });
       confirmStartEnabled.set(view.settings?.confirm_start ?? true);
       maxAttemptsStore.set(Math.max(1, Number(view.settings?.max_attempts) || 3));
@@ -344,18 +350,31 @@
 
   async function checkForUpdates(silent = true) {
     if (updateChecking || updateInstalling) return;
+    if (!silent && updateInfo?.available && updateDismissed) {
+      updateDismissed = false;
+      return;
+    }
     updateChecking = true;
     updateError = "";
     try {
       appVersion = await api.app_version();
       const info = await api.check_app_update();
       updateInfo = info;
-      // Lỗi mạng/không có endpoint: chỉ hiện khi người dùng chủ động bấm kiểm tra.
-      if (!info.available && info.notes) {
-        if (!silent) updateError = info.notes;
+      if (info.available) {
+        updateDismissed = false;
+      } else if (info.notes) {
+        if (!silent) {
+          updateError = info.notes;
+          showToast("error", info.notes);
+        }
+      } else if (!silent) {
+        showToast("success", `Bạn đang dùng phiên bản mới nhất (v${info.current_version}).`);
       }
     } catch (e) {
-      if (!silent) updateError = formatApiError(e);
+      if (!silent) {
+        updateError = formatApiError(e);
+        showToast("error", `Kiểm tra cập nhật thất bại: ${updateError}`);
+      }
     } finally {
       updateChecking = false;
     }
@@ -381,6 +400,8 @@
   let eventLockedAccount: { id: string; label?: string } | null = null;
   let unlistenVideoLocked: (() => void) | null = null;
   let accountsPollTimer: ReturnType<typeof setInterval> | null = null;
+  let accountsPolling = false;
+  let destroyed = false;
 
   function formatProxyIp(proxy: string | null | undefined): string {
     if (!proxy || !proxy.trim()) {
@@ -396,18 +417,37 @@
   }
 
   async function refreshMuseAccounts() {
+    if (destroyed || accountsPolling) return;
+    accountsPolling = true;
     try {
+      const st = await api.muse_sidecar_status();
+      if (destroyed) return;
+      if (!st.sidecar.running) {
+        museAccounts = [];
+        return;
+      }
       const res = await api.muse_list_accounts();
+      if (destroyed) return;
       museAccounts = res.data ?? [];
     } catch {
       // sidecar offline
+    } finally {
+      accountsPolling = false;
     }
   }
 
-  $: lockedAccount =
-    museAccounts.find((a) => a.status === "video_locked") ||
-    eventLockedAccount ||
-    null;
+  $: lockedAccount = (() => {
+    const fromPool = museAccounts.find((a) => a.enabled && a.status === "video_locked");
+    if (fromPool) return fromPool;
+    if (eventLockedAccount) {
+      const matched = museAccounts.find((a) => a.id === eventLockedAccount?.id);
+      if (matched && (!matched.enabled || matched.status !== "video_locked")) {
+        return null;
+      }
+      return eventLockedAccount;
+    }
+    return null;
+  })();
 
   $: activeExecutingAccount =
     museAccounts.find((a) => a.enabled && a.status === "active") ||
@@ -424,7 +464,7 @@
         await api.muse_update_account(accountId, false);
         showToast("info", "Đã tạm dừng tài khoản bị khóa video.");
       } catch (e) {
-        console.error("Lỗi tạm dừng tài khoản:", e);
+        showToast("error", `Lỗi tạm dừng tài khoản: ${formatApiError(e)}`);
       }
     }
     eventLockedAccount = null;
@@ -445,19 +485,28 @@
       refreshMuseAccounts();
     })
       .then((un) => {
-        unlistenVideoLocked = un;
+        if (destroyed) {
+          un();
+        } else {
+          unlistenVideoLocked = un;
+        }
       })
       .catch(() => {});
     listen<UpdateProgress>("update_progress", (ev) => {
       updatePercent = ev.payload.percent;
     })
       .then((un) => {
-        unlistenUpdateProgress = un;
+        if (destroyed) {
+          un();
+        } else {
+          unlistenUpdateProgress = un;
+        }
       })
       .catch(() => {});
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (unlistenUpdateProgress) unlistenUpdateProgress();
     if (accountsPollTimer) clearInterval(accountsPollTimer);
     if (unlistenVideoLocked) unlistenVideoLocked();
@@ -575,6 +624,18 @@
               <span>{stoppingHeader ? "Đang dừng..." : "STOP"}</span>
             </button>
           </div>
+        {/if}
+
+        {#if updateInfo?.available && updateDismissed}
+          <button
+            type="button"
+            class="update-pill-btn"
+            title={`Có bản cập nhật v${updateInfo.version} — nhấn để mở hộp cập nhật`}
+            on:click={() => (updateDismissed = false)}
+          >
+            <Icons name="refresh" size={12} />
+            <span>Bản mới v{updateInfo.version}</span>
+          </button>
         {/if}
 
         <button
@@ -783,7 +844,8 @@
             <button
               type="button"
               class="switcher-select"
-              on:click={() => switchRecentProject(r.path)}
+              disabled={r.is_current || switchingProject || $running}
+              on:click={() => switchRecentProject(r)}
             >
               <div class="switcher-item-top">
                 <span class="switcher-item-name">{r.name}</span>
@@ -1597,11 +1659,30 @@
     opacity: 0.6;
     cursor: default;
   }
+  .update-pill-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 30px;
+    padding: 0 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(14, 124, 134, 0.35);
+    background: var(--c-teal-light);
+    color: var(--c-teal-dark);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .update-pill-btn:hover {
+    background: var(--c-teal);
+    color: #fff;
+  }
   .update-banner {
     position: fixed;
-    right: 16px;
+    left: 16px;
     bottom: 40px;
-    z-index: 900;
+    z-index: 80;
     width: min(560px, calc(100vw - 32px));
     display: flex;
     gap: 12px;
@@ -1699,7 +1780,7 @@
     justify-content: space-between;
     gap: 12px;
     font-size: 13px;
-    z-index: 50;
+    z-index: 35;
     box-shadow: 0 1px 3px rgba(155, 28, 28, 0.08);
   }
   .video-lock-left {

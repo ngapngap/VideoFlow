@@ -2335,8 +2335,26 @@ pub async fn muse_renew_account(
             "/admin/accounts/{}/renew",
             muse_sanitize_id(&account_id)?
         );
-        // renew_session có thể poll VM wake tối đa 20s + timeout HTTP 15s → dùng 45s.
-        crate::muse_sidecar::admin_send_timeout(port, &key, "POST", &path, None, 45)
+        // renew_session có thể poll VM wake + proxy chậm → dùng 90s.
+        crate::muse_sidecar::admin_send_timeout(port, &key, "POST", &path, None, 90)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn muse_reset_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let cfg = state.settings_cache.read().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (port, key) = muse_session_or_err(&cfg)?;
+        let path = format!(
+            "/admin/accounts/{}/reset",
+            muse_sanitize_id(&account_id)?
+        );
+        crate::muse_sidecar::admin_send(port, &key, "POST", &path, None)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2357,8 +2375,8 @@ pub async fn muse_account_quota(
         let id = muse_sanitize_id(&account_id)?;
         let flag = if refresh { "?refresh=1" } else { "" };
         let path = format!("/admin/accounts/{id}/quota{flag}");
-        // Đọc quota bằng browser (cold-start Edge riêng theo account + mở muse.ai) mất 15-45s → dùng 75s.
-        crate::muse_sidecar::admin_get_timeout(port, &key, &path, 75)
+        // Đọc quota bằng browser (cold-start Edge riêng theo account + mở muse.ai qua proxy) → dùng 90s.
+        crate::muse_sidecar::admin_get_timeout(port, &key, &path, 90)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?

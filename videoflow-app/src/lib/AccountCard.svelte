@@ -1,8 +1,9 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { api, formatError, type MuseAccount, type MuseQuotaSnapshot } from "./api";
+  import { api, type MuseAccount, type MuseQuotaSnapshot } from "./api";
   import Icons from "./Icons.svelte";
-  import { showToast } from "./store";
+  import Modal from "./Modal.svelte";
+  import { formatApiError, showToast } from "./store";
 
   export let account: MuseAccount;
   export let running: boolean = false;
@@ -21,9 +22,33 @@
   let proxyValue = account.proxy || "";
   let proxyDirty = false;
   let proxySaving = false;
+  let deleteConfirmOpen = false;
 
   $: if (account.proxy !== undefined && !proxyDirty) {
     proxyValue = account.proxy || "";
+  }
+
+  function hasPositiveExtra(extra: string | null | undefined): boolean {
+    if (!extra || !extra.trim()) return false;
+    return /[1-9]/.test(extra);
+  }
+
+  function isResetDatePassed(resetsAt: string | null | undefined): boolean {
+    if (!resetsAt || !resetsAt.trim()) return false;
+    const raw = resetsAt.trim();
+    const parsed = Date.parse(raw);
+    if (!Number.isNaN(parsed)) {
+      return parsed <= Date.now();
+    }
+    return false;
+  }
+
+  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
+    const usedPct = museQuotaPct(q);
+    if (usedPct == null || usedPct < 100) return false;
+    if (hasPositiveExtra(q?.extra_left)) return false;
+    if (isResetDatePassed(q?.resets_at)) return false;
+    return true;
   }
 
   function museAccState(a: MuseAccount): { key: string; label: string; cls: string } {
@@ -38,6 +63,9 @@
       return isQuota
         ? { key: "quota", label: "Hết hạn mức", cls: "warn" }
         : { key: "cooling", label: "Tạm chờ", cls: "info" };
+    }
+    if (isQuotaExhausted(a.meta?.quota)) {
+      return { key: "quota", label: "Hết hạn mức", cls: "warn" };
     }
     return { key: "active", label: "Hoạt động", cls: "ok" };
   }
@@ -81,14 +109,19 @@
     return { txt: `Còn ${Math.round(days)} ngày`, cls: "info" };
   }
 
-  async function handleToggle() {
-    if (actionBusy || running) return;
+  async function handleToggle(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    if (actionBusy || running) {
+      input.checked = account.enabled;
+      return;
+    }
     actionBusy = true;
     try {
       await api.muse_update_account(account.id, !account.enabled);
       dispatch("updated", { id: account.id });
-    } catch (e) {
-      showToast("error", `Lỗi cập nhật: ${formatError(e)}`);
+    } catch (err) {
+      input.checked = account.enabled;
+      showToast("error", `Lỗi cập nhật: ${formatApiError(err)}`);
     } finally {
       actionBusy = false;
     }
@@ -103,7 +136,7 @@
       showToast("success", "Đã lưu proxy riêng cho tài khoản.");
       dispatch("updated", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi lưu proxy: ${formatError(e)}`);
+      showToast("error", `Lỗi lưu proxy: ${formatApiError(e)}`);
     } finally {
       proxySaving = false;
     }
@@ -114,11 +147,16 @@
     quotaBusy = true;
     quotaErr = "";
     try {
-      await api.muse_account_quota(account.id, true);
-      showToast("success", "Đã làm mới hạn mức.");
+      const res = await api.muse_account_quota(account.id, true);
+      if (res?.quota?.error || res?.quota?.found === false) {
+        quotaErr = res?.quota?.error || "Không đọc được hạn mức từ trang Settings → Usage của muse.ai.";
+        showToast("warn", `Không đọc được hạn mức: ${quotaErr}`);
+      } else {
+        showToast("success", "Đã làm mới hạn mức.");
+      }
       dispatch("refresh", { id: account.id });
     } catch (e) {
-      quotaErr = formatError(e);
+      quotaErr = formatApiError(e);
       showToast("error", `Lỗi đọc hạn mức: ${quotaErr}`);
     } finally {
       quotaBusy = false;
@@ -129,11 +167,29 @@
     if (actionBusy || running) return;
     actionBusy = true;
     try {
-      await api.muse_renew_account(account.id);
-      showToast("success", "Đã gia hạn phiên thành công.");
+      const res = await api.muse_renew_account(account.id);
+      if (res?.ok === false) {
+        showToast("error", `Gia hạn phiên thất bại: ${res.error || "Không rõ nguyên nhân"}`);
+      } else {
+        showToast("success", "Đã gia hạn phiên thành công.");
+      }
       dispatch("updated", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi gia hạn: ${formatError(e)}`);
+      showToast("error", `Lỗi gia hạn: ${formatApiError(e)}`);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function handleReset() {
+    if (actionBusy || running) return;
+    actionBusy = true;
+    try {
+      await api.muse_reset_account(account.id);
+      showToast("success", "Đã đặt lại trạng thái tài khoản về hoạt động.");
+      dispatch("updated", { id: account.id });
+    } catch (e) {
+      showToast("error", `Lỗi đặt lại tài khoản: ${formatApiError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -147,7 +203,7 @@
       showToast("info", res.message || "Đang mở trình duyệt đăng nhập...");
       dispatch("openLogin", { id: account.id });
     } catch (e) {
-      showToast("error", `Không thể mở trình duyệt: ${formatError(e)}`);
+      showToast("error", `Không thể mở trình duyệt: ${formatApiError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -161,22 +217,27 @@
       showToast("info", res.message || "Đang mở trình duyệt xem hội thoại...");
       dispatch("openView", { id: account.id });
     } catch (e) {
-      showToast("error", `Không thể mở xem web: ${formatError(e)}`);
+      showToast("error", `Không thể mở xem web: ${formatApiError(e)}`);
     } finally {
       actionBusy = false;
     }
   }
 
-  async function handleDelete() {
+  function requestDelete() {
     if (actionBusy || running) return;
-    if (!window.confirm(`Xóa tài khoản "${account.label || account.id}" khỏi danh sách?`)) return;
+    deleteConfirmOpen = true;
+  }
+
+  async function confirmDelete() {
+    if (actionBusy || running) return;
     actionBusy = true;
     try {
       await api.muse_delete_account(account.id);
+      deleteConfirmOpen = false;
       showToast("success", "Đã xóa tài khoản.");
       dispatch("deleted", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi xóa tài khoản: ${formatError(e)}`);
+      showToast("error", `Lỗi xóa tài khoản: ${formatApiError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -211,7 +272,7 @@
   </div>
 
   <!-- Quota section -->
-  {#if q && (q.found || pct != null || q.plan)}
+  {#if q && (q.found || pct != null || q.plan || q.error)}
     <div class="acc-quota">
       <div class="qrail">
         <b class={museQuotaBarClass(pct)} style="width:{pct != null ? Math.min(100, Math.max(0, pct)) : 0}%"></b>
@@ -336,11 +397,24 @@
       <span>Gia hạn</span>
     </button>
 
+    {#if account.status === "video_locked" || account.status === "cooling" || account.status === "invalid"}
+      <button
+        type="button"
+        class="btn-action"
+        disabled={actionBusy || running}
+        on:click={handleReset}
+        title="Đặt lại trạng thái khóa/tạm chờ về hoạt động để thử lại"
+      >
+        <Icons name="redo" size={14} />
+        <span>Đặt lại</span>
+      </button>
+    {/if}
+
     <button
       type="button"
       class="btn-action danger"
       disabled={actionBusy || running}
-      on:click={handleDelete}
+      on:click={requestDelete}
       title="Xóa tài khoản khỏi danh sách"
     >
       <Icons name="trash" size={14} />
@@ -348,6 +422,37 @@
     </button>
   </div>
 </article>
+
+<Modal
+  open={deleteConfirmOpen}
+  title="Xác nhận xóa tài khoản"
+  width="400px"
+  disableClose={actionBusy}
+  on:close={() => (deleteConfirmOpen = false)}
+>
+  <p style="margin: 0; line-height: 1.5;">
+    Bạn có chắc muốn xóa tài khoản <b>{account.label || account.id}</b> khỏi danh sách không?
+    Hồ sơ trình duyệt và cookie lưu cục bộ của tài khoản này sẽ bị xóa khỏi pool.
+  </p>
+  <div slot="footer">
+    <button
+      type="button"
+      class="btn-secondary"
+      disabled={actionBusy}
+      on:click={() => (deleteConfirmOpen = false)}
+    >
+      Hủy
+    </button>
+    <button
+      type="button"
+      class="btn-danger"
+      disabled={actionBusy}
+      on:click={confirmDelete}
+    >
+      {actionBusy ? "Đang xóa..." : "Xóa tài khoản"}
+    </button>
+  </div>
+</Modal>
 
 <style>
   .acc-card {
