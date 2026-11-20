@@ -5,7 +5,6 @@
     project,
     running,
     rowChangedTick,
-    assetCacheBust,
     showToast,
     formatApiError,
   } from "../lib/store";
@@ -42,6 +41,7 @@
     "Đã tạo video",
     "Lỗi tạo image",
     "Lỗi tạo video",
+    "Lỗi tạm thời",
     "Bỏ qua",
   ];
 
@@ -114,6 +114,7 @@
   let mediaModalKind: "image" | "video" = "image";
   let mediaModalTitle = "";
   let mediaModalAbsPath = "";
+  let mediaModalCacheKey = Date.now();
 
   let mounted = false;
   let lastProjectPath: string | null = null;
@@ -167,12 +168,19 @@
       lastProjectPath = curPath;
       lastTick = curTick;
       ++runDetailSeq;
+      ++logsSeq;
       page = 1;
       selectedRun = null;
       runRows = [];
       detailLoading = false;
       detailChip = "Tất cả";
       detailPage = 1;
+      rerunConfirmOpen = false;
+      logsModalOpen = false;
+      logsLoading = false;
+      logs = [];
+      mediaModalOpen = false;
+      mediaModalAbsPath = "";
       if (curPath) {
         void load();
       } else {
@@ -216,6 +224,7 @@
       if (seq !== loadSeq) return;
       runs = res.runs ?? [];
       total = res.total ?? 0;
+      page = res.page ?? page;
       pageCount = Math.max(1, res.page_count || 1);
       if (res.stats_7d) {
         stats7d = res.stats_7d;
@@ -461,6 +470,7 @@
     mediaModalKind = kind;
     mediaModalTitle = `${kind === "video" ? "Video" : "Ảnh"} sản phẩm — ${rowKey} (${fileName})`;
     mediaModalAbsPath = abs;
+    mediaModalCacheKey = Date.now();
     mediaModalOpen = true;
   }
 
@@ -1051,12 +1061,12 @@
   <div class="history-media-stage">
     {#if mediaModalAbsPath}
       {#if mediaModalKind === "video"}
-        {#key `${mediaModalAbsPath}-${$assetCacheBust}`}
+        {#key `${mediaModalAbsPath}-${mediaModalCacheKey}`}
           <video
             class="history-video-player"
             controls
             preload="metadata"
-            src={toAssetUrl(mediaModalAbsPath, $assetCacheBust)}
+            src={toAssetUrl(mediaModalAbsPath, mediaModalCacheKey)}
           >
             <track kind="captions" />
           </video>
@@ -1064,7 +1074,7 @@
       {:else}
         <img
           class="history-image-preview"
-          src={toAssetUrl(mediaModalAbsPath, $assetCacheBust)}
+          src={toAssetUrl(mediaModalAbsPath, mediaModalCacheKey)}
           alt={mediaModalTitle}
         />
       {/if}

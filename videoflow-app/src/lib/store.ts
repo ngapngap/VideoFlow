@@ -24,7 +24,17 @@ export const endpointStatus = writable<{ imageConfigured: boolean; videoConfigur
 export const confirmStartEnabled = writable(true);
 export const maxAttemptsStore = writable<number>(3);
 export const assetCacheBust = writable<number>(Date.now());
+export const rowAssetRevs = writable<Record<string, number>>({});
 export const closeConfirmOpen = writable(false);
+
+export function bumpRowAssetRev(rowKey?: string | null): void {
+  const now = Date.now();
+  if (rowKey && rowKey.trim()) {
+    rowAssetRevs.update((m) => ({ ...m, [rowKey]: now }));
+  } else {
+    assetCacheBust.set(now);
+  }
+}
 
 export interface RowsUiState {
   page: number;
@@ -85,6 +95,7 @@ export function resetProjectRunState(): void {
   activeRows.set({});
   selectedRows.set(new Set());
   assetCacheBust.set(Date.now());
+  rowAssetRevs.set({});
   rowsUiState.update((st) => ({
     ...st,
     page: 1,
@@ -304,32 +315,34 @@ export async function initEvents(): Promise<void> {
 
   await safeListen<RunFinishedEventPayload>("run_finished", (p) => {
     running.set(false);
-    progressPercent.set(100);
+    if (p?.status === "hoan_tat") {
+      progressPercent.set(100);
+    }
     progressStep.set(null);
     activeRows.set({});
     lastRunFinished.set(p);
-    assetCacheBust.set(Date.now());
     rowChangedTick.update((n) => n + 1);
 
+    const runTag = p?.run_id ? ` #${p.run_id}` : "";
     if (p?.status === "gian_doan") {
       showToast(
         "error",
-        `Lượt #${p.run_id} bị gián đoạn: ${p.done_count} xong, ${p.error_count} lỗi.`
+        `Lượt${runTag} bị gián đoạn: ${p.done_count} xong, ${p.error_count} lỗi.`
       );
     } else if (p?.status === "da_dung") {
       showToast(
         "warn",
-        `Đã dừng an toàn lượt #${p.run_id}: ${p.done_count} xong, ${p.error_count} lỗi.`
+        `Đã dừng an toàn lượt${runTag}: ${p.done_count} xong, ${p.error_count} lỗi.`
       );
     } else if ((p?.error_count ?? 0) > 0) {
       showToast(
         "warn",
-        `Lượt #${p.run_id} kết thúc: ${p.done_count} dòng xong, ${p.error_count} dòng lỗi cần xem.`
+        `Lượt${runTag} kết thúc: ${p.done_count} dòng xong, ${p.error_count} dòng lỗi cần xem.`
       );
     } else {
       showToast(
         "success",
-        `Hoàn tất lượt #${p?.run_id ?? ""}: ${p?.done_count ?? 0} dòng thành công!`
+        `Hoàn tất lượt${runTag}: ${p?.done_count ?? 0} dòng thành công!`
       );
     }
   });
@@ -356,8 +369,16 @@ export async function initEvents(): Promise<void> {
     }
   });
 
-  await safeListen<any>("row_changed", () => {
-    assetCacheBust.set(Date.now());
+  await safeListen<any>("row_changed", (p) => {
+    const rk =
+      typeof p?.row_key === "string" && p.row_key.trim()
+        ? p.row_key
+        : typeof p === "string" && p.trim()
+          ? p
+          : "";
+    if (rk) {
+      bumpRowAssetRev(rk);
+    }
     rowChangedTick.update((n) => n + 1);
   });
 
@@ -377,9 +398,11 @@ export async function initEvents(): Promise<void> {
     const msg =
       typeof p === "string" && p.trim()
         ? p
-        : typeof p?.message === "string" && p.message.trim()
-          ? p.message
-          : "Đến chu kỳ chạy tự động nhưng đang có lượt chạy khác — đã bỏ qua chu kỳ này.";
+        : typeof p?.reason === "string" && p.reason.trim()
+          ? p.reason
+          : typeof p?.message === "string" && p.message.trim()
+            ? p.message
+            : "Đến chu kỳ chạy tự động nhưng đang có lượt chạy khác — đã bỏ qua chu kỳ này.";
     showToast("warn", msg, 6000);
   });
 

@@ -102,7 +102,10 @@
         const sc = rowsRes.value.status_counts ?? {};
         totalRows = sc["Tất cả"] ?? rowsRes.value.total ?? $project.row_count ?? 0;
         doneCount = sc["Đã tạo video"] ?? 0;
-        errorRows = (sc["Lỗi tạo image"] ?? 0) + (sc["Lỗi tạo video"] ?? 0);
+        errorRows =
+          (sc["Lỗi tạo image"] ?? 0) +
+          (sc["Lỗi tạo video"] ?? 0) +
+          (sc["Lỗi tạm thời"] ?? 0);
         skippedCount = sc["Bỏ qua"] ?? 0;
       } else {
         errMsg = formatApiError(rowsRes.reason);
@@ -222,19 +225,27 @@
   }
 
   async function confirmAndStart(): Promise<void> {
-    if (dontAskAgain && $confirmStartEnabled) {
-      try {
-        const view = await api.get_settings();
-        const updated = { ...view.settings, confirm_start: false };
-        await api.save_settings(updated);
-        confirmStartEnabled.set(false);
-      } catch {
-        // Không chặn luồng chạy nếu lưu tùy chọn phụ thất bại
+    if (starting || $running) return;
+    starting = true;
+    try {
+      if (dontAskAgain && $confirmStartEnabled) {
+        try {
+          const view = await api.get_settings();
+          const updated = { ...view.settings, confirm_start: false };
+          await api.save_settings(updated);
+          confirmStartEnabled.set(false);
+        } catch {
+          // Không chặn luồng chạy nếu lưu tùy chọn phụ thất bại
+        }
       }
+      confirmModalOpen = false;
+      dryRunModalOpen = false;
+      await api.start_run("tat_ca");
+    } catch (e) {
+      showToast("error", formatApiError(e));
+    } finally {
+      starting = false;
     }
-    confirmModalOpen = false;
-    dryRunModalOpen = false;
-    await executeStartRun();
   }
 
   async function executeStartRun(): Promise<void> {
@@ -573,7 +584,7 @@
         <div class="progress-head">
           <div class="progress-head-left">
             <span class="progress-title">
-              Lượt vừa kết thúc #{$lastRunFinished.run_id}
+              Lượt vừa kết thúc{$lastRunFinished.run_id ? ` #${$lastRunFinished.run_id}` : ""}
             </span>
             <span
               class="badge"

@@ -32,6 +32,7 @@ pub struct AppState {
     pub settings: SettingsStore,
     pub settings_cache: parking_lot::RwLock<Settings>,
     pub project: parking_lot::RwLock<Option<PathBuf>>,
+    pub last_probed_dir: parking_lot::RwLock<Option<PathBuf>>,
     pub running: AtomicBool,
     pub exit_requested: AtomicBool,
     pub active_run_id: AtomicI64,
@@ -47,6 +48,7 @@ impl Default for AppState {
             settings: store,
             settings_cache: parking_lot::RwLock::new(cache),
             project: parking_lot::RwLock::new(None),
+            last_probed_dir: parking_lot::RwLock::new(None),
             running: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
             active_run_id: AtomicI64::new(0),
@@ -333,7 +335,7 @@ pub fn remove_recent_project(path: String, state: State<'_, AppState>) -> AppRes
 }
 
 #[tauri::command]
-pub fn probe_folder(path: String) -> AppResult<project::ProbeResult> {
+pub fn probe_folder(path: String, state: State<'_, AppState>) -> AppResult<project::ProbeResult> {
     let p = PathBuf::from(path.trim());
     if p.as_os_str().is_empty() || !p.is_dir() {
         return Err(AppError::new(
@@ -341,6 +343,7 @@ pub fn probe_folder(path: String) -> AppResult<project::ProbeResult> {
             "Thư mục được chọn không tồn tại.",
         ));
     }
+    *state.last_probed_dir.write() = Some(project::normalize_project_path(&p));
     Ok(project::probe_project(&p))
 }
 
@@ -3165,8 +3168,33 @@ pub fn open_path_in_explorer(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let _ = reveal;
-    let proj = project_path(&state)?;
-    let target_canon = resolve_safe_project_target(&proj, &target_path)?;
+    let target_canon = match project_path(&state)
+        .and_then(|proj| resolve_safe_project_target(&proj, &target_path))
+    {
+        Ok(canon) => canon,
+        Err(orig_err) => {
+            // Cho phép mở đúng file `prompts.csv` trong thư mục vừa probe (Probe Modal)
+            // kể cả khi chưa mở dự án hoặc đang probe thư mục khác.
+            let probed_opt = state.last_probed_dir.read().clone();
+            if let Some(probed) = probed_opt {
+                if let Ok(canon) = resolve_safe_project_target(&probed, &target_path) {
+                    let is_prompts_csv = canon
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.eq_ignore_ascii_case("prompts.csv"));
+                    if is_prompts_csv && canon.is_file() {
+                        canon
+                    } else {
+                        return Err(orig_err);
+                    }
+                } else {
+                    return Err(orig_err);
+                }
+            } else {
+                return Err(orig_err);
+            }
+        }
+    };
     let clean_path = strip_verbatim_prefix(target_canon.to_string_lossy().into_owned())
         .replace('"', "");
 

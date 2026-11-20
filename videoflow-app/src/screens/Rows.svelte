@@ -15,6 +15,7 @@
     confirmStartEnabled,
     maxAttemptsStore,
     assetCacheBust,
+    rowAssetRevs,
     rowsUiState,
     showToast,
     formatApiError,
@@ -39,6 +40,7 @@
     { key: "Lỗi", label: "Tất cả lỗi" },
     { key: "Lỗi tạo image", label: "Lỗi tạo image" },
     { key: "Lỗi tạo video", label: "Lỗi tạo video" },
+    { key: "Lỗi tạm thời", label: "Lỗi tạm thời" },
     { key: "Bỏ qua", label: "Bỏ qua" },
   ];
 
@@ -201,10 +203,39 @@
   let videoPlayerEl: HTMLVideoElement | null = null;
   let copiedImagePrompt = false;
   let copiedVideoPrompt = false;
-  let copyFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  let copyImgFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  let copyVidFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function rowRev(
+    rowKey: string | null | undefined,
+    revs: Record<string, number>,
+    baseBust: number
+  ): number {
+    return (rowKey && revs[rowKey]) || baseBust;
+  }
+
+  function formatAspectRatio(w: number, h: number): string {
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return "";
+    let a = Math.round(w);
+    let b = Math.round(h);
+    while (b !== 0) {
+      const t = b;
+      b = a % b;
+      a = t;
+    }
+    const rw = Math.round(w) / a;
+    const rh = Math.round(h) / a;
+    if (rw <= 32 && rh <= 32) {
+      return `${rw}:${rh}`;
+    }
+    return `${(w / h).toFixed(2)}:1`;
+  }
 
   $: videoModalUrl = videoModalAbsPath
-    ? toAssetUrl(videoModalAbsPath, $assetCacheBust)
+    ? toAssetUrl(
+        videoModalAbsPath,
+        rowRev(videoModalDetail?.row.row_key, $rowAssetRevs, $assetCacheBust)
+      )
     : "";
 
   $: anyModalOpen =
@@ -246,7 +277,11 @@
 
   function chipCount(key: string, c: Record<string, number>): number {
     if (key === "Lỗi") {
-      return (c["Lỗi tạo image"] ?? 0) + (c["Lỗi tạo video"] ?? 0);
+      return (
+        (c["Lỗi tạo image"] ?? 0) +
+        (c["Lỗi tạo video"] ?? 0) +
+        (c["Lỗi tạm thời"] ?? 0)
+      );
     }
     return c[key] ?? 0;
   }
@@ -260,7 +295,8 @@
 
   onDestroy(() => {
     if (searchTimer) clearTimeout(searchTimer);
-    if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
+    if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
+    if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
     if (videoPlayerEl) {
       try {
         videoPlayerEl.pause();
@@ -380,9 +416,10 @@
   }
 
   async function refreshOpenDetailSilently(rowKey: string): Promise<void> {
+    const seq = ++detailReqSeq;
     try {
       const fresh = await api.get_row_detail(rowKey);
-      if (!detail || detail.row.row_key !== rowKey) return;
+      if (seq !== detailReqSeq || !detail || detail.row.row_key !== rowKey) return;
       const keepDirty = promptsDirty;
       detail = fresh;
       if (!keepDirty) {
@@ -633,15 +670,22 @@
 
   async function ensurePromptsSavedIfDirty(): Promise<boolean> {
     if (!detail || !promptsDirty) return true;
+    const oldKey = detail.row.row_key;
     savingPrompts = true;
     try {
       const updated = await api.save_row_prompts(
-        detail.row.row_key,
+        oldKey,
         draftPromptImage,
         draftPromptVideo
       );
       detail = updated;
       syncPromptsFromDetail(updated);
+      if (updated.row.row_key !== oldKey && selected.has(oldKey)) {
+        const next = new Set(selected);
+        next.delete(oldKey);
+        next.add(updated.row.row_key);
+        updateSelection(next);
+      }
       return true;
     } catch (e) {
       showToast("error", formatApiError(e));
@@ -653,15 +697,22 @@
 
   async function savePrompts(): Promise<void> {
     if (!detail || $running || !promptsDirty || savingPrompts) return;
+    const oldKey = detail.row.row_key;
     savingPrompts = true;
     try {
       const updated = await api.save_row_prompts(
-        detail.row.row_key,
+        oldKey,
         draftPromptImage,
         draftPromptVideo
       );
       detail = updated;
       syncPromptsFromDetail(updated);
+      if (updated.row.row_key !== oldKey && selected.has(oldKey)) {
+        const next = new Set(selected);
+        next.delete(oldKey);
+        next.add(updated.row.row_key);
+        updateSelection(next);
+      }
       showToast("success", "Đã lưu prompt");
       await load({ silent: true });
     } catch (e) {
@@ -1032,8 +1083,11 @@
   function openVideoModal(d: RowDetail | null | undefined): void {
     if (!d) return;
     videoModalDetail = d;
-    videoModalAbsPath = activeVideoVersion?.abs_path ?? d.video_abs_path ?? null;
-    videoModalFileName = activeVideoVersion?.file_name ?? d.row.video_file ?? "";
+    const sameDetail = detail?.row.row_key === d.row.row_key;
+    videoModalAbsPath =
+      (sameDetail ? activeVideoVersion?.abs_path : null) ?? d.video_abs_path ?? null;
+    videoModalFileName =
+      (sameDetail ? activeVideoVersion?.file_name : null) ?? d.row.video_file ?? "";
     videoModalTitle = d.row.image_name || d.row.row_key;
     videoModalPromptImage = d.prompt_image ?? "";
     videoModalPromptVideo = d.prompt_video ?? "";
@@ -1097,20 +1151,22 @@
       await navigator.clipboard.writeText(text);
       if (kind === "image") {
         copiedImagePrompt = true;
-        if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
-        copyFeedbackTimer = setTimeout(() => {
+        if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
+        copyImgFeedbackTimer = setTimeout(() => {
           copiedImagePrompt = false;
+          copyImgFeedbackTimer = null;
         }, 2000);
       } else {
         copiedVideoPrompt = true;
-        if (copyFeedbackTimer) clearTimeout(copyFeedbackTimer);
-        copyFeedbackTimer = setTimeout(() => {
+        if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
+        copyVidFeedbackTimer = setTimeout(() => {
           copiedVideoPrompt = false;
+          copyVidFeedbackTimer = null;
         }, 2000);
       }
       showToast("success", `Đã sao chép prompt ${kind === "image" ? "tạo ảnh" : "tạo video"}.`);
     } catch (e) {
-      showToast("error", `Không thể sao chép vào clipboard: ${String(e)}`);
+      showToast("error", `Không thể sao chép vào clipboard: ${formatApiError(e)}`);
     }
   }
 
@@ -1399,7 +1455,7 @@
                         <span class="ref-mini">
                           {#if !orphanRow}
                             <img
-                              src={projectFileUrl("input", r.image_name, $assetCacheBust)}
+                              src={projectFileUrl("input", r.image_name, rowRev(r.row_key, $rowAssetRevs, $assetCacheBust))}
                               alt=""
                               loading="lazy"
                               on:error={() => markThumbBroken(refThumbKey)}
@@ -1468,7 +1524,7 @@
                         {#if !brokenThumbs[genThumbKey]}
                           <img
                             class="thumb-img"
-                            src={projectFileUrl("image_out", r.image_file, $assetCacheBust)}
+                            src={projectFileUrl("image_out", r.image_file, rowRev(r.row_key, $rowAssetRevs, $assetCacheBust))}
                             alt={`Ảnh tạo ${r.image_file}`}
                             loading="lazy"
                             on:error={() => markThumbBroken(genThumbKey)}
@@ -1489,9 +1545,8 @@
                       <button
                         type="button"
                         class="video-pill"
-                        title={`Video đã tạo: ${r.video_file} (nhấn để mở xem, nhấn đúp mở modal lớn)`}
-                        on:click={() => requestOpenDetail(r.row_key, "video")}
-                        on:dblclick|stopPropagation={() => openVideoModalByKey(r.row_key)}
+                        title={`Xem video lớn: ${r.video_file}`}
+                        on:click={() => openVideoModalByKey(r.row_key)}
                       >
                         <Icons name="video" size={14} />
                         <span>MP4</span>
@@ -1621,22 +1676,17 @@
                           r.row_key,
                           r.video_file ? "video" : r.image_file ? "generated" : "ref"
                         )}
-                      on:dblclick={() => {
-                        if (r.video_file) {
-                          openVideoModalByKey(r.row_key);
-                        }
-                      }}
                     >
                       {#if r.image_file && !brokenThumbs[genThumbKey]}
                         <img
-                          src={projectFileUrl("image_out", r.image_file, $assetCacheBust)}
+                          src={projectFileUrl("image_out", r.image_file, rowRev(r.row_key, $rowAssetRevs, $assetCacheBust))}
                           alt={`Ảnh sản phẩm ${r.image_file}`}
                           loading="lazy"
                           on:error={() => markThumbBroken(genThumbKey)}
                         />
                       {:else if !orphanRow}
                         <img
-                          src={projectFileUrl("input", r.image_name, $assetCacheBust)}
+                          src={projectFileUrl("input", r.image_name, rowRev(r.row_key, $rowAssetRevs, $assetCacheBust))}
                           alt={`Ảnh gốc ${r.image_name}`}
                           loading="lazy"
                           on:error={() => markThumbBroken(refThumbKey)}
@@ -1653,9 +1703,8 @@
                       <button
                         type="button"
                         class="grid-vid-badge"
-                        title={`Phát video ${r.video_file} (nhấn đúp mở lớn)`}
-                        on:click={() => requestOpenDetail(r.row_key, "video")}
-                        on:dblclick|stopPropagation={() => openVideoModalByKey(r.row_key)}
+                        title={`Xem video lớn: ${r.video_file}`}
+                        on:click|stopPropagation={() => openVideoModalByKey(r.row_key)}
                       >
                         <Icons name="video" size={12} />
                         MP4
@@ -1673,7 +1722,7 @@
                         title={r.row_key}
                         on:click={() => requestOpenDetail(r.row_key)}
                       >
-                        {r.row_key}
+                        {r.image_name}
                       </button>
                       <span
                         class="attempts-cell"
@@ -1695,7 +1744,17 @@
                       {#if r.prompt_modified}
                         <span class="badge badge-sua-prompt mini-badge">Đã sửa</span>
                       {/if}
+                      {#if r.noi_canh}
+                        <span class="badge badge-noi-canh mini-badge" title="Nối cảnh liên tục từ frame cuối video trước (P2-1)">Nối cảnh</span>
+                      {/if}
                     </div>
+
+                    {#if r.last_error}
+                      <div class="err-inline" title={r.last_error}>
+                        <Icons name="alert" size={12} />
+                        <span class="grid-err-text">{r.last_error}</span>
+                      </div>
+                    {/if}
 
                     {#if orphanRow}
                       <div class="grid-orphan-row">
@@ -1966,7 +2025,7 @@
                 >
                   <img
                     class="stage-img"
-                    src={toAssetUrl(detail.ref_abs_path, $assetCacheBust)}
+                    src={toAssetUrl(detail.ref_abs_path, rowRev(detail.row.row_key, $rowAssetRevs, $assetCacheBust))}
                     alt={`Ảnh tham chiếu ${detail.row.image_name}`}
                   />
                 </button>
@@ -2011,7 +2070,7 @@
                 >
                   <img
                     class="stage-img"
-                    src={toAssetUrl(previewImageAbsPath, $assetCacheBust)}
+                    src={toAssetUrl(previewImageAbsPath, rowRev(detail.row.row_key, $rowAssetRevs, $assetCacheBust))}
                     alt={`Ảnh đã tạo ${previewImageName}`}
                   />
                 </button>
@@ -2057,12 +2116,13 @@
               {/if}
             {:else}
               {#if previewVideoAbsPath}
-                {#key `${previewVideoAbsPath}-${$assetCacheBust}`}
+                {@const drawerVidRev = rowRev(detail.row.row_key, $rowAssetRevs, $assetCacheBust)}
+                {#key `${previewVideoAbsPath}-${drawerVidRev}`}
                   <video
                     class="stage-video"
                     controls
                     preload="metadata"
-                    src={toAssetUrl(previewVideoAbsPath, $assetCacheBust)}
+                    src={toAssetUrl(previewVideoAbsPath, drawerVidRev)}
                     title="Nhấn đúp để phóng lớn video kèm prompt & metadata"
                     on:dblclick={() => openVideoModal(detail)}
                   >
@@ -2989,7 +3049,7 @@
             <dt class="meta-key">Độ phân giải</dt>
             <dd class="meta-val">
               {#if videoModalWidth && videoModalHeight}
-                {videoModalWidth}×{videoModalHeight} (9:16)
+                {videoModalWidth}×{videoModalHeight} ({formatAspectRatio(videoModalWidth, videoModalHeight)})
               {:else}
                 —
               {/if}
@@ -3715,7 +3775,7 @@
   .drawer-backdrop {
     position: fixed;
     top: var(--h-titlebar);
-    left: var(--w-sidebar);
+    left: var(--w-sidebar-current, var(--w-sidebar));
     right: 0;
     bottom: var(--h-statusbar);
     background: rgba(15, 23, 42, 0.34);
@@ -3727,7 +3787,7 @@
     right: 0;
     top: var(--h-titlebar);
     bottom: var(--h-statusbar);
-    width: min(var(--w-detail-drawer), calc(100vw - var(--w-sidebar)));
+    width: min(var(--w-detail-drawer), calc(100vw - var(--w-sidebar-current, var(--w-sidebar))));
     background: var(--c-card);
     border-left: 1px solid var(--c-border);
     z-index: 41;
@@ -4582,10 +4642,15 @@
     justify-content: center;
     gap: 10px;
     min-height: 260px;
-    color: var(--c-text-muted);
-    font-size: var(--fs-caption);
+    color: var(--c-muted);
+    font-size: var(--fs-hint);
     text-align: center;
     padding: 20px;
+  }
+  .grid-err-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .video-meta-pane {
     display: flex;
@@ -4622,7 +4687,7 @@
   .meta-key {
     font-size: 11px;
     font-weight: 600;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
   }

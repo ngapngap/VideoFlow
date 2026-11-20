@@ -513,7 +513,10 @@
   });
 </script>
 
-<div class="layout">
+<div
+  class="layout"
+  style="--w-sidebar-current: var({sidebarCollapsed ? '--w-sidebar-collapsed' : '--w-sidebar'});"
+>
   <aside class="sidebar" class:collapsed={sidebarCollapsed}>
     <div class="sidebar-top">
       <div class="logo" title={`VideoFlow Desktop v${appVersion}`}>
