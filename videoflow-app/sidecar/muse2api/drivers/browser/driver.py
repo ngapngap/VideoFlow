@@ -1050,12 +1050,48 @@ class BrowserDriver(MuseDriver):
                     return True
         return False
 
+    async def _maybe_retry_error_nav(
+        self,
+        tab: _Tab,
+        *,
+        href: Any,
+        target_url: str,
+        nav_retries: int,
+        max_nav_retries: int,
+        deadline: float,
+        retry_margin: float,
+        label: str,
+    ) -> tuple[bool, int]:
+        """Re-navigate via ``about:blank`` when a transient proxy stall leaves ``chrome-error://``."""
+        if (
+            isinstance(href, str)
+            and href.startswith("chrome-error://")
+            and nav_retries < max_nav_retries
+            and (deadline - time.monotonic()) > retry_margin
+        ):
+            nav_retries += 1
+            log.warning(
+                "%s landed on browser error page (%s); retrying (%d/%d)",
+                label,
+                href,
+                nav_retries,
+                max_nav_retries,
+            )
+            await asyncio.sleep(1.0)
+            await tab.session.send("Page.navigate", {"url": "about:blank"})
+            await tab.session.send("Page.navigate", {"url": target_url})
+            return True, nav_retries
+        return False, nav_retries
+
     async def _new_thread(self, tab: _Tab) -> None:
         self._forget(tab)
         if await self._soft_new_thread(tab):
             return
         await tab.session.send("Page.navigate", {"url": muse.NEW_THREAD_URL})
         deadline = time.monotonic() + self.settings.page_ready_timeout
+        nav_retries = 0
+        max_nav_retries = 2
+        retry_margin = min(5.0, self.settings.page_ready_timeout * 0.25)
         state: dict = {}
         while time.monotonic() < deadline:
             if getattr(tab.session, "closed", False) is True:
@@ -1080,6 +1116,18 @@ class BrowserDriver(MuseDriver):
                     "it needs a support ticket on muse.ai to reconnect")
             if state.get("ready"):
                 return
+            retried, nav_retries = await self._maybe_retry_error_nav(
+                tab,
+                href=state.get("href") or "",
+                target_url=muse.NEW_THREAD_URL,
+                nav_retries=nav_retries,
+                max_nav_retries=max_nav_retries,
+                deadline=deadline,
+                retry_margin=retry_margin,
+                label="muse.ai navigation",
+            )
+            if retried:
+                continue
         head = (state.get("head") or "").lower()
         if any(h in head for h in dom.LOGIN_HINTS):
             raise UpstreamAuthError("muse.ai redirected to login; cookies are no longer valid")
@@ -1226,10 +1274,29 @@ class BrowserDriver(MuseDriver):
         tab.warm = False
         await tab.session.send("Page.navigate", {"url": tab.thread_url})
         deadline = time.monotonic() + self.settings.page_ready_timeout
+        nav_retries = 0
+        max_nav_retries = 2
+        retry_margin = min(5.0, self.settings.page_ready_timeout * 0.25)
         while time.monotonic() < deadline:
+            if getattr(tab.session, "closed", False) is True:
+                raise CDPError("cdp connection closed")
             await asyncio.sleep(0.25)
             if await self._on_thread(tab):
                 return
+            try:
+                href = await self._href(tab)
+            except TimeoutError:
+                href = ""
+            _, nav_retries = await self._maybe_retry_error_nav(
+                tab,
+                href=href,
+                target_url=tab.thread_url,
+                nav_retries=nav_retries,
+                max_nav_retries=max_nav_retries,
+                deadline=deadline,
+                retry_margin=retry_margin,
+                label="saved conversation navigation",
+            )
         raise UpstreamTimeout("saved conversation did not become ready")
 
     async def _begin_chat(self, account: Account, req: ChatRequest):

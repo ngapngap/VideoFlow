@@ -48,6 +48,7 @@ PAGE_STATE = f"""(() => {{
     hasInput: !!document.querySelector({q(INPUT)}),
     hasFileInput: !!document.querySelector('input[type=file]'),
     vmDisabled: /We disconnected .* to protect your information/i.test(body),
+    href: location.href,
     path: location.pathname,
     head: body.slice(0, 800),
   }};
@@ -79,23 +80,26 @@ CHAT_STATE = f"""(() => {{
   scrollers.forEach(e => {{ e.scrollTop = e.scrollHeight; }});
   const bubbles = [...document.querySelectorAll({q(AGENT_BUBBLE)})];
   const last = bubbles.length ? (bubbles[bubbles.length - 1].innerText || '').trim() : '';
-  const atts = bubbles.flatMap(b => [...b.querySelectorAll({q(ATTACHMENT)})]).map(a => {{
+  const atts = [...document.querySelectorAll({q(ATTACHMENT)})].map(a => {{
+    const tid = a.getAttribute('data-testid') || '';
     const v = a.querySelector('video'), i = a.querySelector('img');
-    const m = v || i;
+    const vidWrap = a.matches('[data-hatch-video-src]')
+      ? a
+      : (a.querySelector('[data-hatch-video-src]') || a.closest('[data-hatch-video-src]'));
+    const hatchVidSrc = vidWrap ? (vidWrap.getAttribute('data-hatch-video-src') || '') : '';
+    const isVideo = tid.includes('video') || !!v || !!hatchVidSrc;
+    const isImage = !isVideo && (tid.includes('image') || !!i);
     let src = '';
-    if (v) {{
-      src = v.currentSrc || v.src || v.getAttribute('src') || '';
-      if (!src) {{
-        const wrapper = v.closest('[data-hatch-video-src]') || a.closest('[data-hatch-video-src]');
-        if (wrapper) src = wrapper.getAttribute('data-hatch-video-src') || '';
-      }}
-    }} else if (i) {{
-      src = i.currentSrc || i.src || i.getAttribute('src') || '';
+    if (isVideo) {{
+      src = (v ? (v.currentSrc || v.src || v.getAttribute('src') || '') : '') || hatchVidSrc;
+    }} else if (isImage) {{
+      src = i ? (i.currentSrc || i.src || i.getAttribute('src') || '') : '';
     }}
+    const m = isVideo ? (v || i) : (i || v);
     return {{
-      tid: a.getAttribute('data-testid') || '',
-      kind: v ? 'video' : (i ? 'image' : 'unknown'),
-      src: src,
+      tid,
+      kind: isVideo ? 'video' : (isImage ? 'image' : 'unknown'),
+      src,
       w: m ? (m.videoWidth || m.naturalWidth || 0) : 0,
       h: m ? (m.videoHeight || m.naturalHeight || 0) : 0,
     }};
@@ -112,10 +116,13 @@ MEDIA_URLS_SNAPSHOT = f"""(() => {{
   const urls = new Set();
   document.querySelectorAll({q(ATTACHMENT)}).forEach(a => {{
     const v = a.querySelector('video'), i = a.querySelector('img');
+    const vw = a.matches('[data-hatch-video-src]')
+      ? a
+      : (a.querySelector('[data-hatch-video-src]') || a.closest('[data-hatch-video-src]'));
+    const hv = vw ? vw.getAttribute('data-hatch-video-src') : null;
     const src = (v ? (v.currentSrc || v.src || v.getAttribute('src')) : null)
-      || (i ? (i.currentSrc || i.src || i.getAttribute('src')) : null)
-      || a.getAttribute('data-hatch-video-src')
-      || (a.closest('[data-hatch-video-src]') ? a.closest('[data-hatch-video-src]').getAttribute('data-hatch-video-src') : null);
+      || hv
+      || (i ? (i.currentSrc || i.src || i.getAttribute('src')) : null);
     if (src) urls.add(src);
   }});
   document.querySelectorAll('video, img').forEach(el => {{
@@ -123,6 +130,10 @@ MEDIA_URLS_SNAPSHOT = f"""(() => {{
     if (s) urls.add(s);
     const h = el.getAttribute('data-hatch-video-src')
       || (el.closest('[data-hatch-video-src]') ? el.closest('[data-hatch-video-src]').getAttribute('data-hatch-video-src') : null);
+    if (h) urls.add(h);
+  }});
+  document.querySelectorAll('[data-hatch-video-src]').forEach(el => {{
+    const h = el.getAttribute('data-hatch-video-src');
     if (h) urls.add(h);
   }});
   return [...urls];

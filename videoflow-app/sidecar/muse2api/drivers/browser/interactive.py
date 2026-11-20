@@ -21,6 +21,7 @@ from ...accounts.model import Account, AccountStatus
 from ...accounts.pool import AccountPool
 from ...config import Settings
 from ...errors import NotFound
+from ...upstream.muse import missing_session_cookies
 from .cdp import CDPSession
 from .chromium import _kill_stale_browsers, find_chromium
 from .driver import AccountBusy, resolve_proxy
@@ -545,8 +546,12 @@ class InteractiveBrowserManager:
                                         if name not in expires:
                                             latest.cookie_expires.pop(name, None)
                                     latest.cookie_expires.update(expires)
-                                    latest.status = AccountStatus.ACTIVE
-                                    latest.last_error = None
+                                    if (
+                                        latest.status != AccountStatus.VIDEO_LOCKED
+                                        and not missing_session_cookies(latest.cookies)
+                                    ):
+                                        latest.status = AccountStatus.ACTIVE
+                                        latest.last_error = None
                                     if captured_auth_headers:
                                         latest.meta["auth_headers"] = {
                                             **latest.meta.get("auth_headers", {}),

@@ -268,9 +268,11 @@ async def update_account(account_id: str, body: AccountUpdate,
                     if name not in body.cookies
                 }
                 if acc.cookies and not (missing := missing_session_cookies(acc.cookies)):
-                    # Fresh complete cookies give an invalid account another chance.
-                    acc.status = AccountStatus.ACTIVE
-                    acc.last_error = None
+                    # Fresh complete cookies give an invalid/cooling account another chance,
+                    # but an explicit VIDEO_LOCKED lock must stay locked until /reset.
+                    if acc.status != AccountStatus.VIDEO_LOCKED:
+                        acc.status = AccountStatus.ACTIVE
+                        acc.last_error = None
                 elif not acc.cookies:
                     acc.status = AccountStatus.INVALID
                     acc.last_error = "cookies cleared"

@@ -18,6 +18,7 @@ from muse2api.app import create_app
 from muse2api.config import Settings
 from muse2api.core.media import _MAX_FETCH_BYTES
 from muse2api.drivers.base import ChatRequest
+from muse2api.drivers.browser import dom
 from muse2api.drivers.browser.cdp import CDPError
 from muse2api.drivers.browser.chromium import _build_wmi_filter
 from muse2api.drivers.browser.driver import (
@@ -29,7 +30,8 @@ from muse2api.drivers.browser.driver import (
     release_cdp_port,
 )
 from muse2api.drivers.browser.proxy_relay import LocalProxyRelay
-from muse2api.errors import NoAccountAvailable, NotFound
+from muse2api.errors import NoAccountAvailable, NotFound, UpstreamTimeout
+from muse2api.upstream import muse
 
 _VALID_COOKIES = {
     "hatch_sess": "sess_1",
@@ -600,3 +602,297 @@ async def test_create_and_import_partial_cookies_marks_invalid_and_excluded_from
         assert app.state.services.pool.get(acc1["id"]).status == AccountStatus.INVALID
         with pytest.raises(NoAccountAvailable):
             await app.state.services.pool.acquire()
+
+
+# ── Live audit finding: preserve VIDEO_LOCKED on login harvest & cookie PATCH ──
+
+
+async def test_video_locked_preserved_on_patch_and_unlocked_only_by_reset(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", api_key="k", admin_key="k", driver="mock")
+    app = create_app(settings)
+    headers = {"Authorization": "Bearer k"}
+
+    async with app.router.lifespan_context(app):
+        pool = app.state.services.pool
+        acc = Account(
+            id="acc_vl_patch",
+            label="VideoLockedPatch",
+            enabled=True,
+            status=AccountStatus.VIDEO_LOCKED,
+            last_error="video creation locked by upstream",
+            cookies=dict(_VALID_COOKIES),
+        )
+        await pool.upsert(acc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            r_patch = await client.patch(
+                f"/admin/accounts/{acc.id}",
+                headers=headers,
+                json={"cookies": {"hatch_sess": "fresh_sess", "hatch_native_auth_device": "fresh_dev"}},
+            )
+            assert r_patch.status_code == 200
+            patched = r_patch.json()["account"]
+            assert patched["status"] == "video_locked"
+            assert patched["last_error"] == "video creation locked by upstream"
+
+            stored = pool.get(acc.id)
+            assert stored is not None
+            assert stored.status == AccountStatus.VIDEO_LOCKED
+            assert stored.cookies["hatch_sess"] == "fresh_sess"
+            assert stored.cookies["hatch_native_auth_device"] == "fresh_dev"
+
+            r_reset = await client.post(f"/admin/accounts/{acc.id}/reset", headers=headers)
+            assert r_reset.status_code == 200
+            assert r_reset.json()["account"]["status"] == "active"
+            assert r_reset.json()["account"]["last_error"] is None
+
+
+async def test_interactive_login_harvest_preserves_video_locked_and_ignores_partial(
+    tmp_path: Path,
+) -> None:
+    from muse2api.accounts.pool import AccountPool
+    from muse2api.accounts.store import JsonAccountStore
+    from muse2api.drivers.browser.interactive import InteractiveBrowserManager, InteractiveSession
+
+    settings = Settings(data_dir=tmp_path / "data", api_key="k", admin_key="k", driver="mock")
+    settings.ensure_dirs()
+    pool = AccountPool(JsonAccountStore(settings.accounts_file), max_concurrency=1)
+    drv = MagicMock()
+    drv.is_account_busy.return_value = False
+    drv.release_account_driver = AsyncMock()
+    mgr = InteractiveBrowserManager(settings, pool, drv)
+
+    vl_acc = Account(
+        id="acc_vl_login",
+        label="VideoLockedLogin",
+        status=AccountStatus.VIDEO_LOCKED,
+        last_error="video locked morning",
+        cookies=dict(_VALID_COOKIES),
+    )
+    partial_acc = Account(
+        id="acc_partial_login",
+        label="PartialLogin",
+        status=AccountStatus.INVALID,
+        last_error="missing cookies",
+    )
+    await pool.upsert(vl_acc)
+    await pool.upsert(partial_acc)
+
+    async def _run_harvest_once(target: Account, harvested_cookies: list[dict]) -> None:
+        fake_proc = MagicMock()
+        fake_proc.returncode = None
+        fake_proc.pid = 42424
+
+        class _FakeCdp:
+            closed = False
+
+            def on(self, _ev: str, _cb) -> None:
+                return None
+
+            async def send(self, method: str, params=None):
+                if method == "Network.getCookies":
+                    fake_proc.returncode = 0
+                    return {"cookies": harvested_cookies}
+                return {}
+
+            async def evaluate(self, _expr: str):
+                return "{}"
+
+            async def close(self) -> None:
+                self.closed = True
+
+        fake_cdp = _FakeCdp()
+        sess = InteractiveSession(target.id, "login")
+        with (
+            patch("muse2api.drivers.browser.interactive.find_chromium", return_value="msedge.exe"),
+            patch("muse2api.drivers.browser.interactive._kill_stale_browsers"),
+            patch("muse2api.drivers.browser.interactive.asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)),
+            patch("muse2api.drivers.browser.interactive._resolve_page_ws_url", AsyncMock(return_value="ws://127.0.0.1/page/1")),
+            patch("muse2api.drivers.browser.interactive.CDPSession.connect", AsyncMock(return_value=fake_cdp)),
+            patch("muse2api.drivers.browser.interactive._terminate_proc", AsyncMock()),
+            patch("muse2api.drivers.browser.interactive.asyncio.sleep", AsyncMock()),
+        ):
+            await mgr._run_login_session(target, sess)
+
+    await _run_harvest_once(
+        vl_acc,
+        [
+            {"name": "hatch_sess", "value": "reharvested_sess", "expires": 1900000000},
+            {"name": "hatch_native_auth_device", "value": "dev_1", "expires": 1900000000},
+        ],
+    )
+    vl_after = pool.get(vl_acc.id)
+    assert vl_after is not None
+    assert vl_after.cookies["hatch_sess"] == "reharvested_sess"
+    assert vl_after.status == AccountStatus.VIDEO_LOCKED
+    assert vl_after.last_error == "video locked morning"
+
+    await _run_harvest_once(
+        partial_acc,
+        [{"name": "hatch_sess", "value": "only_sess_cookie", "expires": 1900000000}],
+    )
+    partial_after = pool.get(partial_acc.id)
+    assert partial_after is not None
+    assert partial_after.cookies["hatch_sess"] == "only_sess_cookie"
+    assert partial_after.status == AccountStatus.INVALID
+    assert partial_after.last_error == "missing cookies"
+
+
+# ── Live proxy test fix: recover when navigation lands on chrome-error:// ──
+
+
+async def test_new_thread_retries_on_chrome_error_page(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", driver="browser", page_ready_timeout=20.0)
+    driver = BrowserDriver(settings)
+    nav_urls: list[str] = []
+    states = [
+        {"ready": False, "href": "chrome-error://chromewebdata/", "vmDisabled": False},
+        {"ready": True, "href": muse.NEW_THREAD_URL, "vmDisabled": False},
+    ]
+
+    class _FakeSession:
+        closed = False
+
+        async def send(self, method: str, params=None):
+            if method == "Page.navigate" and isinstance(params, dict):
+                nav_urls.append(params.get("url", ""))
+            return {}
+
+        async def evaluate(self, expr: str, timeout: float = 5.0):
+            if "window.next" in expr:
+                return False
+            return states.pop(0) if states else {"ready": True, "href": muse.NEW_THREAD_URL}
+
+    tab = _Tab(account_id="acc_1", context_id="ctx_1", target_id="t_1", session=_FakeSession())
+    with patch("muse2api.drivers.browser.driver.asyncio.sleep", AsyncMock()):
+        await driver._new_thread(tab)
+
+    assert nav_urls == [muse.NEW_THREAD_URL, "about:blank", muse.NEW_THREAD_URL]
+
+
+async def test_new_thread_caps_chrome_error_retries_and_times_out(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", driver="browser", page_ready_timeout=20.0)
+    driver = BrowserDriver(settings)
+    nav_urls: list[str] = []
+    now = 100.0
+
+    async def fake_sleep(dt: float) -> None:
+        nonlocal now
+        now += dt
+
+    class _FakeSession:
+        closed = False
+
+        async def send(self, method: str, params=None):
+            if method == "Page.navigate" and isinstance(params, dict):
+                nav_urls.append(params.get("url", ""))
+            return {}
+
+        async def evaluate(self, expr: str, timeout: float = 5.0):
+            if "window.next" in expr:
+                return False
+            return {"ready": False, "href": "chrome-error://chromewebdata/", "vmDisabled": False}
+
+    tab = _Tab(account_id="acc_1", context_id="ctx_1", target_id="t_1", session=_FakeSession())
+    with (
+        patch("muse2api.drivers.browser.driver.time.monotonic", side_effect=lambda: now),
+        patch("muse2api.drivers.browser.driver.asyncio.sleep", side_effect=fake_sleep),
+        pytest.raises(UpstreamTimeout, match="muse.ai page did not become ready"),
+    ):
+        await driver._new_thread(tab)
+
+    assert nav_urls == [
+        muse.NEW_THREAD_URL,
+        "about:blank",
+        muse.NEW_THREAD_URL,
+        "about:blank",
+        muse.NEW_THREAD_URL,
+    ]
+
+
+def test_chat_state_queries_sibling_attachments_and_descendant_hatch_video_src() -> None:
+    chat_js = dom.CHAT_STATE
+    # Attachments live outside hatch-agent-bubble-bg in current muse.ai UI.
+    assert "bubbles.flatMap" not in chat_js
+    assert f"document.querySelectorAll({dom.q(dom.ATTACHMENT)})" in chat_js
+    assert "a.querySelector('[data-hatch-video-src]')" in chat_js
+    assert "tid.includes('video')" in chat_js
+    assert "hatchVidSrc" in chat_js
+    # Video path must never fall back to poster <img> src when hatchVidSrc is empty.
+    assert "src = (v ? (v.currentSrc || v.src || v.getAttribute('src') || '') : '') || hatchVidSrc" in chat_js
+
+    snap_js = dom.MEDIA_URLS_SNAPSHOT
+    assert "a.querySelector('[data-hatch-video-src]')" in snap_js
+    assert "document.querySelectorAll('[data-hatch-video-src]')" in snap_js
+
+
+async def test_wait_media_waits_through_video_skeleton_until_hatch_video_src_mounts(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", driver="browser", page_ready_timeout=20.0)
+    driver = BrowserDriver(settings)
+
+    states = [
+        {
+            "agentCount": 1,
+            "lastText": "Done - 720x1280, 5 seconds",
+            "generating": False,
+            "approval": False,
+            "attachments": [
+                {
+                    "tid": "hatch-chat-attachment-presentation-video",
+                    "kind": "video",
+                    "src": "",
+                    "w": 0,
+                    "h": 0,
+                }
+            ],
+            "tail": "",
+        },
+        {
+            "agentCount": 1,
+            "lastText": "Done - 720x1280, 5 seconds",
+            "generating": False,
+            "approval": False,
+            "attachments": [
+                {
+                    "tid": "hatch-chat-attachment-presentation-video",
+                    "kind": "video",
+                    "src": "blob:https://muse.ai/final-video-blob",
+                    "w": 720,
+                    "h": 1280,
+                }
+            ],
+            "tail": "",
+        },
+    ]
+    mount_calls: list[bool] = []
+    send_calls: list[str] = []
+
+    class _FakeSession:
+        closed = False
+
+        async def evaluate(self, expr: str, *, await_promise: bool = False, timeout: float = 5.0):
+            if await_promise:
+                mount_calls.append(True)
+                return {"mounted": True, "elapsed_ms": 200}
+            return states.pop(0) if states else {}
+
+    async def _fail_if_send(_tab: _Tab, prompt: str) -> None:
+        send_calls.append(prompt)
+
+    tab = _Tab(account_id="acc_1", context_id="ctx_1", target_id="t_1", session=_FakeSession())
+    base = {"attachments": [], "agentCount": 0, "existing_urls": set()}
+
+    with (
+        patch("muse2api.drivers.browser.driver.asyncio.sleep", AsyncMock()),
+        patch.object(driver, "_send", side_effect=_fail_if_send),
+    ):
+        att = await driver._wait_media(tab, base, "video", timeout=60.0, on_progress=None, cancel=None)
+
+    assert att["kind"] == "video"
+    assert att["src"] == "blob:https://muse.ai/final-video-blob"
+    assert mount_calls == [True]
+    assert send_calls == []

@@ -345,7 +345,13 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
                             "value": "new_sess_abc",
                             "domain": ".muse.ai",
                             "expires": 1900000000,
-                        }
+                        },
+                        {
+                            "name": "hatch_native_auth_device",
+                            "value": "dev_abc",
+                            "domain": ".muse.ai",
+                            "expires": 1900000000,
+                        },
                     ]
                 }
             return {}
