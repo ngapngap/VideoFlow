@@ -79,6 +79,7 @@ def _json_body(resp: httpx.Response) -> dict:
 async def renew_session(
     cookies: dict[str, str],
     *,
+    proxy: str | None = None,
     wake_vm: bool = True,
     timeout: float = 15.0,
     confirm_s: float | None = None,
@@ -104,8 +105,14 @@ async def renew_session(
     }
     jar = dict(cookies)
     expires: dict[str, int] = {}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-        resp = await client.get(SESSION_API, headers={"Cookie": cookie_header(jar)})
+    client_kwargs: dict[str, object] = {"timeout": timeout, "headers": headers}
+    if proxy and proxy.strip():
+        client_kwargs["proxy"] = proxy.strip()
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        try:
+            resp = await client.get(SESSION_API, headers={"Cookie": cookie_header(jar)})
+        except httpx.HTTPError as exc:
+            raise UpstreamError(f"session request failed: {exc}") from exc
         if resp.status_code in (401, 403):
             raise UpstreamAuthError(f"session rejected by upstream (HTTP {resp.status_code})")
         if resp.status_code >= 400:

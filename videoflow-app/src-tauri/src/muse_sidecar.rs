@@ -313,11 +313,9 @@ fn start_lock() -> &'static parking_lot::Mutex<()> {
 /// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
 pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let _spawn_guard = start_lock().lock();
-    {
-        let guard = sidecar_cell().read();
-        if guard.is_some() {
-            return status(cfg);
-        }
+    let already_running = sidecar_cell().read().is_some();
+    if already_running {
+        return status(cfg);
     }
 
     let exe = sidecar_exe_path()?;
@@ -690,5 +688,53 @@ mod tests {
 
         let err_view = open_view(65530, "vf_test", "acc_123").unwrap_err();
         assert_eq!(err_view.code, "MUSE_ADMIN_UNREACHABLE");
+    }
+
+    #[test]
+    fn start_khi_da_chay_khong_deadlock() {
+        // Giả lập sidecar_cell() đã có handle rồi gọi start(&cfg): trước bản sửa #28,
+        // start() giữ read lock rồi gọi status() (cần write lock) -> self-deadlock vĩnh viễn.
+        #[cfg(target_os = "windows")]
+        let child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dummy child");
+        #[cfg(not(target_os = "windows"))]
+        let child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn dummy child");
+
+        {
+            let mut guard = sidecar_cell().write();
+            *guard = Some(SidecarHandle {
+                child,
+                port: 65531,
+                api_key: "vf_test_deadlock".to_string(),
+                cfg_port: 65531,
+                cfg_chromium: String::new(),
+                cfg_headless: true,
+            });
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = start(&Settings::default());
+            let _ = tx.send(res);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        // Dọn dẹp handle nếu còn để không ảnh hưởng test khác.
+        if let Some(mut h) = sidecar_cell().write().take() {
+            let _ = h.child.kill();
+            let _ = h.child.wait();
+        }
+        assert!(
+            result.is_ok(),
+            "start() khi sidecar_cell() đang Some bị deadlock quá 5 giây!"
+        );
     }
 }

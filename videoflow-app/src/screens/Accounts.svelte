@@ -19,7 +19,9 @@
   let cookieVml = "";
   let allowDuplicate = false;
   let dupPending = false;
-  let addBusy = false;
+  let loginBusy = false;
+  let manualSaveBusy = false;
+  $: addBusy = loginBusy || manualSaveBusy;
   let addErr = "";
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -84,7 +86,7 @@
 
   async function handleAddAndLogin() {
     if (addBusy || $running) return;
-    addBusy = true;
+    loginBusy = true;
     addErr = "";
     try {
       // 1. Tự khởi động engine nếu chưa chạy
@@ -113,7 +115,7 @@
       addErr = e instanceof Error ? e.message : String(e);
       showToast("error", `Lỗi thêm tài khoản: ${addErr}`);
     } finally {
-      addBusy = false;
+      loginBusy = false;
     }
   }
 
@@ -126,7 +128,7 @@
       return;
     }
 
-    addBusy = true;
+    manualSaveBusy = true;
     addErr = "";
     const cookies: Record<string, string> = {
       hatch_sess: sess,
@@ -164,7 +166,7 @@
       }
       showToast("error", `Lỗi thêm cookie: ${addErr}`);
     } finally {
-      addBusy = false;
+      manualSaveBusy = false;
     }
   }
 
@@ -321,7 +323,7 @@
         title="Tạo tài khoản và mở trình duyệt có giao diện để bạn đăng nhập trực tiếp (tự bắt cookie & token)"
       >
         <Icons name="log-in" size={15} />
-        <span>{addBusy ? "Đang xử lý..." : "Thêm & Mở trình duyệt đăng nhập"}</span>
+        <span>{loginBusy ? "Đang xử lý..." : "Thêm & Mở trình duyệt đăng nhập"}</span>
       </button>
 
       <button
@@ -401,7 +403,7 @@
             on:click={handleAddManualCookies}
           >
             <Icons name="check" size={14} />
-            <span>Lưu tài khoản từ cookie</span>
+            <span>{manualSaveBusy ? "Đang lưu..." : "Lưu tài khoản từ cookie"}</span>
           </button>
 
           {#if dupPending}

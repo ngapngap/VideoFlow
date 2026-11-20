@@ -55,6 +55,7 @@ from ..base import (
 from . import dom
 from .cdp import CDPError, CDPSession
 from .chromium import ChromiumProcess, _kill_stale_browsers, find_chromium
+from .proxy_relay import mask_proxy
 
 log = logging.getLogger(__name__)
 
@@ -318,7 +319,7 @@ class BrowserDriver(MuseDriver):
         drv = self._account_drivers.get(account.id)
         if drv is not None and drv.proxy != expected_proxy:
             log.info("account %s proxy changed from '%s' to '%s'; replacing driver",
-                     account.id, drv.proxy, expected_proxy)
+                     account.id, mask_proxy(drv.proxy), mask_proxy(expected_proxy))
             asyncio.create_task(drv.shutdown())
             drv = None
         if drv is None:
@@ -396,7 +397,7 @@ class BrowserDriver(MuseDriver):
         ws_url = await self._chromium.start()
         self._browser = await CDPSession.connect(ws_url)
         log.info("browser driver ready (account=%s, profile=%s, proxy=%s, port=%d)",
-                 self.account_id or "default", self.profile_dir, self.proxy or "direct", self.port)
+                 self.account_id or "default", self.profile_dir, mask_proxy(self.proxy), self.port)
 
     async def shutdown(self) -> None:
         if self.account is None:
@@ -1330,7 +1331,8 @@ class BrowserDriver(MuseDriver):
         if self.account is None:
             drv = self.get_account_driver(account)
             return await drv.renew_session(account)
-        info = await muse.renew_session(account.cookies)
+        proxy = self.proxy or resolve_proxy(account, self.settings.browser_proxy) or None
+        info = await muse.renew_session(account.cookies, proxy=proxy)
         # Cookies live in the account's browser context, so writing the rotated ones
         # through any open tab updates every tab and keeps hot and warm pages alive.
         async with self._tab_cond:

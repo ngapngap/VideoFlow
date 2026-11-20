@@ -18,6 +18,7 @@ from ...accounts.pool import AccountPool
 from ...config import Settings
 from .cdp import CDPSession
 from .chromium import find_chromium
+from .proxy_relay import LocalProxyRelay, needs_proxy_relay
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class InteractiveBrowserManager:
 
         port = find_free_port()
         proxy = account.proxy or self.settings.browser_proxy or ""
+        proxy_relay: LocalProxyRelay | None = None
 
         target_url = "https://muse.ai/"
         args = [
@@ -110,7 +112,12 @@ class InteractiveBrowserManager:
             target_url,
         ]
         if proxy:
-            args.insert(1, f"--proxy-server={proxy}")
+            if needs_proxy_relay(proxy):
+                proxy_relay = LocalProxyRelay(proxy)
+                effective_proxy = await proxy_relay.start()
+            else:
+                effective_proxy = proxy
+            args.insert(1, f"--proxy-server={effective_proxy}")
 
         log.info("launching headed browser for account %s login on port %d", account_id, port)
         try:
@@ -119,6 +126,8 @@ class InteractiveBrowserManager:
             )
         except Exception as exc:
             log.error("failed to launch headed browser: %s", exc)
+            if proxy_relay is not None:
+                await proxy_relay.stop()
             return
 
         # Poll DevTools port
@@ -226,6 +235,9 @@ class InteractiveBrowserManager:
                 if sess.proc and sess.proc.returncode is None:
                     sess.proc.terminate()
                     await sess.proc.wait()
+            if proxy_relay is not None:
+                with contextlib.suppress(Exception):
+                    await proxy_relay.stop()
             if hasattr(self.driver, "_tabs"):
                 tabs = self.driver._tabs.get(account_id, [])
                 for t in tabs:
@@ -249,6 +261,7 @@ class InteractiveBrowserManager:
 
         port = find_free_port()
         proxy = account.proxy or self.settings.browser_proxy or ""
+        proxy_relay: LocalProxyRelay | None = None
 
         target_url = account.meta.get("hot_page", {}).get("url") or account.meta.get("last_thread_url") or "https://muse.ai/"
         args = [
@@ -264,7 +277,12 @@ class InteractiveBrowserManager:
             target_url,
         ]
         if proxy:
-            args.insert(1, f"--proxy-server={proxy}")
+            if needs_proxy_relay(proxy):
+                proxy_relay = LocalProxyRelay(proxy)
+                effective_proxy = await proxy_relay.start()
+            else:
+                effective_proxy = proxy
+            args.insert(1, f"--proxy-server={effective_proxy}")
 
         log.info("launching headed browser for account %s view on %s", account_id, target_url)
         try:
@@ -273,6 +291,8 @@ class InteractiveBrowserManager:
             )
         except Exception as exc:
             log.error("failed to launch headed browser for view: %s", exc)
+            if proxy_relay is not None:
+                await proxy_relay.stop()
             return
 
         ws_url = None
@@ -302,4 +322,7 @@ class InteractiveBrowserManager:
         try:
             await sess.proc.wait()
         finally:
+            if proxy_relay is not None:
+                with contextlib.suppress(Exception):
+                    await proxy_relay.stop()
             log.info("headed view session ended for account %s", account_id)

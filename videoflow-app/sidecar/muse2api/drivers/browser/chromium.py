@@ -13,6 +13,8 @@ from pathlib import Path
 
 import httpx
 
+from .proxy_relay import LocalProxyRelay, needs_proxy_relay
+
 log = logging.getLogger(__name__)
 
 _CANDIDATES = (
@@ -91,6 +93,7 @@ class ChromiumProcess:
         self.headless = headless
         self.proxy = proxy
         self.proc: asyncio.subprocess.Process | None = None
+        self._proxy_relay: LocalProxyRelay | None = None
 
     @property
     def http_base(self) -> str:
@@ -152,7 +155,14 @@ class ChromiumProcess:
             "about:blank",
         ]
         if self.proxy:
-            args.insert(1, f"--proxy-server={self.proxy}")
+            if needs_proxy_relay(self.proxy):
+                if self._proxy_relay is not None:
+                    await self._proxy_relay.stop()
+                self._proxy_relay = LocalProxyRelay(self.proxy)
+                effective_proxy = await self._proxy_relay.start()
+            else:
+                effective_proxy = self.proxy
+            args.insert(1, f"--proxy-server={effective_proxy}")
         if self.headless:
             args[1:1] = ["--headless=new", "--disable-gpu"]
         if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -189,3 +199,6 @@ class ChromiumProcess:
             except asyncio.TimeoutError:
                 self.proc.kill()
         self.proc = None
+        if self._proxy_relay is not None:
+            await self._proxy_relay.stop()
+            self._proxy_relay = None
