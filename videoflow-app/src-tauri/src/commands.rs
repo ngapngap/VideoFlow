@@ -1058,32 +1058,9 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         }
     }
 
-    // Đọc thông tin tài khoản đã sử dụng (UI-3)
-    let mut account_used = None;
-    let acc_file = crate::settings::app_data_dir()
-        .join(crate::muse_sidecar::MUSE_DATA_DIR)
-        .join("accounts.json");
-    if let Ok(content) = std::fs::read_to_string(&acc_file) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(arr) = val.as_array() {
-                if let Some(acc) = arr
-                    .iter()
-                    .find(|a| a.get("status").and_then(|s| s.as_str()) == Some("active"))
-                    .or_else(|| arr.first())
-                {
-                    let id = acc.get("id").and_then(|s| s.as_str()).unwrap_or("");
-                    let label = acc.get("label").and_then(|s| s.as_str()).unwrap_or("");
-                    if !label.is_empty() && !id.is_empty() && label != id {
-                        account_used = Some(format!("{label} ({id})"));
-                    } else if !label.is_empty() {
-                        account_used = Some(label.to_string());
-                    } else if !id.is_empty() {
-                        account_used = Some(id.to_string());
-                    }
-                }
-            }
-        }
-    }
+    // Chỉ trả `account_used` khi có dữ liệu tài khoản được ghi nhận thật cho job;
+    // không suy đoán bừa từ accounts.json (M5).
+    let account_used: Option<String> = None;
 
     let (video_duration, video_resolution) = if let Some(ref vpath) = video_abs_path {
         probe_mp4_metadata(Path::new(vpath))
@@ -1202,26 +1179,31 @@ pub fn set_current_file_version_at(
         ));
     }
 
+    prompts_csv::set_active_media_file(&csv_path, &actual_key, csv_kind, &file_name)?;
+
     let tx = conn
         .transaction()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     for rk in &related_keys {
         tx.execute(
-            "UPDATE file_refs SET is_current = 0, row_key = ?1
-             WHERE LOWER(row_key) = LOWER(?2) AND kind = ?3",
-            rusqlite::params![actual_key, rk, db_kind],
+            "UPDATE file_refs SET is_current = 0
+             WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2",
+            rusqlite::params![rk, db_kind],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     }
     tx.execute(
-        "UPDATE file_refs SET is_current = 1, row_key = ?1 WHERE id = ?2",
-        rusqlite::params![actual_key, target_ref_id],
+        "UPDATE file_refs SET is_current = 1 WHERE id = ?1",
+        rusqlite::params![target_ref_id],
     )
     .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    for rk in &related_keys {
+        crate::state_db::migrate_file_refs_row_key(&tx, rk, &actual_key, Some(db_kind))
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
     tx.commit()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-    prompts_csv::set_active_media_file(&csv_path, &actual_key, csv_kind, &file_name)?;
     build_row_detail_at(p, &actual_key)
 }
 
@@ -1246,11 +1228,17 @@ pub fn start_dry_run(state: State<'_, AppState>) -> AppResult<engine::DryRunResu
     engine::dry_run(&p, &cfg)
 }
 
-pub(crate) fn spawn_engine_internal(
-    app: AppHandle,
-    state: &AppState,
-    engine_cfg: EngineConfig,
-) -> AppResult<i64> {
+fn app_exiting_error() -> AppError {
+    AppError::new(
+        "APP_EXITING",
+        "Ứng dụng đang thoát hoặc khởi động lại — không thể bắt đầu lượt chạy mới.",
+    )
+}
+
+pub(crate) fn try_begin_run(state: &AppState) -> AppResult<()> {
+    if state.exit_requested.load(Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
     state
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1260,6 +1248,48 @@ pub(crate) fn spawn_engine_internal(
                 "Lượt chạy đang thực hiện - Stop hoặc chờ chạy xong (6.12).",
             )
         })?;
+    if state.exit_requested.load(Ordering::SeqCst) {
+        state.running.store(false, Ordering::SeqCst);
+        return Err(app_exiting_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn begin_app_update_restart(state: &AppState) -> AppResult<()> {
+    if state.exit_requested.swap(true, Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
+    if state.running.load(Ordering::SeqCst) {
+        state.exit_requested.store(false, Ordering::SeqCst);
+        return Err(AppError::new(
+            "RUN_IN_PROGRESS",
+            "Pipeline vừa bắt đầu chạy trong lúc tải bản cập nhật — hãy dừng (STOP) rồi khởi động lại app.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_app_update_restart_with<FStop, FRestart>(
+    state: &AppState,
+    stop_sidecar: FStop,
+    restart_app: FRestart,
+) -> AppResult<bool>
+where
+    FStop: FnOnce(),
+    FRestart: FnOnce(),
+{
+    begin_app_update_restart(state)?;
+    stop_sidecar();
+    restart_app();
+    Ok(true)
+}
+
+pub(crate) fn spawn_engine_internal(
+    app: AppHandle,
+    state: &AppState,
+    engine_cfg: EngineConfig,
+) -> AppResult<i64> {
+    try_begin_run(state)?;
 
     let p = match project_path(state) {
         Ok(p) => p,
@@ -1292,6 +1322,13 @@ pub(crate) fn spawn_engine_internal(
     let created_run_id = Arc::new(AtomicI64::new(0));
     let created_rid_bg = created_run_id.clone();
 
+    let mut thr_guard = state.engine_thread.lock();
+    if state.exit_requested.load(Ordering::SeqCst) {
+        *state.stop_flag.write() = None;
+        state.running.store(false, Ordering::SeqCst);
+        return Err(app_exiting_error());
+    }
+
     let app2 = app.clone();
     let handle = std::thread::spawn(move || {
         let start_inst = Instant::now();
@@ -1318,11 +1355,10 @@ pub(crate) fn spawn_engine_internal(
             )
         }));
 
-        // Dọn stop_flag & running = false TRƯỚC khi phát run_finished cho nhánh lỗi/panic
-        // để UI nhận sự kiện run_finished có thể khởi động lượt mới ngay mà không bị RUN_IN_PROGRESS.
-        let mut deferred_finish: Option<serde_json::Value> = None;
-
-        match result {
+        // Dọn stop_flag & running = false TRƯỚC khi phát run_finished cho mọi nhánh
+        // (hoàn tất, dừng, lỗi, panic) để UI nhận sự kiện run_finished có thể khởi động
+        // lượt mới ngay mà không bị RUN_IN_PROGRESS (H7).
+        let deferred_finish = match result {
             Ok(Ok(outcome)) => {
                 if notify_enabled {
                     if let Some(win) = app2.get_webview_window("main") {
@@ -1349,76 +1385,70 @@ pub(crate) fn spawn_engine_internal(
                         }),
                     );
                 }
+                crate::engine::build_run_finished_payload(&outcome)
             }
             Ok(Err(e)) => {
                 let rid = created_rid_bg.load(Ordering::SeqCst);
-                if rid > 0 {
-                    if let Ok(conn) = crate::state_db::open(&p) {
-                        let ts_now = chrono::Local::now().to_rfc3339();
-                        let _ = conn.execute(
-                            "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
-                            rusqlite::params![ts_now, rid],
-                        );
-                    }
-                }
+                let (done_cnt, err_cnt) = if rid > 0 {
+                    finalize_interrupted_run_in_db(&p, rid)
+                } else {
+                    (0, 0)
+                };
+                let safe_msg = crate::settings::redact_secrets(&e.message);
                 let _ = app2.emit(
                     "run_error",
                     serde_json::json!({
                         "run_id": (rid > 0).then_some(rid), "row_key": null, "step": null,
-                        "code": e.code, "message": e.message
+                        "code": e.code, "message": safe_msg
                     }),
                 );
-                deferred_finish = Some(serde_json::json!({
+                serde_json::json!({
                     "run_id": rid,
                     "status": "gian_doan",
-                    "done_count": 0,
-                    "error_count": 0,
+                    "done_count": done_cnt,
+                    "error_count": err_cnt,
                     "duration_ms": start_inst.elapsed().as_millis() as i64
-                }));
+                })
             }
             Err(panic_err) => {
                 let rid = created_rid_bg.load(Ordering::SeqCst);
-                if rid > 0 {
-                    if let Ok(conn) = crate::state_db::open(&p) {
-                        let ts_now = chrono::Local::now().to_rfc3339();
-                        let _ = conn.execute(
-                            "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
-                            rusqlite::params![ts_now, rid],
-                        );
-                    }
-                }
+                let (done_cnt, err_cnt) = if rid > 0 {
+                    finalize_interrupted_run_in_db(&p, rid)
+                } else {
+                    (0, 0)
+                };
                 let msg = panic_err
                     .downcast_ref::<String>()
                     .cloned()
                     .or_else(|| panic_err.downcast_ref::<&str>().map(|s| (*s).to_string()))
                     .unwrap_or_else(|| "Engine gặp lỗi nội bộ ngoài dự kiến".to_string());
+                let safe_msg = crate::settings::redact_secrets(&msg);
                 let _ = app2.emit(
                     "run_error",
                     serde_json::json!({
                         "run_id": (rid > 0).then_some(rid), "row_key": null, "step": null,
-                        "code": "ENGINE_PANIC", "message": msg
+                        "code": "ENGINE_PANIC", "message": safe_msg
                     }),
                 );
-                deferred_finish = Some(serde_json::json!({
+                serde_json::json!({
                     "run_id": rid,
                     "status": "gian_doan",
-                    "done_count": 0,
-                    "error_count": 0,
+                    "done_count": done_cnt,
+                    "error_count": err_cnt,
                     "duration_ms": start_inst.elapsed().as_millis() as i64
-                }));
+                })
             }
-        }
+        };
 
         let st = app2.state::<AppState>();
         *st.stop_flag.write() = None;
         st.active_run_id.store(0, Ordering::SeqCst);
         st.running.store(false, Ordering::SeqCst);
-        if let Some(payload) = deferred_finish {
-            let _ = app2.emit("run_finished", payload);
-        }
+        let _ = app2.emit("run_finished", deferred_finish);
     });
 
-    *state.engine_thread.lock() = Some(handle);
+    *thr_guard = Some(handle);
+    drop(thr_guard);
     let actual_run_id = rid_rx
         .recv_timeout(Duration::from_millis(400))
         .unwrap_or(0);
@@ -1637,49 +1667,47 @@ fn ensure_seed_run_id(conn: &rusqlite::Connection) -> AppResult<i64> {
 }
 
 pub fn reset_row_status_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
-    let conn =
+    let csv_path = p.join("prompts.csv");
+    let rows = prompts_csv::read_all(&csv_path)?;
+    let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let mut updated = conn
-        .execute(
+    let target_job_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1",
+            rusqlite::params![row_key],
+            |r| r.get(0),
+        )
+        .ok()
+        .or_else(|| {
+            let row = prompts_csv::find_row_by_key(&rows, row_key)?;
+            let latest_map = engine::load_latest_jobs_map(&conn);
+            let img_counts = engine::image_counts(&rows);
+            engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts).map(|j| j.id)
+        });
+
+    prompts_csv::update_row(&csv_path, row_key, |r| {
+        r.trang_thai = "Đang chờ".into();
+        r.ghi_chu_loi.clear();
+    })?;
+
+    if let Some(jid) = target_job_id {
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        tx.execute(
             "UPDATE jobs
              SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
                  image_prompt_hash = NULL, video_prompt_hash = NULL,
                  video_task_id = NULL, video_download_url = NULL,
                  attempts_count = 0, last_error = NULL
-             WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
-            rusqlite::params![row_key],
+             WHERE id = ?1",
+            rusqlite::params![jid],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    if updated == 0 {
-        if let Ok(rows) = prompts_csv::read_all(&p.join("prompts.csv")) {
-            if let Some(row) = prompts_csv::find_row_by_key(&rows, row_key) {
-                let latest_map = engine::load_latest_jobs_map(&conn);
-                let img_counts = engine::image_counts(&rows);
-                if let Some(linked) =
-                    engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts)
-                {
-                    updated = conn
-                        .execute(
-                            "UPDATE jobs
-                             SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
-                                 image_prompt_hash = NULL, video_prompt_hash = NULL,
-                                 video_task_id = NULL, video_download_url = NULL,
-                                 attempts_count = 0, last_error = NULL
-                             WHERE id = ?1",
-                            rusqlite::params![linked.id],
-                        )
-                        .unwrap_or(0);
-                }
-            }
-        }
+        tx.commit()
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     }
-    let _ = updated;
 
-    prompts_csv::update_row(&p.join("prompts.csv"), row_key, |r| {
-        r.trang_thai = "Đang chờ".into();
-        r.ghi_chu_loi.clear();
-    })?;
     build_row_detail_at(p, row_key)
 }
 
@@ -1704,38 +1732,60 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let vid_hash = engine::sha2hex(row.promt_tao_video.trim());
     let row_no = row.row_no as i64;
 
-    let conn =
+    let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let note = "Bị bỏ qua bởi người dùng";
-
-    let mut updated = conn
-        .execute(
-            "UPDATE jobs
-             SET status = 'bo_qua', last_error = ?1
-             WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?2) ORDER BY id DESC LIMIT 1)",
-            rusqlite::params![note, actual_key],
+    let direct_job_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1",
+            rusqlite::params![actual_key],
+            |r| r.get(0),
         )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    if updated == 0 {
+        .ok();
+    let linked_job_id: Option<i64> = if direct_job_id.is_none() {
         let latest_map = engine::load_latest_jobs_map(&conn);
         let img_counts = engine::image_counts(&rows);
-        if let Some(linked) = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts) {
-            updated = conn
+        engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts).map(|j| j.id)
+    } else {
+        None
+    };
+
+    prompts_csv::update_row(&csv_path, &actual_key, |r| {
+        r.trang_thai = "Đang chờ".into();
+        r.ghi_chu_loi = "Bị bỏ qua bởi người dùng (Bỏ qua dòng)".into();
+    })?;
+
+    let note = "Bị bỏ qua bởi người dùng";
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    let mut updated = if let Some(jid) = direct_job_id {
+        tx.execute(
+            "UPDATE jobs SET status = 'bo_qua', last_error = ?1 WHERE id = ?2",
+            rusqlite::params![note, jid],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?
+    } else {
+        0
+    };
+
+    if updated == 0 {
+        if let Some(linked_id) = linked_job_id {
+            updated = tx
                 .execute(
                     "UPDATE OR IGNORE jobs
                      SET status = 'bo_qua', last_error = ?1, row_key = ?2
                      WHERE id = ?3",
-                    rusqlite::params![note, actual_key, linked.id],
+                    rusqlite::params![note, actual_key, linked_id],
                 )
                 .unwrap_or(0);
             if updated == 0 {
-                updated = conn
+                updated = tx
                     .execute(
                         "UPDATE jobs
                          SET status = 'bo_qua', last_error = ?1
                          WHERE id = ?2",
-                        rusqlite::params![note, linked.id],
+                        rusqlite::params![note, linked_id],
                     )
                     .unwrap_or(0);
             }
@@ -1743,9 +1793,9 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     }
 
     if updated == 0 {
-        let seed_run_id = ensure_seed_run_id(&conn)?;
+        let seed_run_id = ensure_seed_run_id(&tx)?;
         let ts = chrono::Local::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status,
                               image_prompt_hash, video_prompt_hash, attempts_count, last_error, started_at, finished_at)
              VALUES (?1, ?2, ?3, 'bo_qua', 'chua_chay', 'chua_chay', ?4, ?5, 0, ?6, ?7, ?7)
@@ -1755,10 +1805,8 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         .map_err(|e| AppError::new("DB_FAIL", format!("Không lưu được trạng thái bỏ qua: {e}")))?;
     }
 
-    prompts_csv::update_row(&csv_path, &actual_key, |r| {
-        r.trang_thai = "Đang chờ".into();
-        r.ghi_chu_loi = "Bị bỏ qua bởi người dùng (Bỏ qua dòng)".into();
-    })?;
+    tx.commit()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     build_row_detail_at(p, &actual_key)
 }
@@ -1811,72 +1859,88 @@ pub fn remap_reference_image_at(
         &old_row.promt_tao_image,
         &old_row.promt_tao_video,
     );
+    let old_img_low = old_row.anh_tham_chieu.trim().to_lowercase();
+    let img_counts = engine::image_counts(&before_rows);
+    let same_image = img_counts.get(&old_img_low).copied().unwrap_or(0);
+
+    let mut conn =
+        crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let prev_job = engine::latest_job_for_csv_row(&conn, &old_row, &latest_map, &img_counts);
+
+    let mut migrate_keys: Vec<String> = vec![old_key.clone()];
+    let req_trimmed = row_key.trim();
+    if !req_trimmed.is_empty()
+        && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(req_trimmed))
+    {
+        migrate_keys.push(req_trimmed.to_string());
+    }
+    if let Some(ref pj) = prev_job {
+        if !pj.row_key.trim().is_empty()
+            && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&pj.row_key))
+        {
+            migrate_keys.push(pj.row_key.clone());
+        }
+    }
+    if same_image == 1
+        && !old_img_low.is_empty()
+        && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&old_img_low))
+    {
+        migrate_keys.push(old_img_low.clone());
+    }
 
     prompts_csv::remap_key(&csv_path, row_key, trimmed_new)?;
 
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
     if !old_key.eq_ignore_ascii_case(&new_key) {
-        let mut conn =
-            crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-        let tx = conn
-            .transaction()
+        let keep_existing_new_key = prev_job
+            .as_ref()
+            .is_some_and(|pj| pj.row_key.eq_ignore_ascii_case(&new_key));
+        if !keep_existing_new_key {
+            // Chỉ cập nhật từ các key của chính dòng cũ -> new_key (không xóa bản ghi của dòng anh em dùng chung ảnh mới).
+            // Dọn bản ghi cũ trùng đúng new_key nếu có để tránh đụng UNIQUE(run_id, row_key).
+            tx.execute(
+                "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
+                rusqlite::params![new_key],
+            )
             .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-        // Chỉ cập nhật từ old_key -> new_key (không xóa bản ghi của dòng anh em dùng chung ảnh mới).
-        // Dọn bản ghi cũ trùng đúng new_key nếu có để tránh đụng UNIQUE(run_id, row_key).
-        tx.execute(
-            "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+            tx.execute(
+                "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)
+                    OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
+                rusqlite::params![new_key],
+            )
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-        tx.execute(
-            "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)
-                OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+            tx.execute(
+                "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
+                rusqlite::params![new_key],
+            )
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        }
+    }
 
-        tx.execute(
-            "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-        tx.execute(
-            "UPDATE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
-            rusqlite::params![new_key, old_key, row_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
-
-        tx.execute(
-            "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
-            rusqlite::params![new_key, old_key, row_key],
-        )
-        .map_err(|e| {
+    for mk in &migrate_keys {
+        crate::state_db::migrate_jobs_row_key(&tx, mk, &new_key)
+            .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
+        crate::state_db::migrate_file_refs_row_key(&tx, mk, &new_key, None).map_err(|e| {
             AppError::new(
                 "DB_FAIL",
                 format!("Không đổi được row_key trong file_refs: {e}"),
             )
         })?;
-
         tx.execute(
-            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
-            rusqlite::params![new_key, old_key, row_key],
+            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) AND row_key != ?1",
+            rusqlite::params![new_key, mk],
         )
         .ok();
-
-        tx.commit()
-            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    } else if let Ok(conn) = crate::state_db::open(p) {
-        let _ = conn.execute(
-            "UPDATE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![new_key, old_key],
-        );
-        let _ = conn.execute(
-            "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-            rusqlite::params![new_key, old_key],
-        );
     }
+
+    tx.commit()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     build_row_detail_at(p, &new_key)
 }
@@ -1974,32 +2038,132 @@ pub async fn pick_image_in_input(
     copy_picked_image_into_input(&input_dir, &chosen).map(Some)
 }
 
+fn escape_sqlite_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 pub fn delete_row_at(p: &Path, row_key: &str) -> AppResult<bool> {
-    prompts_csv::delete_row(&p.join("prompts.csv"), row_key)?;
+    let csv_path = p.join("prompts.csv");
+    let rows = prompts_csv::read_all(&csv_path)?;
+    let row = prompts_csv::find_row_by_key(&rows, row_key)
+        .ok_or_else(|| AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'.")))?
+        .clone();
+    let actual_key = prompts_csv::row_key_of(
+        &row.anh_tham_chieu,
+        &row.promt_tao_image,
+        &row.promt_tao_video,
+    );
+    let img_counts = engine::image_counts(&rows);
+    let legacy_low = row.anh_tham_chieu.trim().to_lowercase();
+    let same_image = img_counts.get(&legacy_low).copied().unwrap_or(0);
 
     let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let prev_job = engine::latest_job_for_csv_row(&conn, &row, &latest_map, &img_counts);
+
+    let mut related_keys: Vec<String> = Vec::new();
+    let mut push_key = |k: &str| {
+        let trimmed = k.trim();
+        if !trimmed.is_empty() && !related_keys.iter().any(|x| x.eq_ignore_ascii_case(trimmed)) {
+            related_keys.push(trimmed.to_string());
+        }
+    };
+    push_key(&actual_key);
+    push_key(row_key);
+    if let Some(ref pj) = prev_job {
+        push_key(&pj.row_key);
+    }
+
+    for media_name in [row.anh_da_tao.trim(), row.video_da_tao.trim()] {
+        if !media_name.is_empty() {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT DISTINCT row_key FROM file_refs WHERE LOWER(file_name) = LOWER(?1)",
+            ) {
+                if let Ok(iter) = stmt.query_map(rusqlite::params![media_name], |r| r.get::<_, String>(0)) {
+                    for rk in iter.flatten() {
+                        push_key(&rk);
+                    }
+                }
+            }
+        }
+    }
+
+    if same_image == 1 && !legacy_low.is_empty() {
+        push_key(&legacy_low);
+        let prefix_like = format!("{}#%", escape_sqlite_like(&legacy_low));
+        for sql in [
+            "SELECT DISTINCT row_key FROM jobs WHERE LOWER(row_key) LIKE LOWER(?1) ESCAPE '\\'",
+            "SELECT DISTINCT row_key FROM file_refs WHERE LOWER(row_key) LIKE LOWER(?1) ESCAPE '\\'",
+        ] {
+            if let Ok(mut stmt) = conn.prepare(sql) {
+                if let Ok(iter) = stmt.query_map(rusqlite::params![prefix_like], |r| r.get::<_, String>(0)) {
+                    for rk in iter.flatten() {
+                        push_key(&rk);
+                    }
+                }
+            }
+        }
+    }
+
+    prompts_csv::delete_row(&csv_path, row_key)?;
+
     let tx = conn
         .transaction()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-    tx.execute(
-        "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-        rusqlite::params![row_key],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    let mut job_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1)")
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        for rk in &related_keys {
+            let iter = stmt
+                .query_map(rusqlite::params![rk], |r| r.get::<_, i64>(0))
+                .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+            for jid in iter {
+                let id = jid.map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+                if !job_ids.contains(&id) {
+                    job_ids.push(id);
+                }
+            }
+        }
+    }
 
-    tx.execute(
-        "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1) OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-        rusqlite::params![row_key],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    tx.execute(
-        "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
-        rusqlite::params![row_key],
-    )
-    .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    for jid in &job_ids {
+        tx.execute("DELETE FROM attempts WHERE job_id = ?1", rusqlite::params![jid])
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        tx.execute("DELETE FROM file_refs WHERE job_id = ?1", rusqlite::params![jid])
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
+    for rk in &related_keys {
+        tx.execute(
+            "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)",
+            rusqlite::params![rk],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
+    for jid in &job_ids {
+        tx.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![jid])
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
+    for rk in &related_keys {
+        tx.execute(
+            "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
+            rusqlite::params![rk],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    }
 
     tx.commit()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
@@ -2043,7 +2207,7 @@ pub fn save_row_prompts_at(
     }
 
     let new_key = prompts_csv::row_key_of(&image_name, trimmed_img, trimmed_vid);
-    let conn =
+    let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     let old_key = prompts_csv::row_key_of(
@@ -2060,49 +2224,52 @@ pub fn save_row_prompts_at(
     let latest_map = engine::load_latest_jobs_map(&conn);
     let prev_job = engine::latest_job_for_csv_row(&conn, old_row, &latest_map, &img_counts);
 
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
     // Di trú bản ghi job "chưa sinh sản phẩm" của CHÍNH dòng này sang khoá mới.
+    // Cập nhật prompt hashes trước, rồi dùng migrate_jobs_row_key để tránh đụng UNIQUE(run_id, row_key).
     // Chỉ khớp chính xác `old_key` (và fallback tên ảnh trần khi `same_image == 1`);
     // TUYỆT ĐỐI không dùng `LIKE image_low || '#%'` để tránh cướp/xóa dòng anh em dùng chung ảnh.
-    if same_image == 1 {
-        conn.execute(
+    let untouched_updated = if same_image == 1 {
+        tx.execute(
             "UPDATE jobs
-             SET row_key = ?1, image_prompt_hash = ?2, video_prompt_hash = ?3
-             WHERE (LOWER(row_key) = LOWER(?4) OR LOWER(row_key) = LOWER(?5))
+             SET image_prompt_hash = ?1, video_prompt_hash = ?2
+             WHERE (LOWER(row_key) = LOWER(?3) OR LOWER(row_key) = LOWER(?4))
                AND status IN ('dang_cho', 'bo_qua')
                AND attempts_count = 0
                AND image_status = 'chua_chay'
                AND video_status = 'chua_chay'",
             rusqlite::params![
-                new_key,
                 engine::sha2hex(trimmed_img),
                 engine::sha2hex(trimmed_vid),
                 old_key,
                 image_low
             ],
         )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?
     } else {
-        conn.execute(
+        tx.execute(
             "UPDATE jobs
-             SET row_key = ?1, image_prompt_hash = ?2, video_prompt_hash = ?3
-             WHERE LOWER(row_key) = LOWER(?4)
+             SET image_prompt_hash = ?1, video_prompt_hash = ?2
+             WHERE LOWER(row_key) = LOWER(?3)
                AND status IN ('dang_cho', 'bo_qua')
                AND attempts_count = 0
                AND image_status = 'chua_chay'
                AND video_status = 'chua_chay'",
             rusqlite::params![
-                new_key,
                 engine::sha2hex(trimmed_img),
                 engine::sha2hex(trimmed_vid),
                 old_key
             ],
         )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    }
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?
+    };
 
     // Với các bản ghi job đã từng chạy và file_refs của chính dòng này: cập nhật `row_key` sang `new_key`
-    // nhưng GIỮ NGUYÊN `image_prompt_hash` / `video_prompt_hash` lịch sử để cờ `prompt_modified`
-    // tiếp tục phát hiện chính xác prompt đã sửa.
+    // một cách an toàn khi va chạm UNIQUE, GIỮ NGUYÊN `image_prompt_hash` / `video_prompt_hash` lịch sử
+    // để cờ `prompt_modified` tiếp tục phát hiện chính xác prompt đã sửa.
     if !old_key.eq_ignore_ascii_case(&new_key) {
         let mut migrate_keys = vec![old_key.clone()];
         if let Some(ref pj) = prev_job {
@@ -2114,16 +2281,18 @@ pub fn save_row_prompts_at(
             migrate_keys.push(image_low.clone());
         }
         for mk in &migrate_keys {
-            let _ = conn.execute(
-                "UPDATE OR IGNORE jobs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-                rusqlite::params![new_key, mk],
-            );
-            let _ = conn.execute(
-                "UPDATE file_refs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2)",
-                rusqlite::params![new_key, mk],
-            );
+            crate::state_db::migrate_jobs_row_key(&tx, mk, &new_key)
+                .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+            crate::state_db::migrate_file_refs_row_key(&tx, mk, &new_key, None)
+                .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
         }
+    } else if same_image == 1 && untouched_updated > 0 && !image_low.is_empty() && !image_low.eq_ignore_ascii_case(&new_key) {
+        crate::state_db::migrate_jobs_row_key(&tx, &image_low, &new_key)
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     }
+
+    tx.commit()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     build_row_detail_at(p, &new_key)
 }
 
@@ -2189,24 +2358,56 @@ pub fn hide_to_tray(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn force_quit_app(
+const SHUTDOWN_ENGINE_WAIT_TIMEOUT: Duration = Duration::from_millis(2500);
+
+pub(crate) fn shutdown_app_state_with<FQuit>(
+    state: &AppState,
     stop_first: bool,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> AppResult<()> {
+    wait_timeout: Duration,
+    quit_sidecar: FQuit,
+) where
+    FQuit: FnOnce(),
+{
     state.exit_requested.store(true, Ordering::SeqCst);
     if stop_first {
         if let Some(flag) = state.stop_flag.read().clone() {
             flag.store(true, Ordering::SeqCst);
         }
     }
-    if let Ok(p) = project_path(&state) {
+    let handle_opt = state.engine_thread.lock().take();
+    if let Some(handle) = handle_opt {
+        let deadline = Instant::now() + wait_timeout;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+    if let Ok(p) = project_path(state) {
         if let Ok(conn) = crate::state_db::open(&p) {
             let _ = crate::state_db::recover_interrupted_runs(&conn);
         }
     }
-    crate::muse_sidecar::stop_for_quit();
+    quit_sidecar();
+}
+
+pub(crate) fn shutdown_app_state(state: &AppState, stop_first: bool) {
+    shutdown_app_state_with(
+        state,
+        stop_first,
+        SHUTDOWN_ENGINE_WAIT_TIMEOUT,
+        crate::muse_sidecar::stop_for_quit,
+    );
+}
+
+#[tauri::command]
+pub fn force_quit_app(
+    stop_first: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    shutdown_app_state(&state, stop_first);
     app.exit(0);
     Ok(())
 }
@@ -2296,16 +2497,54 @@ pub async fn muse_start_sidecar(state: State<'_, AppState>) -> AppResult<serde_j
         .map_err(|e| AppError::new("SERIALIZE_FAIL", format!("{e}")))
 }
 
+static PROXY_MUTATION_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn proxy_mutation_lock() -> &'static parking_lot::Mutex<()> {
+    PROXY_MUTATION_LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+fn finalize_interrupted_run_in_db(p: &Path, rid: i64) -> (i64, i64) {
+    let Ok(conn) = crate::state_db::open(p) else {
+        return (0, 0);
+    };
+    let ts_now = chrono::Local::now().to_rfc3339();
+    let _ = conn.execute(
+        "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
+        rusqlite::params![ts_now, rid],
+    );
+    let _ = conn.execute(
+        "UPDATE jobs
+         SET status = CASE WHEN status IN ('dang_cho', 'da_tao_image') THEN 'loi_tam_thoi' ELSE status END,
+             image_status = CASE WHEN image_status = 'dang_chay' THEN 'loi' ELSE image_status END,
+             video_status = CASE WHEN video_status = 'dang_chay' THEN 'loi' ELSE video_status END,
+             finished_at = COALESCE(finished_at, ?1)
+         WHERE run_id = ?2 AND (image_status = 'dang_chay' OR video_status = 'dang_chay')",
+        rusqlite::params![ts_now, rid],
+    );
+    conn.query_row(
+        "SELECT COALESCE(done_count, 0), COALESCE(error_count, 0) FROM runs WHERE id = ?1",
+        rusqlite::params![rid],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )
+    .unwrap_or((0, 0))
+}
+
 #[tauri::command]
-pub fn muse_stop_sidecar() -> AppResult<bool> {
-    crate::muse_sidecar::stop()?;
-    Ok(true)
+pub async fn muse_stop_sidecar() -> AppResult<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::muse_sidecar::stop()?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
 }
 
 fn enrich_account_json_with_proxy(
     acc: &mut serde_json::Value,
     acc_to_proxy: &std::collections::HashMap<String, String>,
     proxy_by_id: &std::collections::HashMap<String, crate::proxies::ProxyItem>,
+    proxy_urls: &std::collections::HashMap<String, String>,
     sidecar_session: Option<(u16, &str)>,
 ) {
     let Some(obj) = acc.as_object_mut() else {
@@ -2349,21 +2588,31 @@ fn enrich_account_json_with_proxy(
                     .unwrap_or(serde_json::Value::Null),
             );
             let expected_masked = px.to_masked_url();
-            if current_masked.as_deref() != Some(expected_masked.as_str()) && !is_busy {
-                if let Some((port, key)) = sidecar_session {
-                    if let Ok(safe_id) = muse_sanitize_id(&acc_id) {
-                        let patch_body = serde_json::json!({ "proxy": px.to_proxy_url() });
-                        let _ = crate::muse_sidecar::admin_send(
-                            port,
-                            key,
-                            "PATCH",
-                            &format!("/admin/accounts/{safe_id}"),
-                            Some(&patch_body),
-                        );
+            let mut synced = current_masked.as_deref() == Some(expected_masked.as_str());
+            if !synced {
+                match sidecar_session {
+                    None => synced = true,
+                    Some((port, key)) if !is_busy => {
+                        if let (Ok(safe_id), Some(full_url)) =
+                            (muse_sanitize_id(&acc_id), proxy_urls.get(&px.id))
+                        {
+                            let patch_body = serde_json::json!({ "proxy": full_url });
+                            synced = crate::muse_sidecar::admin_send(
+                                port,
+                                key,
+                                "PATCH",
+                                &format!("/admin/accounts/{safe_id}"),
+                                Some(&patch_body),
+                            )
+                            .is_ok();
+                        }
                     }
+                    Some(_) => {}
                 }
             }
-            obj.insert("proxy".into(), serde_json::Value::String(expected_masked));
+            if synced {
+                obj.insert("proxy".into(), serde_json::Value::String(expected_masked));
+            }
             return;
         }
     }
@@ -2374,6 +2623,81 @@ fn enrich_account_json_with_proxy(
     obj.insert("proxy_exit_ip".into(), serde_json::Value::Null);
     obj.insert("proxy_status".into(), serde_json::Value::Null);
     obj.insert("proxy_latency_ms".into(), serde_json::Value::Null);
+    if current_masked.is_some() {
+        if !is_busy {
+            let cleared_ok = match sidecar_session {
+                Some((port, key)) => match muse_sanitize_id(&acc_id) {
+                    Ok(safe_id) => {
+                        let patch_body = serde_json::json!({ "proxy": "" });
+                        crate::muse_sidecar::admin_send(
+                            port,
+                            key,
+                            "PATCH",
+                            &format!("/admin/accounts/{safe_id}"),
+                            Some(&patch_body),
+                        )
+                        .is_ok()
+                    }
+                    Err(_) => false,
+                },
+                None => true,
+            };
+            if cleared_ok {
+                obj.insert("proxy".into(), serde_json::Value::Null);
+            }
+        }
+    } else {
+        obj.insert("proxy".into(), serde_json::Value::Null);
+    }
+}
+
+fn enrich_accounts_slice_from_db(
+    conn: &rusqlite::Connection,
+    items: &mut [serde_json::Value],
+    sidecar_session: Option<(u16, &str)>,
+) {
+    let Ok(proxies) = crate::proxies::list_proxies_in(conn) else {
+        return;
+    };
+    let Ok(acc_to_proxy) = crate::proxies::load_account_to_proxy_map(conn) else {
+        return;
+    };
+    let proxy_urls = crate::proxies::resolve_proxy_urls_map_best_effort_in(conn)
+        .map(|(m, _)| m)
+        .unwrap_or_default();
+    let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
+        proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+    for item in items.iter_mut() {
+        enrich_account_json_with_proxy(
+            item,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            sidecar_session,
+        );
+    }
+}
+
+fn muse_list_accounts_with_session_and_db<FOpen>(
+    session: &crate::muse_sidecar::SidecarSession,
+    open_db: FOpen,
+) -> AppResult<serde_json::Value>
+where
+    FOpen: FnOnce() -> AppResult<rusqlite::Connection>,
+{
+    let _mut_guard = proxy_mutation_lock().lock();
+    let mut res =
+        crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
+    if let Ok(conn) = open_db() {
+        if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
+            enrich_accounts_slice_from_db(
+                &conn,
+                arr,
+                Some((session.port, &session.api_key)),
+            );
+        }
+    }
+    Ok(res)
 }
 
 #[tauri::command]
@@ -2385,25 +2709,7 @@ pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
                 "Engine VideoFlow Muse đang dừng — hãy khởi động engine trước khi tải danh sách tài khoản.",
             )
         })?;
-        let mut res =
-            crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
-        if let Ok(conn) = crate::proxies::open_db() {
-            let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-            let acc_to_proxy = crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-            let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
-            if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
-                for item in arr.iter_mut() {
-                    enrich_account_json_with_proxy(
-                        item,
-                        &acc_to_proxy,
-                        &proxy_by_id,
-                        Some((session.port, &session.api_key)),
-                    );
-                }
-            }
-        }
-        Ok(res)
+        muse_list_accounts_with_session_and_db(&session, crate::proxies::open_db)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2421,15 +2727,15 @@ pub async fn muse_add_cookie(
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let clean_pid = proxy_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let resolved_proxy = if let Some(ref pid) = clean_pid {
+        let resolved_proxy_url = if let Some(ref pid) = clean_pid {
             let conn = crate::proxies::open_db()?;
-            let px = crate::proxies::get_proxy_in(&conn, pid)?;
-            Some(px)
+            Some(crate::proxies::resolve_proxy_url_in(&conn, pid)?)
         } else {
             None
         };
@@ -2439,9 +2745,9 @@ pub async fn muse_add_cookie(
             "label": label.trim(),
             "cookies": cookies,
         });
-        if let Some(ref px) = resolved_proxy {
+        if let Some(ref url) = resolved_proxy_url {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("proxy".into(), serde_json::Value::String(px.to_proxy_url()));
+                obj.insert("proxy".into(), serde_json::Value::String(url.clone()));
             }
         }
         let dup_flag = if allow_duplicate { "?allow_duplicate_session=true" } else { "" };
@@ -2460,21 +2766,19 @@ pub async fn muse_add_cookie(
                 .unwrap_or("")
                 .to_string();
             if !acc_id.is_empty() {
-                if let Ok(conn) = crate::proxies::open_db() {
-                    let _ = crate::proxies::set_account_proxy_in(
+                if let Some(ref pid) = clean_pid {
+                    let conn = crate::proxies::open_db()?;
+                    crate::proxies::set_account_proxy_in(&conn, &acc_id, Some(pid.as_str()))?;
+                    enrich_accounts_slice_from_db(
                         &conn,
-                        &acc_id,
-                        clean_pid.as_deref(),
+                        std::slice::from_mut(acc_obj),
+                        Some((port, &key)),
                     );
-                    let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-                    let acc_to_proxy =
-                        crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-                    let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                        proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
-                    enrich_account_json_with_proxy(
-                        acc_obj,
-                        &acc_to_proxy,
-                        &proxy_by_id,
+                } else if let Ok(conn) = crate::proxies::open_db() {
+                    let _ = crate::proxies::set_account_proxy_in(&conn, &acc_id, None);
+                    enrich_accounts_slice_from_db(
+                        &conn,
+                        std::slice::from_mut(acc_obj),
                         Some((port, &key)),
                     );
                 }
@@ -2484,6 +2788,125 @@ pub async fn muse_add_cookie(
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn muse_update_account_with_session_and_db<FGetSess, FOpenDb>(
+    account_id: String,
+    enabled: Option<bool>,
+    label: Option<String>,
+    proxy: Option<String>,
+    proxy_id: Option<String>,
+    get_session: FGetSess,
+    mut open_db: FOpenDb,
+) -> AppResult<serde_json::Value>
+where
+    FGetSess: FnOnce() -> AppResult<(u16, String)>,
+    FOpenDb: FnMut() -> AppResult<rusqlite::Connection>,
+{
+    let _mut_guard = proxy_mutation_lock().lock();
+    let (port, key) = get_session()?;
+    let safe_id = muse_sanitize_id(&account_id)?;
+    let mut body = serde_json::Map::new();
+    if let Some(e) = enabled {
+        body.insert("enabled".into(), serde_json::Value::Bool(e));
+    }
+    if let Some(l) = label {
+        body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
+    }
+
+    let mut target_proxy_id: Option<Option<String>> = None;
+    let has_raw_proxy =
+        proxy_id.is_none() && proxy.as_deref().is_some_and(|p| !p.trim().is_empty());
+    let mut prev_proxy_url_for_rb: Option<String> = None;
+
+    if let Some(pid_raw) = proxy_id {
+        let conn = open_db()?;
+        if let Ok(map) = crate::proxies::load_account_to_proxy_map(&conn) {
+            prev_proxy_url_for_rb = Some(
+                map.get(&safe_id)
+                    .and_then(|old_pid| crate::proxies::resolve_proxy_url_in(&conn, old_pid).ok())
+                    .unwrap_or_default(),
+            );
+        }
+        let trimmed = pid_raw.trim();
+        if trimmed.is_empty() {
+            body.insert("proxy".into(), serde_json::Value::String(String::new()));
+            target_proxy_id = Some(None);
+        } else {
+            let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
+            let url = crate::proxies::resolve_proxy_url_in(&conn, &px.id)?;
+            body.insert("proxy".into(), serde_json::Value::String(url));
+            target_proxy_id = Some(Some(px.id));
+        }
+    } else if let Some(p) = proxy {
+        let trimmed = p.trim();
+        body.insert("proxy".into(), serde_json::Value::String(trimmed.to_string()));
+        if trimmed.is_empty() {
+            target_proxy_id = Some(None);
+        }
+    }
+
+    let path = format!("/admin/accounts/{safe_id}");
+    let mut res = crate::muse_sidecar::admin_send(
+        port,
+        &key,
+        "PATCH",
+        &path,
+        Some(&serde_json::Value::Object(body)),
+    )?;
+
+    if let Some(ref pid_opt) = target_proxy_id {
+        let conn = match open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(ref old_u) = prev_proxy_url_for_rb {
+                    let rb_body = serde_json::json!({ "proxy": old_u });
+                    let _ = crate::muse_sidecar::admin_send(
+                        port,
+                        &key,
+                        "PATCH",
+                        &path,
+                        Some(&rb_body),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref()) {
+            if let Some(ref old_u) = prev_proxy_url_for_rb {
+                let rb_body = serde_json::json!({ "proxy": old_u });
+                let _ = crate::muse_sidecar::admin_send(
+                    port,
+                    &key,
+                    "PATCH",
+                    &path,
+                    Some(&rb_body),
+                );
+            }
+            return Err(e);
+        }
+        if !has_raw_proxy {
+            if let Some(acc_obj) = res.get_mut("account") {
+                enrich_accounts_slice_from_db(
+                    &conn,
+                    std::slice::from_mut(acc_obj),
+                    Some((port, &key)),
+                );
+            }
+        }
+    } else if !has_raw_proxy {
+        if let Ok(conn) = open_db() {
+            if let Some(acc_obj) = res.get_mut("account") {
+                enrich_accounts_slice_from_db(
+                    &conn,
+                    std::slice::from_mut(acc_obj),
+                    Some((port, &key)),
+                );
+            }
+        }
+    }
+    Ok(res)
 }
 
 #[tauri::command]
@@ -2500,64 +2923,15 @@ pub async fn muse_update_account(
     }
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (port, key) = muse_session_or_err(&cfg)?;
-        let mut body = serde_json::Map::new();
-        if let Some(e) = enabled {
-            body.insert("enabled".into(), serde_json::Value::Bool(e));
-        }
-        if let Some(l) = label {
-            body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
-        }
-
-        let mut target_proxy_id: Option<Option<String>> = None;
-        if let Some(pid_raw) = proxy_id {
-            let trimmed = pid_raw.trim();
-            if trimmed.is_empty() {
-                body.insert("proxy".into(), serde_json::Value::String(String::new()));
-                target_proxy_id = Some(None);
-            } else {
-                let conn = crate::proxies::open_db()?;
-                let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
-                body.insert("proxy".into(), serde_json::Value::String(px.to_proxy_url()));
-                target_proxy_id = Some(Some(px.id));
-            }
-        } else if let Some(p) = proxy {
-            let trimmed = p.trim();
-            body.insert("proxy".into(), serde_json::Value::String(trimmed.to_string()));
-            if trimmed.is_empty() {
-                target_proxy_id = Some(None);
-            }
-        }
-
-        let safe_id = muse_sanitize_id(&account_id)?;
-        let path = format!("/admin/accounts/{safe_id}");
-        let mut res = crate::muse_sidecar::admin_send(
-            port,
-            &key,
-            "PATCH",
-            &path,
-            Some(&serde_json::Value::Object(body)),
-        )?;
-
-        if let Ok(conn) = crate::proxies::open_db() {
-            if let Some(ref pid_opt) = target_proxy_id {
-                crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref())?;
-            }
-            if let Some(acc_obj) = res.get_mut("account") {
-                let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-                let acc_to_proxy =
-                    crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-                let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                    proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
-                enrich_account_json_with_proxy(
-                    acc_obj,
-                    &acc_to_proxy,
-                    &proxy_by_id,
-                    Some((port, &key)),
-                );
-            }
-        }
-        Ok(res)
+        muse_update_account_with_session_and_db(
+            account_id,
+            enabled,
+            label,
+            proxy,
+            proxy_id,
+            || muse_session_or_err(&cfg),
+            crate::proxies::open_db,
+        )
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2600,6 +2974,7 @@ pub async fn muse_delete_account(
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let (port, key) = muse_session_or_err(&cfg)?;
         let safe_id = muse_sanitize_id(&account_id)?;
         let path = format!("/admin/accounts/{safe_id}");
@@ -2729,29 +3104,239 @@ fn check_sidecar_accounts_not_busy(
     if account_ids.is_empty() {
         return Ok(());
     }
-    if let Ok(res) = crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")
-    {
-        if let Some(arr) = res.get("data").and_then(|d| d.as_array()) {
-            for acc in arr {
-                let id = acc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let busy = acc.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
-                if busy && account_ids.iter().any(|a| a == id) {
-                    let label = acc
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(id);
-                    return Err(AppError::new(
-                        "ACCOUNT_BUSY",
-                        format!(
-                            "Tài khoản '{label}' đang bận thực thi hoặc đang mở trình duyệt đăng nhập, không thể sửa/xoá proxy lúc này."
-                        ),
-                    ));
-                }
+    let res = crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")
+        .map_err(|e| {
+            AppError::new(
+                "SIDECAR_SYNC_FAIL",
+                crate::settings::redact_secrets(&format!(
+                    "Không kiểm tra được trạng thái tài khoản trên engine trước khi sửa/xoá proxy: {}",
+                    e.message
+                )),
+            )
+        })?;
+    if let Some(arr) = res.get("data").and_then(|d| d.as_array()) {
+        for acc in arr {
+            let id = acc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let busy = acc.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+            if busy && account_ids.iter().any(|a| a == id) {
+                let label = acc
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id);
+                return Err(AppError::new(
+                    "ACCOUNT_BUSY",
+                    format!(
+                        "Tài khoản '{label}' đang bận thực thi hoặc đang mở trình duyệt đăng nhập, không thể sửa/xoá proxy lúc này."
+                    ),
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn restore_sidecar_proxy_batch(
+    session: &crate::muse_sidecar::SidecarSession,
+    ids: &[String],
+    old_url: &str,
+) -> Option<String> {
+    let rollback_body = serde_json::json!({ "proxy": old_url });
+    let mut failed = Vec::new();
+    for id in ids {
+        if let Err(e) = crate::muse_sidecar::admin_send(
+            session.port,
+            &session.api_key,
+            "PATCH",
+            &format!("/admin/accounts/{id}"),
+            Some(&rollback_body),
+        ) {
+            failed.push(format!("{id} ({})", e.code));
+        }
+    }
+    if failed.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Không khôi phục được proxy sidecar cho account: {}",
+            failed.join(", ")
+        ))
+    }
+}
+
+pub(crate) fn proxy_update_in_with_session(
+    conn: &mut rusqlite::Connection,
+    proxy_id: &str,
+    input: &crate::proxies::ProxyInput,
+    session_opt: Option<&crate::muse_sidecar::SidecarSession>,
+) -> AppResult<crate::proxies::ProxyItem> {
+    let existing = crate::proxies::get_proxy_in(conn, proxy_id)?;
+    let norm_kind = input.kind.trim().to_ascii_lowercase();
+    let raw_host = input.host.trim();
+    let norm_host = raw_host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_host);
+    let norm_user = input
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let endpoint_or_secret_changed = existing.kind != norm_kind
+        || existing.host != norm_host
+        || existing.port != input.port
+        || existing.username.as_deref() != norm_user
+        || (input.clear_password == Some(true) && existing.has_password)
+        || input.password.as_deref().is_some_and(|s| !s.is_empty());
+
+    if endpoint_or_secret_changed {
+        if let Some(session) = session_opt {
+            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+        }
+    }
+
+    let old_snap = crate::proxies::snapshot_proxy_row_in(conn, proxy_id)?;
+    let old_url_opt = crate::proxies::resolve_proxy_url_in(conn, proxy_id).ok();
+    let updated = crate::proxies::update_proxy_in(conn, proxy_id, input)?;
+
+    if endpoint_or_secret_changed {
+        if let Some(session) = session_opt {
+            if !updated.assigned_account_ids.is_empty() {
+                let new_url = match crate::proxies::resolve_proxy_url_in(conn, proxy_id) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        if let Err(rb_e) = crate::proxies::restore_proxy_update_in(conn, &old_snap) {
+                            eprintln!("proxy_update DB rollback failed: {}", rb_e.message);
+                        }
+                        return Err(e);
+                    }
+                };
+                if old_url_opt.as_deref() != Some(new_url.as_str()) {
+                    let mut patched_ids: Vec<String> = Vec::new();
+                    for acc_id in &updated.assigned_account_ids {
+                        let safe_id = match muse_sanitize_id(acc_id) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = crate::proxies::restore_proxy_update_in(conn, &old_snap);
+                                if let Some(ref old_url) = old_url_opt {
+                                    if let Some(warn) =
+                                        restore_sidecar_proxy_batch(session, &patched_ids, old_url)
+                                    {
+                                        eprintln!("{warn}");
+                                    }
+                                }
+                                return Err(e);
+                            }
+                        };
+                        let body = serde_json::json!({ "proxy": &new_url });
+                        match crate::muse_sidecar::admin_send(
+                            session.port,
+                            &session.api_key,
+                            "PATCH",
+                            &format!("/admin/accounts/{safe_id}"),
+                            Some(&body),
+                        ) {
+                            Ok(_) => patched_ids.push(safe_id),
+                            Err(e) if e.code == "MUSE_NOT_FOUND" => {
+                                let _ = crate::proxies::remove_account_link_in(conn, acc_id);
+                            }
+                            Err(e) => {
+                                let mut warnings = Vec::new();
+                                if let Err(rb_e) =
+                                    crate::proxies::restore_proxy_update_in(conn, &old_snap)
+                                {
+                                    warnings.push(format!("DB rollback lỗi: {}", rb_e.message));
+                                }
+                                if let Some(ref old_url) = old_url_opt {
+                                    if let Some(warn) =
+                                        restore_sidecar_proxy_batch(session, &patched_ids, old_url)
+                                    {
+                                        warnings.push(warn);
+                                    }
+                                }
+                                let mut msg = crate::settings::redact_secrets(&e.message);
+                                if !warnings.is_empty() {
+                                    msg = format!("{msg} [Rollback warning: {}]", warnings.join("; "));
+                                }
+                                return Err(AppError::new(&e.code, msg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    crate::proxies::get_proxy_in(conn, proxy_id)
+}
+
+pub(crate) fn proxy_delete_in_with_session(
+    conn: &mut rusqlite::Connection,
+    proxy_id: &str,
+    session_opt: Option<&crate::muse_sidecar::SidecarSession>,
+) -> AppResult<Vec<String>> {
+    let existing = crate::proxies::get_proxy_in(conn, proxy_id)?;
+    if let Some(session) = session_opt {
+        check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+    }
+
+    let old_snap = crate::proxies::snapshot_proxy_row_in(conn, proxy_id)?;
+    let old_url_opt = crate::proxies::resolve_proxy_url_in(conn, proxy_id).ok();
+    let affected = crate::proxies::delete_proxy_in(conn, proxy_id)?;
+
+    if let Some(session) = session_opt {
+        if !affected.is_empty() {
+            let mut cleared_ids: Vec<String> = Vec::new();
+            for acc_id in &affected {
+                let safe_id = match muse_sanitize_id(acc_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = crate::proxies::restore_proxy_delete_in(conn, &old_snap);
+                        if let Some(ref old_url) = old_url_opt {
+                            if let Some(warn) =
+                                restore_sidecar_proxy_batch(session, &cleared_ids, old_url)
+                            {
+                                eprintln!("{warn}");
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let body = serde_json::json!({ "proxy": "" });
+                match crate::muse_sidecar::admin_send(
+                    session.port,
+                    &session.api_key,
+                    "PATCH",
+                    &format!("/admin/accounts/{safe_id}"),
+                    Some(&body),
+                ) {
+                    Ok(_) => cleared_ids.push(safe_id),
+                    Err(e) if e.code == "MUSE_NOT_FOUND" => {}
+                    Err(e) => {
+                        let mut warnings = Vec::new();
+                        if let Err(rb_e) = crate::proxies::restore_proxy_delete_in(conn, &old_snap)
+                        {
+                            warnings.push(format!("DB rollback lỗi: {}", rb_e.message));
+                        }
+                        if let Some(ref old_url) = old_url_opt {
+                            if let Some(warn) =
+                                restore_sidecar_proxy_batch(session, &cleared_ids, old_url)
+                            {
+                                warnings.push(warn);
+                            }
+                        }
+                        let mut msg = crate::settings::redact_secrets(&e.message);
+                        if !warnings.is_empty() {
+                            msg = format!("{msg} [Rollback warning: {}]", warnings.join("; "));
+                        }
+                        return Err(AppError::new(&e.code, msg));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(affected)
 }
 
 #[tauri::command]
@@ -2774,33 +3359,10 @@ pub async fn proxy_update(
 ) -> AppResult<crate::proxies::ProxyItem> {
     ensure_not_running(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = crate::proxies::open_db()?;
-        let existing = crate::proxies::get_proxy_in(&conn, &proxy_id)?;
+        let _mut_guard = proxy_mutation_lock().lock();
+        let mut conn = crate::proxies::open_db()?;
         let session_opt = crate::muse_sidecar::current_session();
-
-        if let Some(ref session) = session_opt {
-            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
-        }
-
-        let updated = crate::proxies::update_proxy_in(&conn, &proxy_id, &input)?;
-
-        if let Some(ref session) = session_opt {
-            let new_url = updated.to_proxy_url();
-            for acc_id in &updated.assigned_account_ids {
-                if let Ok(safe_id) = muse_sanitize_id(acc_id) {
-                    let body = serde_json::json!({ "proxy": new_url });
-                    let _ = crate::muse_sidecar::admin_send(
-                        session.port,
-                        &session.api_key,
-                        "PATCH",
-                        &format!("/admin/accounts/{safe_id}"),
-                        Some(&body),
-                    );
-                }
-            }
-        }
-
-        Ok(updated)
+        proxy_update_in_with_session(&mut conn, &proxy_id, &input, session_opt.as_ref())
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2813,27 +3375,10 @@ pub async fn proxy_delete(
 ) -> AppResult<serde_json::Value> {
     ensure_not_running(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = crate::proxies::open_db()?;
-        let existing = crate::proxies::get_proxy_in(&conn, &proxy_id)?;
+        let _mut_guard = proxy_mutation_lock().lock();
+        let mut conn = crate::proxies::open_db()?;
         let session_opt = crate::muse_sidecar::current_session();
-
-        if let Some(ref session) = session_opt {
-            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
-            for acc_id in &existing.assigned_account_ids {
-                if let Ok(safe_id) = muse_sanitize_id(acc_id) {
-                    let body = serde_json::json!({ "proxy": "" });
-                    let _ = crate::muse_sidecar::admin_send(
-                        session.port,
-                        &session.api_key,
-                        "PATCH",
-                        &format!("/admin/accounts/{safe_id}"),
-                        Some(&body),
-                    );
-                }
-            }
-        }
-
-        let affected = crate::proxies::delete_proxy_in(&conn, &proxy_id)?;
+        let affected = proxy_delete_in_with_session(&mut conn, &proxy_id, session_opt.as_ref())?;
         Ok(serde_json::json!({
             "deleted": proxy_id,
             "unassigned_accounts": affected,
@@ -2853,19 +3398,83 @@ pub async fn proxy_test(proxy_id: String) -> AppResult<crate::proxies::ProxyItem
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
 }
 
+pub(crate) fn proxy_test_all_with_urls_in(
+    db_path: &Path,
+    target_url: &str,
+    ip_urls: &[&str],
+) -> AppResult<Vec<crate::proxies::ProxyItem>> {
+    let list = {
+        let conn = crate::proxies::open_db_at(db_path)?;
+        crate::proxies::list_proxies_in(&conn)?
+    };
+    let total = list.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = total.min(6);
+    let queue = parking_lot::Mutex::new(
+        list.into_iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.id))
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let results = parking_lot::Mutex::new(vec![None::<crate::proxies::ProxyItem>; total]);
+    let first_err = parking_lot::Mutex::new(None::<AppError>);
+
+    std::thread::scope(|s| {
+        for _ in 0..worker_count {
+            s.spawn(|| {
+                let worker_conn = match crate::proxies::open_db_at(db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let mut slot = first_err.lock();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    let next = queue.lock().pop_front();
+                    let Some((idx, pid)) = next else {
+                        break;
+                    };
+                    let item_opt = match crate::proxies::test_proxy_connection_with_urls(
+                        &worker_conn,
+                        &pid,
+                        target_url,
+                        ip_urls,
+                    ) {
+                        Ok(updated) => Some(updated),
+                        Err(e) if e.code == "PROXY_NOT_FOUND" => None,
+                        Err(_) => crate::proxies::get_proxy_in(&worker_conn, &pid).ok(),
+                    };
+                    results.lock()[idx] = item_opt;
+                }
+            });
+        }
+    });
+
+    if let Some(err) = first_err.into_inner() {
+        return Err(err);
+    }
+
+    Ok(results.into_inner().into_iter().flatten().collect())
+}
+
 #[tauri::command]
 pub async fn proxy_test_all() -> AppResult<Vec<crate::proxies::ProxyItem>> {
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = crate::proxies::open_db()?;
-        let list = crate::proxies::list_proxies_in(&conn)?;
-        let mut results = Vec::with_capacity(list.len());
-        for p in list {
-            match crate::proxies::test_proxy_connection(&conn, &p.id) {
-                Ok(updated) => results.push(updated),
-                Err(_) => results.push(p),
-            }
-        }
-        Ok(results)
+        proxy_test_all_with_urls_in(
+            &crate::proxies::default_db_path(),
+            "https://muse.ai",
+            &[
+                "https://api.ipify.org?format=json",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip",
+            ],
+        )
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2933,6 +3542,9 @@ pub async fn install_app_update(
 ) -> AppResult<bool> {
     use tauri_plugin_updater::UpdaterExt;
 
+    if state.exit_requested.load(Ordering::SeqCst) {
+        return Err(app_exiting_error());
+    }
     if state.running.load(Ordering::SeqCst) {
         return Err(AppError::new(
             "RUN_IN_PROGRESS",
@@ -2976,16 +3588,15 @@ pub async fn install_app_update(
             AppError::new("UPDATE_INSTALL_FAIL", format!("Cài bản cập nhật thất bại: {e}"))
         })?;
 
-    if state.running.load(Ordering::SeqCst) {
-        return Err(AppError::new(
-            "RUN_IN_PROGRESS",
-            "Pipeline vừa bắt đầu chạy trong lúc tải bản cập nhật — hãy dừng (STOP) rồi khởi động lại app.",
-        ));
-    }
-    log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
-    // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
-    crate::muse_sidecar::stop_for_quit();
-    app.restart();
+    finish_app_update_restart_with(
+        &state,
+        || {
+            log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
+            // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
+            crate::muse_sidecar::stop_for_quit();
+        },
+        || app.restart(),
+    )
 }
 
 fn log_info_app(msg: &str) {
@@ -3262,21 +3873,35 @@ pub fn get_run_detail(
     get_run_detail_at(&p, run_id)
 }
 
-fn validate_export_save_path(
-    state: &AppState,
+fn validate_export_save_path_with_approved(
+    approved: &HashSet<String>,
     project_dir: &Path,
     save_path: &str,
     allowed_exts: &[&str],
-) -> AppResult<()> {
+) -> AppResult<PathBuf> {
     let trimmed = save_path.trim();
     if trimmed.is_empty() {
         return Err(AppError::new("EMPTY_PATH", "Đường dẫn lưu file trống."));
     }
-    let key = normalize_win_path_key(trimmed);
-    if state.approved_export_paths.read().contains(&key) {
-        return Ok(());
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Đường dẫn lưu file chứa ký tự điều khiển không hợp lệ.",
+        ));
     }
     let pb = PathBuf::from(trimmed);
+    let Some(fname) = pb.file_name().and_then(|n| n.to_str()) else {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Đường dẫn lưu file thiếu tên file hợp lệ.",
+        ));
+    };
+    if fname.contains(':') || fname.chars().any(|c| c.is_control()) {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Tên file xuất không được chứa ':' hoặc ký tự điều khiển.",
+        ));
+    }
     let ext_ok = pb
         .extension()
         .and_then(|e| e.to_str())
@@ -3299,17 +3924,58 @@ fn validate_export_save_path(
             "Đường dẫn xuất file không được chứa '..'.",
         ));
     }
-    if let (Ok(proj_canon), Some(parent)) = (std::fs::canonicalize(project_dir), pb.parent()) {
-        if let Ok(parent_canon) = std::fs::canonicalize(parent) {
-            if parent_canon.starts_with(&proj_canon) {
-                return Ok(());
-            }
+    if let Ok(meta) = std::fs::symlink_metadata(&pb) {
+        if meta.file_type().is_symlink() {
+            return Err(AppError::new(
+                "FORBIDDEN_EXPORT_PATH",
+                "Không cho phép ghi đè qua symlink.",
+            ));
+        }
+    }
+
+    let proj_canon = std::fs::canonicalize(project_dir).ok();
+    let parent_canon = pb.parent().and_then(|p| std::fs::canonicalize(p).ok());
+    if let (Some(ref proj_c), Some(ref par_c)) = (&proj_canon, &parent_canon) {
+        if par_c.starts_with(proj_c)
+            && (fname.eq_ignore_ascii_case("prompts.csv")
+                || fname.eq_ignore_ascii_case("state.db")
+                || fname.eq_ignore_ascii_case("state.db-wal")
+                || fname.eq_ignore_ascii_case("state.db-shm"))
+        {
+            return Err(AppError::new(
+                "FORBIDDEN_EXPORT_PATH",
+                "Không cho phép ghi đè file hệ thống của dự án (prompts.csv / state.db).",
+            ));
+        }
+    }
+
+    let key = normalize_win_path_key(trimmed);
+    if approved.contains(&key) {
+        return Ok(pb);
+    }
+
+    if let (Some(ref proj_c), Some(ref par_c)) = (&proj_canon, &parent_canon) {
+        if par_c.starts_with(proj_c)
+            && (!pb.exists()
+                || std::fs::canonicalize(&pb).is_ok_and(|target_c| target_c.starts_with(proj_c)))
+        {
+            return Ok(pb);
         }
     }
     Err(AppError::new(
         "FORBIDDEN_EXPORT_PATH",
         "Đường dẫn lưu file chưa được chọn qua hộp thoại hệ thống hoặc nằm ngoài thư mục dự án.",
     ))
+}
+
+fn validate_export_save_path(
+    state: &AppState,
+    project_dir: &Path,
+    save_path: &str,
+    allowed_exts: &[&str],
+) -> AppResult<PathBuf> {
+    let approved = state.approved_export_paths.read();
+    validate_export_save_path_with_approved(&approved, project_dir, save_path, allowed_exts)
 }
 
 #[tauri::command]
@@ -3400,7 +4066,7 @@ pub async fn pick_save_log(
 pub fn export_history_csv_at(
     p: &Path,
     filter: Option<serde_json::Value>,
-    save_path: &str,
+    save_path: impl AsRef<Path>,
 ) -> AppResult<bool> {
     let parsed: HistoryExportFilter = match filter {
         Some(serde_json::Value::String(s)) => HistoryExportFilter {
@@ -3482,7 +4148,7 @@ pub fn export_history_csv_at(
         wtr.flush()
             .map_err(|e| AppError::new("CSV_EXPORT_FAIL", format!("{e}")))?;
     }
-    std::fs::write(save_path, &out)
+    std::fs::write(save_path.as_ref(), &out)
         .map_err(|e| AppError::new("CSV_EXPORT_FAIL", format!("Không ghi được file: {e}")))?;
     Ok(true)
 }
@@ -3494,8 +4160,8 @@ pub fn export_history_csv(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let p = project_path(&state)?;
-    validate_export_save_path(&state, &p, &save_path, &["csv"])?;
-    export_history_csv_at(&p, filter, &save_path)
+    let validated = validate_export_save_path(&state, &p, &save_path, &["csv"])?;
+    export_history_csv_at(&p, filter, &validated)
 }
 
 fn query_logs_at(
@@ -3575,16 +4241,7 @@ pub fn get_logs(
     query_logs_at(&p, run_id, level.as_deref(), limit.unwrap_or(200))
 }
 
-#[tauri::command]
-pub fn export_logs_txt(
-    run_id: Option<i64>,
-    level: Option<String>,
-    save_path: String,
-    state: State<'_, AppState>,
-) -> AppResult<bool> {
-    let p = project_path(&state)?;
-    validate_export_save_path(&state, &p, &save_path, &["log", "txt"])?;
-    let items = query_logs_at(&p, run_id, level.as_deref(), 5000)?;
+fn format_logs_txt_content(items: &[LogItem]) -> String {
     let mut text = String::from("\u{FEFF}# VideoFlow Desktop — Nhật ký kỹ thuật\r\n");
     for item in items.iter().rev() {
         let rid_str = item
@@ -3593,10 +4250,12 @@ pub fn export_logs_txt(
             .unwrap_or_else(|| "-".into());
         let row_str = item.row_key.as_deref().unwrap_or("-");
         let step_str = item.step.as_deref().unwrap_or("-");
+        let safe_msg = crate::settings::redact_secrets(&item.message);
         let detail_str = item
             .detail
             .as_deref()
             .filter(|d| !d.is_empty())
+            .map(crate::settings::redact_secrets)
             .map(|d| format!(" | {d}"))
             .unwrap_or_default();
         text.push_str(&format!(
@@ -3606,11 +4265,25 @@ pub fn export_logs_txt(
             rid_str,
             row_str,
             step_str,
-            item.message,
+            safe_msg,
             detail_str
         ));
     }
-    std::fs::write(&save_path, text.as_bytes())
+    text
+}
+
+#[tauri::command]
+pub fn export_logs_txt(
+    run_id: Option<i64>,
+    level: Option<String>,
+    save_path: String,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    let p = project_path(&state)?;
+    let validated = validate_export_save_path(&state, &p, &save_path, &["log", "txt"])?;
+    let items = query_logs_at(&p, run_id, level.as_deref(), 5000)?;
+    let text = format_logs_txt_content(&items);
+    std::fs::write(&validated, text.as_bytes())
         .map_err(|e| AppError::new("LOG_EXPORT_FAIL", format!("Không ghi được file log: {e}")))?;
     Ok(true)
 }
@@ -4019,7 +4692,7 @@ mod tests {
         export_history_csv_at(
             &dir,
             Some(serde_json::json!({ "status": "da_dung", "kind": "lam_lai" })),
-            &out_csv.to_string_lossy(),
+            &out_csv,
         )
         .unwrap();
         let exported_text = String::from_utf8(std::fs::read(&out_csv).unwrap()).unwrap();
@@ -4170,6 +4843,1297 @@ mod tests {
         let d2_remapped = remap_reference_image_at(&dir, &k2, "other.png").unwrap();
         assert!(d2_remapped.row.row_key.starts_with("other.png#"));
         assert_eq!(d2_remapped.row.status, "Bỏ qua");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn read_http_req_test(stream: &mut std::net::TcpStream) -> (String, String) {
+        use std::io::Read;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end;
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => {
+                    header_end = buf.len();
+                    break;
+                }
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = pos + 4;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    header_end = buf.len();
+                    break;
+                }
+            }
+        }
+        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let content_len = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_len {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+        let body = String::from_utf8_lossy(
+            &buf[header_end.min(buf.len())..(header_end + content_len).min(buf.len())],
+        )
+        .into_owned();
+        (head, body)
+    }
+
+    fn write_http_json_test(stream: &mut std::net::TcpStream, status: &str, json_body: &str) {
+        use std::io::Write;
+        let resp = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json_body.len(),
+            json_body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    }
+
+    #[test]
+    fn test_h2_enrich_account_json_with_proxy_clears_unassigned_and_skips_busy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar");
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::<(String, String)>::new()));
+        let captured_srv = captured.clone();
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let (head, body) = read_http_req_test(&mut stream);
+                    let req_line = head.lines().next().unwrap_or("").to_string();
+                    captured_srv.lock().push((req_line, body));
+                    write_http_json_test(&mut stream, "200 OK", r#"{"ok":true}"#);
+                }
+            }
+        });
+
+        let mut proxy_by_id = HashMap::new();
+        proxy_by_id.insert(
+            "px_1".to_string(),
+            crate::proxies::ProxyItem {
+                id: "px_1".into(),
+                name: "P1".into(),
+                kind: "http".into(),
+                host: "198.51.100.1".into(),
+                port: 8080,
+                username: Some("u1".into()),
+                password: None,
+                has_password: true,
+                note: None,
+                last_status: "alive".into(),
+                exit_ip: Some("198.51.100.1".into()),
+                latency_ms: Some(12),
+                tested_at: None,
+                last_error: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+                assigned_account_ids: vec!["acc_1".into()],
+            },
+        );
+        let mut acc_to_proxy = HashMap::new();
+        acc_to_proxy.insert("acc_1".to_string(), "px_1".to_string());
+        let mut proxy_urls = HashMap::new();
+        proxy_urls.insert(
+            "px_1".to_string(),
+            "http://u1:real_pw@198.51.100.1:8080".to_string(),
+        );
+
+        let mut acc1 = serde_json::json!({ "id": "acc_1", "busy": false, "proxy": null });
+        enrich_account_json_with_proxy(
+            &mut acc1,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((port, "k1")),
+        );
+        assert_eq!(acc1["proxy"], "http://***@198.51.100.1:8080");
+        assert_eq!(acc1["proxy_id"], "px_1");
+
+        let mut acc2 = serde_json::json!({
+            "id": "acc_2",
+            "busy": false,
+            "proxy": "http://***@1.2.3.4:8080"
+        });
+        enrich_account_json_with_proxy(
+            &mut acc2,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((port, "k1")),
+        );
+        assert_eq!(acc2["proxy"], serde_json::Value::Null);
+        assert_eq!(acc2["proxy_id"], serde_json::Value::Null);
+
+        let mut acc3_busy = serde_json::json!({
+            "id": "acc_3",
+            "busy": true,
+            "proxy": "http://***@1.2.3.4:8080"
+        });
+        enrich_account_json_with_proxy(
+            &mut acc3_busy,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((port, "k1")),
+        );
+        assert_eq!(acc3_busy["proxy"], "http://***@1.2.3.4:8080");
+
+        srv.join().unwrap();
+        let reqs = captured.lock();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].0.starts_with("PATCH /admin/accounts/acc_1"));
+        assert!(reqs[0].1.contains("http://u1:real_pw@198.51.100.1:8080"));
+        assert!(reqs[1].0.starts_with("PATCH /admin/accounts/acc_2"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&reqs[1].1).unwrap()["proxy"], "");
+    }
+
+    #[test]
+    fn test_h2_proxy_update_delete_fail_closed_and_rollback() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_h2_rollback_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mut conn = crate::proxies::open_db_at(&db_path).expect("open db");
+        let px = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "OldProxy".into(),
+                kind: "http".into(),
+                host: "198.51.100.10".into(),
+                port: 8080,
+                username: Some("old_u".into()),
+                password: Some("old_pw".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .expect("create proxy");
+        crate::proxies::set_account_proxy_in(&conn, "acc_a", Some(&px.id)).unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_b", Some(&px.id)).unwrap();
+
+        // 1. Closed port -> fail closed on admin_get, DB stays intact
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+        let dead_sess = crate::muse_sidecar::SidecarSession {
+            port: dead_port,
+            api_key: "k".into(),
+        };
+        let err_upd = proxy_update_in_with_session(
+            &mut conn,
+            &px.id,
+            &crate::proxies::ProxyInput {
+                name: "NewProxy".into(),
+                kind: "http".into(),
+                host: "198.51.100.99".into(),
+                port: 9090,
+                username: None,
+                password: None,
+                clear_password: Some(true),
+                note: None,
+            },
+            Some(&dead_sess),
+        )
+        .unwrap_err();
+        assert_eq!(err_upd.code, "SIDECAR_SYNC_FAIL");
+        assert_eq!(crate::proxies::get_proxy_in(&conn, &px.id).unwrap().name, "OldProxy");
+
+        let err_del = proxy_delete_in_with_session(&mut conn, &px.id, Some(&dead_sess)).unwrap_err();
+        assert_eq!(err_del.code, "SIDECAR_SYNC_FAIL");
+        assert_eq!(crate::proxies::get_proxy_in(&conn, &px.id).unwrap().host, "198.51.100.10");
+
+        // 2. Mock sidecar: update rolls back DB & acc_a when acc_b returns 409 AccountBusy;
+        //    delete rolls back DB & acc_a on 409; then delete succeeds on 200 + 404 not_found.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let live_sess = crate::muse_sidecar::SidecarSession {
+            port,
+            api_key: "k".into(),
+        };
+        let log_reqs = Arc::new(parking_lot::Mutex::new(Vec::<(String, String)>::new()));
+        let log_srv = log_reqs.clone();
+
+        let srv = std::thread::spawn(move || {
+            // Update (4 reqs): GET, PATCH acc_a (200), PATCH acc_b (409), rollback PATCH acc_a (200)
+            // Delete-fail (4 reqs): GET, PATCH acc_a (200), PATCH acc_b (409), rollback PATCH acc_a (200)
+            // Delete-ok (3 reqs): GET, PATCH acc_a (200), PATCH acc_b (404)
+            for idx in 0..11 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let (head, body) = read_http_req_test(&mut stream);
+                    let req_line = head.lines().next().unwrap_or("").to_string();
+                    log_srv.lock().push((req_line.clone(), body));
+                    if req_line.starts_with("GET /admin/accounts") {
+                        write_http_json_test(
+                            &mut stream,
+                            "200 OK",
+                            r#"{"data":[{"id":"acc_a","busy":false},{"id":"acc_b","busy":false}]}"#,
+                        );
+                    } else if idx == 2 || idx == 6 {
+                        write_http_json_test(
+                            &mut stream,
+                            "409 Conflict",
+                            r#"{"error":{"code":"account_busy","message":"Account busy"}}"#,
+                        );
+                    } else if idx == 10 {
+                        write_http_json_test(
+                            &mut stream,
+                            "404 Not Found",
+                            r#"{"error":{"code":"not_found","message":"Account missing"}}"#,
+                        );
+                    } else {
+                        write_http_json_test(&mut stream, "200 OK", r#"{"ok":true}"#);
+                    }
+                }
+            }
+        });
+
+        let upd_conflict = proxy_update_in_with_session(
+            &mut conn,
+            &px.id,
+            &crate::proxies::ProxyInput {
+                name: "UpdatedShouldRollback".into(),
+                kind: "socks5".into(),
+                host: "198.51.100.77".into(),
+                port: 1080,
+                username: Some("new_u".into()),
+                password: Some("new_pw".into()),
+                clear_password: None,
+                note: None,
+            },
+            Some(&live_sess),
+        )
+        .unwrap_err();
+        assert_eq!(upd_conflict.code, "MUSE_ACCOUNT_BUSY");
+        let after_rb = crate::proxies::get_proxy_in(&conn, &px.id).unwrap();
+        assert_eq!(after_rb.name, "OldProxy");
+        assert_eq!(after_rb.host, "198.51.100.10");
+        assert_eq!(
+            crate::proxies::resolve_proxy_url_in(&conn, &px.id).unwrap(),
+            "http://old_u:old_pw@198.51.100.10:8080"
+        );
+        assert_eq!(after_rb.assigned_account_ids, vec!["acc_a".to_string(), "acc_b".to_string()]);
+
+        let del_conflict =
+            proxy_delete_in_with_session(&mut conn, &px.id, Some(&live_sess)).unwrap_err();
+        assert_eq!(del_conflict.code, "MUSE_ACCOUNT_BUSY");
+        assert_eq!(
+            crate::proxies::get_proxy_in(&conn, &px.id)
+                .unwrap()
+                .assigned_account_ids,
+            vec!["acc_a".to_string(), "acc_b".to_string()]
+        );
+
+        let deleted_accs =
+            proxy_delete_in_with_session(&mut conn, &px.id, Some(&live_sess)).expect("delete ok");
+        assert_eq!(deleted_accs, vec!["acc_a".to_string(), "acc_b".to_string()]);
+        assert!(crate::proxies::get_proxy_in(&conn, &px.id).is_err());
+
+        srv.join().unwrap();
+        let captured = log_reqs.lock();
+        assert_eq!(captured.len(), 11);
+        assert!(captured[3].1.contains("http://old_u:old_pw@198.51.100.10:8080"));
+        assert!(captured[7].1.contains("http://old_u:old_pw@198.51.100.10:8080"));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_m2_proxy_test_all_concurrent_and_non_resurrecting() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_m2_testall_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let conn = crate::proxies::open_db_at(&db_path).expect("open db");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock proxy");
+        let port = listener.local_addr().unwrap().port();
+        // 2 proxies * 2 HTTP GETs each = 4 connections; barrier waits for at least 2 concurrent requests.
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let in_f = in_flight.clone();
+        let max_f = max_in_flight.clone();
+
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<()>();
+        let srv = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..4 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let in_f_c = in_f.clone();
+                    let max_f_c = max_f.clone();
+                    handlers.push(std::thread::spawn(move || {
+                        let (_head, _) = read_http_req_test(&mut stream);
+                        let cur = in_f_c.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_f_c.fetch_max(cur, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(120));
+                        in_f_c.fetch_sub(1, Ordering::SeqCst);
+                        let body = "{\"ip\":\"198.51.100.50\"}";
+                        write_http_json_test(&mut stream, "200 OK", body);
+                    }));
+                }
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+            let _ = tx_done.send(());
+        });
+
+        let p1 = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "P1".into(),
+                kind: "http".into(),
+                host: "127.0.0.1".into(),
+                port,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let p2 = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "P2".into(),
+                kind: "http".into(),
+                host: "127.0.0.1".into(),
+                port,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let tested = proxy_test_all_with_urls_in(
+            &db_path,
+            "http://example.com/",
+            &["http://api.ipify.org/?format=json"],
+        )
+        .expect("proxy_test_all ok");
+        rx_done.recv_timeout(Duration::from_secs(5)).unwrap();
+        srv.join().unwrap();
+
+        assert_eq!(tested.len(), 2);
+        assert_eq!(tested[0].id, p1.id);
+        assert_eq!(tested[1].id, p2.id);
+        assert!(tested.iter().all(|p| p.last_status == "alive"));
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected concurrent proxy tests, max_in_flight={}",
+            max_in_flight.load(Ordering::SeqCst)
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_m7_validate_export_save_path_and_log_redaction() {
+        let dir = temp_proj("export_guard");
+        let prompts_path = dir.join("prompts.csv");
+        std::fs::write(&prompts_path, b"col1\n").unwrap();
+        let state_db_path = dir.join("state.db");
+        std::fs::write(&state_db_path, b"db").unwrap();
+
+        let mut approved = HashSet::new();
+        approved.insert(normalize_win_path_key(&prompts_path.to_string_lossy()));
+        approved.insert(normalize_win_path_key(&state_db_path.to_string_lossy()));
+
+        // Protected project files must be blocked even if present in approved_export_paths
+        let err_prompts = validate_export_save_path_with_approved(
+            &approved,
+            &dir,
+            &prompts_path.to_string_lossy(),
+            &["csv"],
+        )
+        .unwrap_err();
+        assert_eq!(err_prompts.code, "FORBIDDEN_EXPORT_PATH");
+
+        let err_traversal = validate_export_save_path_with_approved(
+            &approved,
+            &dir,
+            &format!("{}\\..\\evil.csv", dir.display()),
+            &["csv"],
+        )
+        .unwrap_err();
+        assert_eq!(err_traversal.code, "FORBIDDEN_EXPORT_PATH");
+
+        let ok_inside = validate_export_save_path_with_approved(
+            &HashSet::new(),
+            &dir,
+            &dir.join("history_out.csv").to_string_lossy(),
+            &["csv"],
+        );
+        assert!(ok_inside.is_ok());
+
+        crate::settings::register_secret_for_redaction("vf_secret_log_test_xyz");
+        let items = vec![LogItem {
+            id: 2,
+            ts: "2026-11-20T10:00:00Z".into(),
+            level: "error".into(),
+            run_id: Some(9),
+            row_key: Some("a.png".into()),
+            step: Some("tao_video".into()),
+            message: "fail with key vf_secret_log_test_xyz".into(),
+            detail: Some("via http://alice:superPw@198.51.100.2:8080/api".into()),
+        }];
+        let txt = format_logs_txt_content(&items);
+        assert!(!txt.contains("vf_secret_log_test_xyz"));
+        assert!(!txt.contains("superPw"));
+        assert!(txt.contains("http://alice:[REDACTED]@198.51.100.2:8080/api"));
+
+        // Pass-2: NTFS ADS path (`prompts.csv:x.csv`) must be blocked even when in approved paths
+        let ads_path = dir.join("prompts.csv:x.csv");
+        let mut approved_ads = approved.clone();
+        approved_ads.insert(normalize_win_path_key(&ads_path.to_string_lossy()));
+        let err_ads = validate_export_save_path_with_approved(
+            &approved_ads,
+            &dir,
+            &ads_path.to_string_lossy(),
+            &["csv"],
+        )
+        .unwrap_err();
+        assert_eq!(err_ads.code, "FORBIDDEN_EXPORT_PATH");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pass2_proxy_enrich_no_lie_and_metadata_only_update_while_busy() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_cmd_pass2_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mut conn = crate::proxies::open_db_at(&db_path).unwrap();
+        let px = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "InitialName".into(),
+                kind: "http".into(),
+                host: "198.51.100.20".into(),
+                port: 8080,
+                username: Some("u".into()),
+                password: Some("pw".into()),
+                clear_password: None,
+                note: Some("old note".into()),
+            },
+        )
+        .unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_1", Some(&px.id)).unwrap();
+        let acc_to_proxy = crate::proxies::load_account_to_proxy_map(&conn).unwrap();
+        let proxies = crate::proxies::list_proxies_in(&conn).unwrap();
+        let proxy_by_id: HashMap<String, crate::proxies::ProxyItem> =
+            proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+        let (proxy_urls, _) =
+            crate::proxies::resolve_proxy_urls_map_best_effort_in(&conn).unwrap();
+
+        // 1. Busy account must NOT lie about obj["proxy"] when sidecar still holds old proxy
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::Read;
+            // Only expects ONE request for the PATCH failure test
+            if let Ok((mut s, _)) = srv.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                write_http_json_test(
+                    &mut s,
+                    "500 Internal Server Error",
+                    r#"{"error":{"code":"sync_fail","message":"boom"}}"#,
+                );
+            }
+        });
+        let live_sess = crate::muse_sidecar::SidecarSession {
+            port: srv_port,
+            api_key: "k".into(),
+        };
+
+        let mut busy_acc = serde_json::json!({
+            "id": "acc_1",
+            "busy": true,
+            "proxy": "http://***@old.invalid:3128"
+        });
+        enrich_account_json_with_proxy(
+            &mut busy_acc,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((srv_port, "k")),
+        );
+        assert_eq!(
+            busy_acc.get("proxy").and_then(|v| v.as_str()),
+            Some("http://***@old.invalid:3128"),
+            "busy account must retain actual sidecar proxy"
+        );
+
+        // Idle account where PATCH fails must also NOT lie about obj["proxy"]
+        let mut fail_acc = serde_json::json!({
+            "id": "acc_1",
+            "busy": false,
+            "proxy": "http://***@old.invalid:3128"
+        });
+        enrich_account_json_with_proxy(
+            &mut fail_acc,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((srv_port, "k")),
+        );
+        server.join().unwrap();
+        assert_eq!(
+            fail_acc.get("proxy").and_then(|v| v.as_str()),
+            Some("http://***@old.invalid:3128"),
+            "failed PATCH must retain actual sidecar proxy"
+        );
+
+        // 2. Metadata-only proxy_update succeeds even while assigned account is busy (no sidecar traffic needed)
+        let metadata_updated = proxy_update_in_with_session(
+            &mut conn,
+            &px.id,
+            &crate::proxies::ProxyInput {
+                name: "RenamedOnly".into(),
+                kind: "http".into(),
+                host: "198.51.100.20".into(),
+                port: 8080,
+                username: Some("u".into()),
+                password: None,
+                clear_password: None,
+                note: Some("updated note".into()),
+            },
+            Some(&live_sess),
+        )
+        .expect("metadata-only update should not touch sidecar");
+        assert_eq!(metadata_updated.name, "RenamedOnly");
+        assert_eq!(metadata_updated.note.as_deref(), Some("updated note"));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_muse_list_accounts_serializes_with_proxy_mutation_lock() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_list_proxy_lock_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let conn = crate::proxies::open_db_at(&db_path).unwrap();
+        let px_a = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "ProxyA".into(),
+                kind: "http".into(),
+                host: "198.51.100.1".into(),
+                port: 8001,
+                username: Some("ua".into()),
+                password: Some("pa".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let px_b = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "ProxyB".into(),
+                kind: "http".into(),
+                host: "198.51.100.2".into(),
+                port: 8002,
+                username: Some("ub".into()),
+                password: Some("pb".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_1", Some(&px_a.id)).unwrap();
+        drop(conn);
+
+        let sidecar_proxy = Arc::new(parking_lot::Mutex::new(px_a.to_masked_url()));
+        let patch_history = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+        srv.set_nonblocking(true).unwrap();
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let sidecar_proxy_bg = Arc::clone(&sidecar_proxy);
+        let patch_history_bg = Arc::clone(&patch_history);
+        let px_a_masked_srv = px_a.to_masked_url();
+        let px_b_masked_srv = px_b.to_masked_url();
+
+        let server = std::thread::spawn(move || {
+            while !stop_srv_bg.load(Ordering::SeqCst) {
+                match srv.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let (head, body) = read_http_req_test(&mut stream);
+                        let first_line = head.lines().next().unwrap_or("");
+                        if first_line.starts_with("GET /admin/accounts ") {
+                            let cur_px = sidecar_proxy_bg.lock().clone();
+                            let resp = serde_json::json!({
+                                "data": [{ "id": "acc_1", "busy": false, "proxy": cur_px }]
+                            })
+                            .to_string();
+                            write_http_json_test(&mut stream, "200 OK", &resp);
+                        } else if first_line.starts_with("PATCH /admin/accounts/acc_1 ") {
+                            let v: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                            let raw_url = v
+                                .get("proxy")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let masked = if raw_url.contains("198.51.100.2:8002") {
+                                px_b_masked_srv.clone()
+                            } else if raw_url.contains("198.51.100.1:8001") {
+                                px_a_masked_srv.clone()
+                            } else {
+                                raw_url.clone()
+                            };
+                            *sidecar_proxy_bg.lock() = masked.clone();
+                            patch_history_bg.lock().push(raw_url);
+                            let resp = serde_json::json!({
+                                "account": { "id": "acc_1", "busy": false, "proxy": masked }
+                            })
+                            .to_string();
+                            write_http_json_test(&mut stream, "200 OK", &resp);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let session = crate::muse_sidecar::SidecarSession {
+            port: srv_port,
+            api_key: "k".into(),
+        };
+        let (tx_midflight, rx_midflight) = std::sync::mpsc::channel::<()>();
+        let db_calls = std::sync::atomic::AtomicUsize::new(0);
+        let db_path_upd = db_path.clone();
+        let px_b_id = px_b.id.clone();
+
+        let list_handle = std::thread::spawn({
+            let session_list = session.clone();
+            let db_path_list = db_path.clone();
+            move || {
+                rx_midflight.recv_timeout(Duration::from_secs(3)).unwrap();
+                muse_list_accounts_with_session_and_db(&session_list, || {
+                    crate::proxies::open_db_at(&db_path_list)
+                })
+            }
+        });
+
+        let upd_res = muse_update_account_with_session_and_db(
+            "acc_1".into(),
+            None,
+            None,
+            None,
+            Some(px_b_id.clone()),
+            || Ok((session.port, session.api_key.clone())),
+            || {
+                let n = db_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    // Right after sidecar PATCH to ProxyB and BEFORE DB commit to ProxyB:
+                    // trigger concurrent muse_list_accounts; it must wait for proxy_mutation_lock.
+                    let _ = tx_midflight.send(());
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+                crate::proxies::open_db_at(&db_path_upd)
+            },
+        )
+        .expect("muse_update_account succeeds");
+        assert_eq!(
+            upd_res["account"]["proxy_id"].as_str(),
+            Some(px_b_id.as_str())
+        );
+
+        let list_res = list_handle.join().unwrap().expect("muse_list_accounts succeeds");
+        assert_eq!(
+            list_res["data"][0]["proxy_id"].as_str(),
+            Some(px_b_id.as_str())
+        );
+        assert_eq!(
+            list_res["data"][0]["proxy"].as_str(),
+            Some(px_b.to_masked_url().as_str())
+        );
+
+        let patches = patch_history.lock().clone();
+        assert_eq!(
+            patches.len(),
+            1,
+            "muse_list_accounts must NOT send a revert PATCH during in-flight update: {patches:?}"
+        );
+        assert_eq!(*sidecar_proxy.lock(), px_b.to_masked_url());
+
+        stop_srv.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_remap_reference_image_migrates_legacy_bare_key_and_logs() {
+        let dir = temp_proj("remap_legacy_bare");
+        std::fs::write(dir.join("input").join("old.png"), b"png1").unwrap();
+        std::fs::write(dir.join("input").join("new.png"), b"png2").unwrap();
+        std::fs::write(dir.join("image_out").join("old_gen.png"), b"gen_img").unwrap();
+        std::fs::write(dir.join("video_out").join("old_gen.mp4"), b"gen_vid").unwrap();
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[Row {
+                row_no: 2,
+                anh_tham_chieu: "old.png".into(),
+                promt_tao_image: "prompt img".into(),
+                promt_tao_video: "prompt vid".into(),
+                anh_da_tao: "old_gen.png".into(),
+                video_da_tao: "old_gen.mp4".into(),
+                trang_thai: "Đã tạo video".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        let expected_old_key = prompts_csv::row_key_of("old.png", "prompt img", "prompt vid");
+        {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, finished_at, total_rows, done_count, error_count)
+                 VALUES ('chung', 'hoan_tat', '2026-11-18T01:00:00Z', '2026-11-18T01:02:00Z', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            // Seed v1.4.0 bare-image job, file_refs, and logs (even though CSV row has prompts -> expected_old_key has #hash)
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash)
+                 VALUES (?1, 'old.png', 2, 'da_tao_video', 'xong', 'xong', ?2, ?3)",
+                rusqlite::params![rid, engine::sha2hex("prompt img"), engine::sha2hex("prompt vid")],
+            )
+            .unwrap();
+            let jid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, 'old.png', 'anh', 'old_gen.png', 'image_out/old_gen.png', 1, 1, '2026-11-18T01:00:30Z')",
+                rusqlite::params![jid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, 'old.png', 'video', 'old_gen.mp4', 'video_out/old_gen.mp4', 1, 1, '2026-11-18T01:01:30Z')",
+                rusqlite::params![jid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO logs(ts, level, run_id, row_key, step, message)
+                 VALUES ('2026-11-18T01:01:00Z', 'info', ?1, 'old.png', 'B2', 'legacy log')",
+                rusqlite::params![rid],
+            )
+            .unwrap();
+        }
+
+        // Caller passes the hashed row_key (as UI does) when remapping to new.png
+        let remapped = remap_reference_image_at(&dir, &expected_old_key, "new.png").unwrap();
+        let new_key = prompts_csv::row_key_of("new.png", "prompt img", "prompt vid");
+        assert_eq!(remapped.row.row_key, new_key);
+        assert_eq!(remapped.row.status, "Đã tạo video");
+        assert_eq!(remapped.row.image_file, "old_gen.png");
+        assert_eq!(remapped.row.video_file, "old_gen.mp4");
+        assert_eq!(remapped.files.len(), 2);
+
+        let conn = crate::state_db::open(&dir).unwrap();
+        let old_jobs_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE LOWER(row_key) = 'old.png'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_jobs_cnt, 0);
+        let new_job_status: String = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_job_status, "da_tao_video");
+        let new_refs_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_refs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_refs_cnt, 2);
+        let new_logs_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_logs_cnt, 1);
+
+        // Same-key remap branch (e.g. legacy 'new.png' bare row_key migrated on same-image remap)
+        conn.execute(
+            "INSERT INTO logs(ts, level, row_key, step, message) VALUES ('2026-11-18T01:02:00Z', 'info', 'new.png', 'B3', 'bare log')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let same_remapped = remap_reference_image_at(&dir, &new_key, "new.png").unwrap();
+        assert_eq!(same_remapped.row.row_key, new_key);
+        let conn2 = crate::state_db::open(&dir).unwrap();
+        let migrated_logs: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_logs, 2);
+
+        drop(conn2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_csv_locked_aborts_before_state_db_commit_in_version_reset_and_skip() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = temp_proj("csv_lock_no_db_split_brain");
+        std::fs::write(dir.join("input").join("item.png"), b"png").unwrap();
+        std::fs::write(dir.join("image_out").join("item_gen.png"), b"v1").unwrap();
+        std::fs::write(dir.join("image_out").join("item_gen_v2.png"), b"v2").unwrap();
+
+        let csv_path = dir.join("prompts.csv");
+        prompts_csv::write_all(
+            &csv_path,
+            &[
+                Row {
+                    row_no: 2,
+                    anh_tham_chieu: "item.png".into(),
+                    promt_tao_image: "p_img".into(),
+                    promt_tao_video: "p_vid".into(),
+                    anh_da_tao: "item_gen_v2.png".into(),
+                    trang_thai: "Lỗi tạo video".into(),
+                    ghi_chu_loi: "old error".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 3,
+                    anh_tham_chieu: "fresh.png".into(),
+                    promt_tao_image: "f_img".into(),
+                    promt_tao_video: "f_vid".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let item_key = prompts_csv::row_key_of("item.png", "p_img", "p_vid");
+        let fresh_key = prompts_csv::row_key_of("fresh.png", "f_img", "f_vid");
+        let item_job_id = {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-20T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash, video_task_id, attempts_count, last_error)
+                 VALUES (?1, ?2, 2, 'loi_tao_video', 'xong', 'loi', 'h_img', 'h_vid', 'task_abc', 2, 'boom')",
+                rusqlite::params![rid, item_key],
+            )
+            .unwrap();
+            let jid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, ?2, 'anh', 'item_gen.png', 'image_out/item_gen.png', 1, 0, '2026-11-20T00:00:01Z')",
+                rusqlite::params![jid, item_key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, ?2, 'anh', 'item_gen_v2.png', 'image_out/item_gen_v2.png', 2, 1, '2026-11-20T00:00:02Z')",
+                rusqlite::params![jid, item_key],
+            )
+            .unwrap();
+            jid
+        };
+
+        // Hold FILE_SHARE_READ-only Windows handle (no write/delete share, matching Excel lock):
+        // read_all succeeds, rename fails with CSV_LOCKED.
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&csv_path)
+            .expect("acquire exclusive write/delete lock on prompts.csv");
+
+        let e_ver = set_current_file_version_at(&dir, &item_key, "image", 1)
+            .err()
+            .expect("set_current_file_version_at must fail on locked csv");
+        assert_eq!(e_ver.code, "CSV_LOCKED");
+
+        let e_reset = reset_row_status_at(&dir, &item_key)
+            .err()
+            .expect("reset_row_status_at must fail on locked csv");
+        assert_eq!(e_reset.code, "CSV_LOCKED");
+
+        let e_skip_existing = skip_row_at(&dir, &item_key)
+            .err()
+            .expect("skip_row_at existing must fail on locked csv");
+        assert_eq!(e_skip_existing.code, "CSV_LOCKED");
+
+        let e_skip_fresh = skip_row_at(&dir, &fresh_key)
+            .err()
+            .expect("skip_row_at fresh must fail on locked csv");
+        assert_eq!(e_skip_fresh.code, "CSV_LOCKED");
+
+        drop(lock_file);
+
+        // Verify state.db is completely untouched across file_refs, jobs, and runs
+        let conn = crate::state_db::open(&dir).unwrap();
+        let cur_ver: i64 = conn
+            .query_row(
+                "SELECT version FROM file_refs WHERE row_key = ?1 AND kind = 'anh' AND is_current = 1",
+                rusqlite::params![item_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cur_ver, 2, "file_refs.is_current must stay at v2");
+
+        let (st, img_st, vid_st, task_id, attempts, err_msg): (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, image_status, video_status, video_task_id, attempts_count, last_error FROM jobs WHERE id = ?1",
+                rusqlite::params![item_job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(st, "loi_tao_video");
+        assert_eq!(img_st, "xong");
+        assert_eq!(vid_st, "loi");
+        assert_eq!(task_id.as_deref(), Some("task_abc"));
+        assert_eq!(attempts, 2);
+        assert_eq!(err_msg.as_deref(), Some("boom"));
+
+        let fresh_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE row_key = ?1",
+                rusqlite::params![fresh_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_jobs, 0, "skip_row_at must not insert job on CSV_LOCKED");
+        let runs_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs_count, 1, "skip_row_at must not insert seed run on CSV_LOCKED");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shutdown_app_state_orders_stop_join_and_recover_with_bounded_wait() {
+        let dir = temp_proj("shutdown_order");
+        let run_id = {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-11-20T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+                 VALUES (?1, 'k.png', 2, 'dang_cho', 'dang_chay', 'chua_chay')",
+                rusqlite::params![rid],
+            )
+            .unwrap();
+            rid
+        };
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let state = AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(true),
+            exit_requested: AtomicBool::new(false),
+            active_run_id: AtomicI64::new(run_id),
+            stop_flag: parking_lot::RwLock::new(Some(Arc::clone(&stop_flag))),
+            engine_thread: parking_lot::Mutex::new(None),
+        };
+
+        let worker_stop = Arc::clone(&stop_flag);
+        let worker_events = Arc::clone(&events);
+        let worker_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_events.lock().push("worker_saw_stop".into());
+            std::thread::sleep(Duration::from_millis(25));
+            // Must still be 'dang_chay' until worker finishes and shutdown runs recover_interrupted_runs
+            let conn = crate::state_db::open(&worker_dir).unwrap();
+            let st: String = conn
+                .query_row(
+                    "SELECT status FROM runs WHERE id = ?1",
+                    rusqlite::params![run_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(st, "dang_chay", "recover_interrupted_runs must wait for engine_thread");
+            worker_events.lock().push("worker_finished".into());
+        });
+        *state.engine_thread.lock() = Some(handle);
+
+        let quit_events = Arc::clone(&events);
+        shutdown_app_state_with(&state, true, Duration::from_secs(2), move || {
+            quit_events.lock().push("quit_sidecar".into());
+        });
+
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert!(state.engine_thread.lock().is_none());
+        assert_eq!(
+            *events.lock(),
+            vec![
+                "worker_saw_stop".to_string(),
+                "worker_finished".to_string(),
+                "quit_sidecar".to_string()
+            ]
+        );
+        let conn = crate::state_db::open(&dir).unwrap();
+        let recovered_status: String = conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_status, "gian_doan");
+
+        // Bounded wait: hung thread must not block shutdown beyond wait_timeout
+        let (tx_release, rx_release) = std::sync::mpsc::channel::<()>();
+        let hung = std::thread::spawn(move || {
+            let _ = rx_release.recv_timeout(Duration::from_secs(2));
+        });
+        *state.engine_thread.lock() = Some(hung);
+        let t0 = Instant::now();
+        shutdown_app_state_with(&state, true, Duration::from_millis(50), || {});
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "shutdown wait on hung engine_thread must be bounded"
+        );
+        let _ = tx_release.send(());
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_begin_run_and_update_restart_reject_when_exit_requested() {
+        let dir = temp_proj("begin_run_exit_guard");
+        let state = AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(true),
+            active_run_id: AtomicI64::new(0),
+            stop_flag: parking_lot::RwLock::new(None),
+            engine_thread: parking_lot::Mutex::new(None),
+        };
+
+        let err = try_begin_run(&state).unwrap_err();
+        assert_eq!(err.code, "APP_EXITING");
+        assert!(
+            !state.running.load(Ordering::SeqCst),
+            "running must remain false when exit_requested is true"
+        );
+
+        // If a run is already stopping during exit, try_begin_run refuses without clearing running
+        state.running.store(true, Ordering::SeqCst);
+        let exiting_while_running = try_begin_run(&state).unwrap_err();
+        assert_eq!(exiting_while_running.code, "APP_EXITING");
+        assert!(state.running.load(Ordering::SeqCst));
+
+        // If exit_requested was already true, finish_app_update_restart_with rejects without restarting or clearing exit_requested
+        let mut stopped = false;
+        let mut restarted = false;
+        let already_exiting_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(already_exiting_err.code, "APP_EXITING");
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(!stopped);
+        assert!(!restarted);
+
+        state.running.store(false, Ordering::SeqCst);
+        let already_exiting_idle_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(already_exiting_idle_err.code, "APP_EXITING");
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(!stopped);
+        assert!(!restarted);
+
+        // When not exiting, try_begin_run sets running=true and blocks concurrent runs & update restart
+        state.exit_requested.store(false, Ordering::SeqCst);
+        try_begin_run(&state).expect("try_begin_run succeeds when idle and not exiting");
+        assert!(state.running.load(Ordering::SeqCst));
+
+        let dup_err = try_begin_run(&state).unwrap_err();
+        assert_eq!(dup_err.code, "RUN_IN_PROGRESS");
+
+        let upd_err = finish_app_update_restart_with(
+            &state,
+            || stopped = true,
+            || restarted = true,
+        )
+        .unwrap_err();
+        assert_eq!(upd_err.code, "RUN_IN_PROGRESS");
+        assert!(
+            !state.exit_requested.load(Ordering::SeqCst),
+            "exit_requested must roll back to false when update restart aborts due to RUN_IN_PROGRESS"
+        );
+        assert!(!stopped);
+        assert!(!restarted);
+
+        // Once idle, finish_app_update_restart_with locks exit_requested=true BEFORE stop_for_quit and restart
+        state.running.store(false, Ordering::SeqCst);
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<&'static str>::new()));
+        let ev_stop = Arc::clone(&events);
+        let ev_restart = Arc::clone(&events);
+        let ok = finish_app_update_restart_with(
+            &state,
+            || {
+                assert!(
+                    state.exit_requested.load(Ordering::SeqCst),
+                    "exit_requested must be true before stop_for_quit"
+                );
+                let race_err = try_begin_run(&state).unwrap_err();
+                assert_eq!(race_err.code, "APP_EXITING");
+                assert!(!state.running.load(Ordering::SeqCst));
+                ev_stop.lock().push("stop_sidecar");
+            },
+            || {
+                assert!(
+                    state.exit_requested.load(Ordering::SeqCst),
+                    "exit_requested must remain true before app.restart"
+                );
+                ev_restart.lock().push("restart_app");
+            },
+        )
+        .expect("update restart succeeds when idle");
+        assert!(ok);
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert_eq!(*events.lock(), vec!["stop_sidecar", "restart_app"]);
+
+        let post_upd_err = try_begin_run(&state).unwrap_err();
+        assert_eq!(post_upd_err.code, "APP_EXITING");
+        assert!(!state.running.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_try_begin_run_and_update_restart_are_mutually_exclusive_under_race() {
+        let dir = temp_proj("begin_run_update_race");
+        let state = Arc::new(AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
+            active_run_id: AtomicI64::new(0),
+            stop_flag: parking_lot::RwLock::new(None),
+            engine_thread: parking_lot::Mutex::new(None),
+        });
+
+        for _ in 0..64 {
+            state.running.store(false, Ordering::SeqCst);
+            state.exit_requested.store(false, Ordering::SeqCst);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let s1 = Arc::clone(&state);
+            let b1 = Arc::clone(&barrier);
+            let t_run = std::thread::spawn(move || {
+                b1.wait();
+                try_begin_run(&s1)
+            });
+
+            let s2 = Arc::clone(&state);
+            let b2 = Arc::clone(&barrier);
+            let t_upd = std::thread::spawn(move || {
+                b2.wait();
+                begin_app_update_restart(&s2)
+            });
+
+            let run_res = t_run.join().unwrap();
+            let upd_res = t_upd.join().unwrap();
+
+            assert!(
+                !(run_res.is_ok() && upd_res.is_ok()),
+                "try_begin_run and begin_app_update_restart must never both succeed"
+            );
+            if upd_res.is_ok() {
+                assert!(state.exit_requested.load(Ordering::SeqCst));
+                assert!(!state.running.load(Ordering::SeqCst));
+            }
+            if run_res.is_ok() {
+                assert!(state.running.load(Ordering::SeqCst));
+                assert!(!state.exit_requested.load(Ordering::SeqCst));
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

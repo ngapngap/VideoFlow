@@ -98,9 +98,15 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("VideoFlow Desktop khởi tạo thất bại")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                muse_sidecar::stop_for_quit();
+                use tauri::Manager;
+                let st = app.state::<AppState>();
+                if !st.exit_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                    commands::shutdown_app_state(&st, true);
+                } else {
+                    muse_sidecar::stop_for_quit();
+                }
             }
         });
 }

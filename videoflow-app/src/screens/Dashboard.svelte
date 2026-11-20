@@ -14,6 +14,7 @@
     pendingRowsFilter,
     endpointStatus,
     confirmStartEnabled,
+    beginProjectSwitch,
     resetProjectRunState,
     showToast,
     formatApiError,
@@ -132,6 +133,7 @@
     try {
       const dir = await api.pick_folder();
       if (!dir) return;
+      beginProjectSwitch();
       const probe = await api.probe_folder(dir);
       const writeItem = probe.checklist.find((i) => i.key === "write");
       if (writeItem && !writeItem.ok) {
@@ -140,6 +142,7 @@
       }
       // Mục 6.7b: nếu đã đủ cấu trúc và prompts.csv hợp lệ thì mở thẳng không hỏi ghi đè
       if (probe.has_full_structure && (probe.prompts_valid ?? true)) {
+        beginProjectSwitch();
         const info = await api.load_project(dir);
         resetProjectRunState();
         project.set(info);
@@ -175,6 +178,7 @@
   async function confirmOnboardingCreate(): Promise<void> {
     if (!probedPath || !probeInfo || probeApplying) return;
     probeApplying = true;
+    beginProjectSwitch();
     try {
       const info =
         probeInfo.has_full_structure && probeInfo.prompts_valid !== false && probeMode === "giu_lai"

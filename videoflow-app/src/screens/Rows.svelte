@@ -31,6 +31,12 @@
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
+  import {
+    createSeqGuard,
+    isRowLockedForBatch,
+    pruneSelectedKeys,
+    runWithLoadingGuard,
+  } from "../lib/asyncGuard";
 
   const filterChips: { key: string; label: string }[] = [
     { key: "Tất cả", label: "Tất cả" },
@@ -124,10 +130,16 @@
   let panOriginY = 0;
 
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
-  let loadSeq = 0;
+  const loadGuard = createSeqGuard();
   let mounted = false;
+  let hasLoadedRows = false;
+  let lastPrunedMaxAttempts = get(maxAttemptsStore);
   let lastProjectPath: string | null = null;
   let lastTick = -1;
+
+  $: if (mounted && hasLoadedRows && $maxAttemptsStore !== lastPrunedMaxAttempts) {
+    pruneSelection($maxAttemptsStore);
+  }
 
   $: if (!$running) {
     stoppingRun = false;
@@ -192,6 +204,8 @@
     : "";
 
   // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
+  const videoModalGuard = createSeqGuard();
+  let destroyed = false;
   let videoModalOpen = false;
   let videoModalDetail: RowDetail | null = null;
   let videoModalAbsPath: string | null = null;
@@ -266,12 +280,12 @@
     selectedRows.set(new Set(next));
   }
 
-  function isRowLockedForBatch(r: RowSummary, maxAtt: number): boolean {
-    return (
-      r.status === "Đã tạo video" ||
-      r.status === "Bỏ qua" ||
-      (r.attempts_count >= maxAtt && !r.prompt_modified)
-    );
+  function pruneSelection(maxAtt: number): void {
+    lastPrunedMaxAttempts = maxAtt;
+    const pruned = pruneSelectedKeys(selected, rows, maxAtt);
+    if (pruned !== selected) {
+      updateSelection(pruned);
+    }
   }
 
   function isRowOrphan(r: RowSummary, brokenMap: Record<string, boolean>): boolean {
@@ -297,6 +311,10 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
+    videoModalGuard.invalidate();
+    ++detailReqSeq;
+    loadGuard.invalidate();
     if (searchTimer) clearTimeout(searchTimer);
     if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
     if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
@@ -319,6 +337,7 @@
     if (curPath !== lastProjectPath) {
       lastProjectPath = curPath;
       lastTick = curTick;
+      hasLoadedRows = false;
       const resetUi = get(rowsUiState);
       page = resetUi.page || 1;
       pageSize = resetUi.pageSize || pageSize;
@@ -327,10 +346,16 @@
       viewMode = resetUi.viewMode || viewMode;
       updateSelection(new Set());
       forceCloseDrawer();
+      closeVideoModal();
+      videoModalDetail = null;
+      videoModalAbsPath = null;
       brokenThumbs = {};
       if (curPath) {
         void load();
       } else {
+        loadGuard.invalidate();
+        hasLoadedRows = false;
+        loading = false;
         rows = [];
         total = 0;
         pageCount = 1;
@@ -342,7 +367,7 @@
       brokenThumbs = {};
       if (curPath) {
         void load({ silent: true });
-        if (detail) {
+        if (detail && !detailLoading) {
           void refreshOpenDetailSilently(detail.row.row_key);
         }
       }
@@ -369,53 +394,59 @@
 
   export async function load(opts?: { silent?: boolean }): Promise<void> {
     if (!$project) {
+      loadGuard.invalidate();
+      hasLoadedRows = false;
+      loading = false;
       rows = [];
       total = 0;
       pageCount = 1;
       counts = {};
       return;
     }
-    const seq = ++loadSeq;
-    if (!opts?.silent) {
-      loading = true;
+    const silent = Boolean(opts?.silent);
+    if (!silent) {
       brokenThumbs = {};
       assetCacheBust.set(Date.now());
     }
-    try {
-      const statusArg = chip === "Tất cả" ? undefined : chip;
-      const queryArg = search.trim() ? search.trim() : undefined;
-      const res = await api.get_rows(statusArg, queryArg, page, pageSize);
-      if (seq !== loadSeq) return;
+    await runWithLoadingGuard(
+      loadGuard,
+      silent,
+      (nextLoading) => {
+        loading = nextLoading;
+      },
+      async (seq) => {
+        const statusArg = chip === "Tất cả" ? undefined : chip;
+        const queryArg = search.trim() ? search.trim() : undefined;
+        const res = await api.get_rows(statusArg, queryArg, page, pageSize);
+        if (!loadGuard.isCurrent(seq)) return;
 
-      const nextPageCount = Math.max(1, res.page_count || 1);
-      if (res.rows.length === 0 && page > nextPageCount) {
-        page = nextPageCount;
-        syncUiState();
-        const retryRes = await api.get_rows(statusArg, queryArg, page, pageSize);
-        if (seq !== loadSeq) return;
-        rows = retryRes.rows;
-        total = retryRes.total;
-        pageCount = Math.max(1, retryRes.page_count || 1);
-        counts = retryRes.status_counts ?? counts;
-      } else {
-        rows = res.rows;
-        total = res.total;
-        pageCount = nextPageCount;
-        counts = res.status_counts ?? counts;
-      }
-      loadError = null;
-    } catch (e) {
-      if (seq === loadSeq) {
+        const nextPageCount = Math.max(1, res.page_count || 1);
+        if (res.rows.length === 0 && page > nextPageCount) {
+          page = nextPageCount;
+          syncUiState();
+          const retryRes = await api.get_rows(statusArg, queryArg, page, pageSize);
+          if (!loadGuard.isCurrent(seq)) return;
+          rows = retryRes.rows;
+          total = retryRes.total;
+          pageCount = Math.max(1, retryRes.page_count || 1);
+          counts = retryRes.status_counts ?? counts;
+        } else {
+          rows = res.rows;
+          total = res.total;
+          pageCount = nextPageCount;
+          counts = res.status_counts ?? counts;
+        }
+        hasLoadedRows = true;
+        pruneSelection($maxAttemptsStore);
+        loadError = null;
+      },
+      (e) => {
         loadError = formatApiError(e);
-        if (!opts?.silent) {
+        if (!silent) {
           showToast("error", loadError);
         }
       }
-    } finally {
-      if (seq === loadSeq && !opts?.silent) {
-        loading = false;
-      }
-    }
+    );
   }
 
   async function refreshOpenDetailSilently(rowKey: string): Promise<void> {
@@ -527,7 +558,7 @@
 
   // Mở / đóng Drawer có bảo vệ sequence & kiểm tra prompt chưa lưu
   function requestOpenDetail(rowKey: string, preferredTab?: PreviewTab): void {
-    if (detail && detail.row.row_key === rowKey && !promptsDirty) {
+    if (detail && detail.row.row_key === rowKey) {
       if (preferredTab) previewTab = preferredTab;
       return;
     }
@@ -862,6 +893,9 @@
       if (detail && detail.row.row_key === keyToDelete) {
         forceCloseDrawer();
       }
+      if (videoModalDetail?.row.row_key === keyToDelete) {
+        closeVideoModal();
+      }
       const next = new Set(selected);
       next.delete(keyToDelete);
       updateSelection(next);
@@ -1102,6 +1136,7 @@
 
   function openVideoModal(d: RowDetail | null | undefined): void {
     if (!d) return;
+    videoModalGuard.invalidate();
     videoModalDetail = d;
     const sameDetail = detail?.row.row_key === d.row.row_key;
     videoModalAbsPath =
@@ -1132,15 +1167,31 @@
       openVideoModal(detail);
       return;
     }
+    const seq = videoModalGuard.next();
+    const expectedProjectPath = $project?.path ?? null;
     try {
       const d = await api.get_row_detail(rowKey);
+      if (
+        destroyed ||
+        !videoModalGuard.isCurrent(seq) ||
+        ($project?.path ?? null) !== expectedProjectPath
+      ) {
+        return;
+      }
       openVideoModal(d);
     } catch (e) {
-      showToast("error", formatApiError(e));
+      if (
+        !destroyed &&
+        videoModalGuard.isCurrent(seq) &&
+        ($project?.path ?? null) === expectedProjectPath
+      ) {
+        showToast("error", formatApiError(e));
+      }
     }
   }
 
   function closeVideoModal(): void {
+    videoModalGuard.invalidate();
     if (videoPlayerEl) {
       try {
         videoPlayerEl.pause();
@@ -2303,17 +2354,20 @@
         <details class="drawer-section" open={detail.files.length > 0}>
           <summary class="section-summary">
             <span>Phiên bản sản phẩm ({detail.files.length})</span>
-            {#if canCompareVersions}
+          </summary>
+          {#if canCompareVersions}
+            <div class="section-actions-header">
+              <span class="section-actions-note">Đối chiếu trực quan các phiên bản</span>
               <button
                 type="button"
                 class="btn-secondary compare-trigger-btn"
-                on:click|preventDefault|stopPropagation={() => openCompareModal()}
+                on:click={() => openCompareModal()}
               >
                 <Icons name="columns" size={13} />
                 So sánh phiên bản
               </button>
-            {/if}
-          </summary>
+            </div>
+          {/if}
           {#if detail.files.length > 0}
             <div class="version-list">
               {#each detail.files as f (`${f.kind}-${f.version}-${f.file_name}`)}
@@ -2346,6 +2400,7 @@
                     <button
                       type="button"
                       class="btn-ghost icon-mini"
+                      aria-label={`Xem phiên bản v${f.version} (${f.file_name}) trong khung xem trước`}
                       title="Xem phiên bản này trong khung xem trước"
                       on:click={() => previewVersionFile(f)}
                     >
@@ -2354,6 +2409,7 @@
                     <button
                       type="button"
                       class="btn-ghost icon-mini"
+                      aria-label={`Hiện ${f.file_name} trong thư mục Explorer`}
                       title="Hiện file trong thư mục Explorer"
                       on:click={() => revealInExplorer(f.abs_path)}
                     >
@@ -4186,6 +4242,19 @@
   }
   .section-summary::-webkit-details-marker {
     display: none;
+  }
+  .section-actions-header {
+    padding: 6px 12px;
+    border-top: 1px solid #eef2f5;
+    background: var(--c-surface-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .section-actions-note {
+    font-size: 11px;
+    color: var(--c-muted);
   }
   .compare-trigger-btn {
     height: 24px;

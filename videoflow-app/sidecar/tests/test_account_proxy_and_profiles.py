@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
-from muse2api.accounts.model import Account
+from muse2api.accounts.model import Account, mask_proxy_url
 from muse2api.accounts.pool import AccountPool
 from muse2api.accounts.store import JsonAccountStore
 from muse2api.api.schemas import AccountCreate, AccountUpdate
@@ -459,5 +460,244 @@ def test_account_public_masks_proxy_credentials_and_strips_auth_tokens():
     assert "auth_headers" not in pub["meta"]
     assert "auth_tokens" not in pub["meta"]
     assert pub["meta"]["quota"]["plan"] == "Pro"
+
+
+@pytest.mark.asyncio
+async def test_chromium_process_uses_local_relay_for_auth_socks5_and_socks5h(tmp_path: Path):
+    for proxy_url, expect_relay in [
+        ("socks5://alice:s3cr3t@10.0.0.1:1080", True),
+        ("socks5h://10.0.0.1:1080", True),
+        ("socks5://10.0.0.1:1080", False),
+    ]:
+        profile_dir = tmp_path / f"profile_{expect_relay}_{proxy_url.split(':')[0]}"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        proc = ChromiumProcess(
+            executable="msedge.exe",
+            port=19310,
+            profile_dir=profile_dir,
+            headless=True,
+            proxy=proxy_url,
+        )
+        launched_args: list[str] = []
+
+        async def fake_exec(*args, _buf=launched_args, **kwargs):
+            _buf.extend(args)
+            m = MagicMock()
+            m.returncode = None
+            m.terminate = MagicMock()
+            m.wait = AsyncMock(return_value=0)
+            return m
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            patch("muse2api.drivers.browser.chromium._kill_stale_browsers", return_value=0),
+            patch("muse2api.drivers.browser.chromium._is_port_in_use", return_value=False),
+            patch.object(
+                proc,
+                "browser_ws_url",
+                new=AsyncMock(return_value="ws://127.0.0.1:19310/devtools/browser/1"),
+            ),
+        ):
+            ws = await proc.start()
+            assert ws == "ws://127.0.0.1:19310/devtools/browser/1"
+
+        proxy_args = [a for a in launched_args if a.startswith("--proxy-server=")]
+        assert len(proxy_args) == 1
+        assert "s3cr3t" not in " ".join(launched_args)
+        if expect_relay:
+            assert proxy_args[0].startswith("--proxy-server=http://127.0.0.1:")
+            assert proc._proxy_relay is not None
+        else:
+            assert proxy_args[0] == f"--proxy-server={proxy_url}"
+            assert proc._proxy_relay is None
+
+        await proc.stop()
+        assert proc._proxy_relay is None
+
+
+@pytest.mark.asyncio
+async def test_chromium_process_refuses_blind_attach_and_reallocates_occupied_port(
+    tmp_path: Path,
+):
+    profile_dir = tmp_path / "profile_occupied"
+    profile_dir.mkdir(parents=True)
+
+    async def foreign_cdp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        body = (
+            f'{{"webSocketDebuggerUrl":"ws://127.0.0.1:{busy_port}/devtools/browser/FOREIGN"}}'
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    foreign_srv = await asyncio.start_server(foreign_cdp, "127.0.0.1", 0)
+    busy_port = foreign_srv.sockets[0].getsockname()[1]
+
+    proc = ChromiumProcess(
+        executable="msedge.exe",
+        port=busy_port,
+        profile_dir=profile_dir,
+        headless=True,
+    )
+    launched_args: list[str] = []
+
+    async def fake_exec(*args, **kwargs):
+        launched_args.extend(args)
+        m = MagicMock()
+        m.returncode = None
+        m.terminate = MagicMock()
+        m.wait = AsyncMock(return_value=0)
+        return m
+
+    async def own_ws_url() -> str:
+        return f"ws://127.0.0.1:{proc.port}/devtools/browser/OWN"
+
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+            patch("muse2api.drivers.browser.chromium._kill_stale_browsers", return_value=0),
+            patch.object(proc, "browser_ws_url", side_effect=own_ws_url),
+        ):
+            ws = await proc.start()
+
+        assert proc.port != busy_port
+        assert ws == f"ws://127.0.0.1:{proc.port}/devtools/browser/OWN"
+        assert "FOREIGN" not in ws
+        assert f"--remote-debugging-port={proc.port}" in launched_args
+        await proc.stop()
+    finally:
+        foreign_srv.close()
+        await foreign_srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chromium_process_launch_checks_returncode_before_ws_url(tmp_path: Path):
+    profile_dir = tmp_path / "profile_exited"
+    profile_dir.mkdir(parents=True)
+    proc = ChromiumProcess(
+        executable="msedge.exe",
+        port=19320,
+        profile_dir=profile_dir,
+        headless=True,
+    )
+    m_proc = MagicMock()
+    m_proc.returncode = 1
+    ws_mock = AsyncMock(return_value="ws://127.0.0.1:19320/devtools/browser/FOREIGN")
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=m_proc),
+        patch.object(proc, "browser_ws_url", new=ws_mock),
+    ):
+        result = await proc._launch()
+
+    assert result is None
+    ws_mock.assert_not_awaited()
+
+
+def test_mask_proxy_url_edge_cases():
+    assert mask_proxy_url(None) is None
+    assert mask_proxy_url("") is None
+    assert mask_proxy_url("   ") is None
+
+    # @ inside password must not leak suffix
+    assert mask_proxy_url("http://user:p@ss@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+    assert mask_proxy_url("http://user:p@ss:123@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+
+    # IPv6 brackets preserved (auth & unauth, with & without port)
+    assert mask_proxy_url("http://user:p@ss@[::1]:8080") == "http://***@[::1]:8080"
+    assert (
+        mask_proxy_url("socks5h://user:pass@[2001:db8::1]:1080")
+        == "socks5h://***@[2001:db8::1]:1080"
+    )
+    assert mask_proxy_url("http://[::1]:8080") == "http://[::1]:8080"
+    assert mask_proxy_url("socks5h://[::1]") == "socks5h://[::1]"
+
+    # Password-only, username-only, empty password, bare @
+    assert mask_proxy_url("http://:secret@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+    assert mask_proxy_url("http://alice@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+    assert mask_proxy_url("http://alice:@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+    assert mask_proxy_url("http://@10.0.0.1:8080") == "http://***@10.0.0.1:8080"
+
+    # Host casing preserved for Rust parity
+    assert (
+        mask_proxy_url("http://user:pass@Proxy.Example.COM:8080")
+        == "http://***@Proxy.Example.COM:8080"
+    )
+
+    # Path kept, query/fragment dropped
+    assert (
+        mask_proxy_url("http://user:pass@10.0.0.1:8080/proxy?token=secret#frag")
+        == "http://***@10.0.0.1:8080/proxy"
+    )
+
+    # Malformed / unparseable inputs return "***" without leaking credentials
+    for bad in (
+        "http://user:secret@[bad:8080",
+        "http://user:secret@10.0.0.1:99999",
+        "http://user:secret@",
+        "user:secret@10.0.0.1:8080",
+    ):
+        masked = mask_proxy_url(bad)
+        assert masked == "***"
+        assert "secret" not in masked
+
+
+def test_account_public_masks_at_password_and_ipv6():
+    acc = Account(
+        id="acc_ipv6",
+        proxy="socks5h://alice:p@ss:w0rd@[2001:db8::1]:1080",
+    )
+    pub = acc.public()
+    assert pub["proxy"] == "socks5h://***@[2001:db8::1]:1080"
+    assert "p@ss" not in str(pub)
+    assert "w0rd" not in str(pub)
+
+
+def test_proxy_url_validation_schemes_ipv6_and_control_chars():
+    for valid in (
+        None,
+        "",
+        "http://127.0.0.1:8080",
+        "https://user:pass@proxy.example.com:8443",
+        "socks5://10.0.0.1:1080",
+        "socks5h://user:p%40ss@[::1]:1080",
+        "http://[::1]",
+        "http://127.0.0.1:8080/",
+    ):
+        assert AccountCreate(proxy=valid).proxy == valid
+        assert AccountUpdate(proxy=valid).proxy == valid
+
+    for invalid in (
+        "socks4://127.0.0.1:1080",
+        "SOCKS4://127.0.0.1:1080",
+        "http://127.0.0.1:8080\r\n",
+        "http://user:pa\nss@10.0.0.1:8080",
+        "http://10.0.0.1\t:8080",
+        "http://10.0.0.1:8080\x00",
+        "http://10.0.0.1:8080\x1f",
+        "http://10.0.0.1:8080\x7f",
+        "http://127.0.0.1 :8080",
+        "http://user:p ass@127.0.0.1:8080",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:",
+        "http://::1:8080",
+        "http://[::1]extra:8080",
+        "http://[127.0.0.1]:8080",
+        "http://127.0.0.1:8080?x=1",
+        "http://127.0.0.1:8080#frag",
+        "http://127.0.0.1:8080/path",
+        "http://" + ("a" * 2045) + ":8080",
+    ):
+        with pytest.raises(ValidationError):
+            AccountCreate(proxy=invalid)
+        with pytest.raises(ValidationError):
+            AccountUpdate(proxy=invalid)
 
 

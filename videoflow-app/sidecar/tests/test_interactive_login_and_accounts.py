@@ -361,7 +361,7 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
         fake_cdp_instances.append(inst)
         return inst
 
-    upsert_spy = AsyncMock(wraps=test_services.pool.upsert)
+    try_update_spy = AsyncMock(wraps=test_services.pool.try_update)
     sess = InteractiveSession(acc.id, "login")
 
     with (
@@ -377,7 +377,7 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
         ),
         patch("muse2api.drivers.browser.interactive.CDPSession.connect", side_effect=fake_connect),
         patch("muse2api.drivers.browser.interactive.asyncio.sleep", new=AsyncMock()),
-        patch.object(test_services.pool, "upsert", upsert_spy),
+        patch.object(test_services.pool, "try_update", try_update_spy),
     ):
         await test_services.interactive._run_login_session(acc, sess)
 
@@ -385,13 +385,15 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
     assert acc.id in test_services.driver.released_accounts
     assert acc.id in test_services.driver.stale_accounts
 
-    # Verify --remote-debugging-address=127.0.0.1 was passed to create_subprocess_exec
+    # Verify --remote-debugging-address=127.0.0.1 and about:blank initial launch
     exec_args = mock_exec.call_args[0]
     assert "--remote-debugging-address=127.0.0.1" in exec_args
+    assert exec_args[-1] == "about:blank"
 
-    # Verify __Host- cookie injection had no domain and had secure=True
+    # Verify __Host- cookie injection had no domain and had secure=True, followed by Page.navigate
     assert len(fake_cdp_instances) == 1
-    set_cookie_calls = [p for m, p in fake_cdp_instances[0].calls if m == "Network.setCookie"]
+    calls = fake_cdp_instances[0].calls
+    set_cookie_calls = [p for m, p in calls if m == "Network.setCookie"]
     host_cookie = next(c for c in set_cookie_calls if c["name"] == "__Host-token")
     assert "domain" not in host_cookie
     assert host_cookie["secure"] is True
@@ -399,9 +401,14 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
     assert normal_cookie["domain"] == ".muse.ai"
     assert normal_cookie["secure"] is True
 
-    # Two identical loop iterations should deduplicate to only 1 pool.upsert call
+    nav_idx = next(i for i, (m, p) in enumerate(calls) if m == "Page.navigate")
+    last_cookie_idx = max(i for i, (m, _) in enumerate(calls) if m == "Network.setCookie")
+    assert last_cookie_idx < nav_idx
+    assert calls[nav_idx][1] == {"url": "https://muse.ai/"}
+
+    # Two identical loop iterations should deduplicate to only 1 pool.try_update call
     assert proc.get_cookies_calls == 2
-    assert upsert_spy.call_count == 1
+    assert try_update_spy.call_count == 1
 
     updated = test_services.pool.get(acc.id)
     assert updated.status == AccountStatus.ACTIVE

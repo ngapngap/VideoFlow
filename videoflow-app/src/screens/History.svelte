@@ -1,6 +1,6 @@
 <script lang="ts">
   // Màn hình Lịch sử (Wave 2 Full Option): lọc trạng thái/loại/ngày, Xuất CSV theo bộ lọc, Nhật ký + Xuất .log, Xem media trong app & phân trang chi tiết
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     project,
     running,
@@ -18,6 +18,7 @@
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
+  import { createSeqGuard, runWithLoadingGuard } from "../lib/asyncGuard";
 
   const runStatusChips: { label: string; value: string | undefined }[] = [
     { label: "Tất cả", value: undefined },
@@ -119,7 +120,7 @@
   let mounted = false;
   let lastProjectPath: string | null = null;
   let lastTick = -1;
-  let loadSeq = 0;
+  const loadGuard = createSeqGuard();
 
   $: hasActiveFilter = Boolean(runStatusFilter || kindFilter || dateFrom || dateTo);
 
@@ -160,6 +161,12 @@
     }
   });
 
+  onDestroy(() => {
+    loadGuard.invalidate();
+    ++runDetailSeq;
+    ++logsSeq;
+  });
+
   // Tự động nạp lại khi đổi dự án hoặc khi có sự kiện row_changed / run_finished
   $: if (mounted) {
     const curPath = $project?.path ?? null;
@@ -184,6 +191,8 @@
       if (curPath) {
         void load();
       } else {
+        loadGuard.invalidate();
+        loading = false;
         runs = [];
         total = 0;
         pageCount = 1;
@@ -193,7 +202,7 @@
       lastTick = curTick;
       if (curPath) {
         void load({ silent: true });
-        if (selectedRun) {
+        if (selectedRun && !detailLoading) {
           void refreshSelectedRunSilently(selectedRun.id);
         }
       }
@@ -202,42 +211,45 @@
 
   export async function load(opts?: { silent?: boolean }): Promise<void> {
     if (!$project) {
+      loadGuard.invalidate();
+      loading = false;
       runs = [];
       total = 0;
       pageCount = 1;
       stats7d = { runs_count: 0, done_rows: 0, error_rows: 0 };
       return;
     }
-    const seq = ++loadSeq;
-    if (!opts?.silent) {
-      loading = true;
-    }
-    try {
-      const res = await api.get_history(
-        page,
-        pageSize,
-        runStatusFilter,
-        kindFilter || undefined,
-        dateFrom || undefined,
-        dateTo || undefined
-      );
-      if (seq !== loadSeq) return;
-      runs = res.runs ?? [];
-      total = res.total ?? 0;
-      page = res.page ?? page;
-      pageCount = Math.max(1, res.page_count || 1);
-      if (res.stats_7d) {
-        stats7d = res.stats_7d;
+    const silent = Boolean(opts?.silent);
+    await runWithLoadingGuard(
+      loadGuard,
+      silent,
+      (nextLoading) => {
+        loading = nextLoading;
+      },
+      async (seq) => {
+        const res = await api.get_history(
+          page,
+          pageSize,
+          runStatusFilter,
+          kindFilter || undefined,
+          dateFrom || undefined,
+          dateTo || undefined
+        );
+        if (!loadGuard.isCurrent(seq)) return;
+        runs = res.runs ?? [];
+        total = res.total ?? 0;
+        page = res.page ?? page;
+        pageCount = Math.max(1, res.page_count || 1);
+        if (res.stats_7d) {
+          stats7d = res.stats_7d;
+        }
+      },
+      (e) => {
+        if (!silent) {
+          showToast("error", formatApiError(e));
+        }
       }
-    } catch (e) {
-      if (seq === loadSeq && !opts?.silent) {
-        showToast("error", formatApiError(e));
-      }
-    } finally {
-      if (seq === loadSeq && !opts?.silent) {
-        loading = false;
-      }
-    }
+    );
   }
 
   async function refreshSelectedRunSilently(runId: number): Promise<void> {
@@ -697,27 +709,26 @@
           </thead>
           <tbody>
             {#each runs as r (r.id)}
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-noninteractive-element-interactions -->
               <tr
                 class="run-row"
                 class:selected={selectedRun?.id === r.id}
                 on:click={() => openRun(r)}
-                on:keydown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    void openRun(r);
-                  }
-                }}
-                role="button"
-                tabindex="0"
               >
                 <td class="strong">
-                  <span class="run-id-cell">
+                  <button
+                    type="button"
+                    class="run-id-btn"
+                    aria-expanded={selectedRun?.id === r.id}
+                    aria-label={`Xem chi tiết lượt chạy #${r.id}`}
+                    on:click|stopPropagation={() => openRun(r)}
+                  >
                     <Icons
                       name={selectedRun?.id === r.id ? "chevron-down" : "chevron-right"}
                       size={14}
                     />
-                    #{r.id}
-                  </span>
+                    <span>#{r.id}</span>
+                  </button>
                 </td>
                 <td>
                   <span class="kind-pill">{kindLabel[r.kind] ?? r.kind}</span>
@@ -1420,10 +1431,25 @@
   .run-row.selected {
     background: var(--c-teal-light);
   }
-  .run-id-cell {
+  .run-id-btn {
     display: inline-flex;
     align-items: center;
     gap: 4px;
+    padding: 2px 4px;
+    margin: -2px -4px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+  .run-id-btn:hover {
+    color: var(--c-teal);
+  }
+  .run-id-btn:focus-visible {
+    outline: 2px solid var(--c-teal);
+    outline-offset: 2px;
   }
   .kind-pill {
     display: inline-flex;

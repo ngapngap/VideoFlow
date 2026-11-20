@@ -1,15 +1,31 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { api, type MuseAccount, type ProxyInput, type ProxyItem } from "../lib/api";
+  import { mergeSingleTestedProxy } from "../lib/asyncGuard";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
-  import { formatApiError, running, showToast } from "../lib/store";
+  import {
+    buildProxyInput,
+    formatHostPort,
+    isProxyBusy,
+    parseProxyPaste,
+    resolveLiveProxy,
+    validateProxyHost,
+  } from "../lib/proxyInput";
+  import {
+    formatApiError,
+    museAccounts,
+    refreshMuseState,
+    running,
+    showToast,
+    startMusePolling,
+  } from "../lib/store";
 
   let proxies: ProxyItem[] = [];
-  let accounts: MuseAccount[] = [];
   let loading = true;
   let loadSeq = 0;
   let destroyed = false;
+  let stopMusePolling: (() => void) | null = null;
 
   // Test states
   let testingIds = new Set<string>();
@@ -18,6 +34,8 @@
   // Add / Edit modal
   let formModalOpen = false;
   let editingId: string | null = null;
+  let editingHasPassword = false;
+  let clearPassword = false;
   let formName = "";
   let formKind: "http" | "socks5" = "http";
   let formHost = "";
@@ -34,32 +52,26 @@
   let deleting = false;
 
   onMount(() => {
+    stopMusePolling = startMusePolling();
     void loadData();
   });
 
   onDestroy(() => {
     destroyed = true;
+    stopMusePolling?.();
+    stopMusePolling = null;
   });
 
   async function loadData() {
     if (destroyed) return;
     const seq = ++loadSeq;
     try {
-      const pxList = await api.proxy_list();
+      const [pxList] = await Promise.all([
+        api.proxy_list(),
+        refreshMuseState({ force: true }),
+      ]);
       if (destroyed || seq !== loadSeq) return;
       proxies = pxList;
-
-      try {
-        const st = await api.muse_sidecar_status();
-        if (!destroyed && seq === loadSeq && st.sidecar.running) {
-          const accRes = await api.muse_list_accounts();
-          if (!destroyed && seq === loadSeq) {
-            accounts = accRes.data ?? [];
-          }
-        }
-      } catch {
-        // sidecar offline — vẫn hiển thị danh sách proxy bình thường
-      }
     } catch (e) {
       if (!destroyed && seq === loadSeq) {
         showToast("error", `Không thể tải danh sách proxy: ${formatApiError(e)}`);
@@ -71,7 +83,9 @@
     }
   }
 
-  $: accountMap = new Map(accounts.map((a) => [a.id, a]));
+  $: accountMap = new Map($museAccounts.map((a) => [a.id, a]));
+  $: liveDeleteTarget = resolveLiveProxy(deleteTarget, proxies);
+  $: deleteTargetBusy = isProxyBusy(liveDeleteTarget, $running, accountMap);
 
   // Map exit_ip -> danh sách account IDs đang dùng exit_ip đó (qua mọi proxy)
   $: exitIpAccountsMap = (() => {
@@ -90,27 +104,28 @@
     return m;
   })();
 
-  function isProxyBusy(p: ProxyItem): boolean {
-    if ($running) return true;
-    return p.assigned_account_ids.some((id) => accountMap.get(id)?.busy === true);
-  }
-
-  function accountDisplayName(accId: string): string {
-    const a = accountMap.get(accId);
+  function accountDisplayName(accId: string, accMap: Map<string, MuseAccount>): string {
+    const a = accMap.get(accId);
     return a?.label ? `${a.label} (${accId})` : accId;
   }
 
-  function getSharedIpConflict(p: ProxyItem): string[] {
+  function getSharedIpConflict(
+    p: ProxyItem,
+    ipMap: Map<string, { accId: string; label: string; proxyName: string }[]>
+  ): string[] {
+    if (p.assigned_account_ids.length === 0) return [];
     const ip = (p.exit_ip || "").trim();
     if (!ip) return [];
-    const entries = exitIpAccountsMap.get(ip) ?? [];
+    const entries = ipMap.get(ip) ?? [];
     if (entries.length <= 1) return [];
     return entries.map((e) => e.label);
   }
 
   function openCreateModal() {
-    if ($running) return;
+    if ($running || testingAll) return;
     editingId = null;
+    editingHasPassword = false;
+    clearPassword = false;
     formName = `Proxy ${proxies.length + 1}`;
     formKind = "http";
     formHost = "";
@@ -124,7 +139,7 @@
   }
 
   function openEditModal(p: ProxyItem) {
-    if (isProxyBusy(p)) {
+    if (isProxyBusy(p, $running, accountMap)) {
       showToast(
         "warn",
         "Không thể sửa proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận."
@@ -132,59 +147,34 @@
       return;
     }
     editingId = p.id;
+    editingHasPassword = Boolean(p.has_password);
+    clearPassword = false;
     formName = p.name;
     formKind = p.kind === "socks5" ? "socks5" : "http";
     formHost = p.host;
     formPort = p.port;
     formUsername = p.username || "";
-    formPassword = p.password || "";
+    formPassword = "";
     formNote = p.note || "";
     showPassword = false;
     formErr = "";
     formModalOpen = true;
   }
 
-  /** Hỗ trợ dán nhanh chuỗi `host:port`, `host:port:user:pass` hoặc `http://user:pass@host:port` vào ô Host */
-  function handleHostInput() {
-    const raw = formHost.trim();
-    if (!raw) return;
+  /** Hỗ trợ dán nhanh chuỗi `host:port`, `host:port:user:pass`, `[ipv6]:port` hoặc URL vào ô Host */
+  function handleHostPaste(e: ClipboardEvent) {
+    const raw = e.clipboardData?.getData("text") ?? "";
+    const parsed = parseProxyPaste(raw);
+    if (!parsed) return;
 
-    // Dạng URL: http://user:pass@host:port hoặc socks5://host:port
-    if (/^(https?|socks5h?):\/\//i.test(raw)) {
-      try {
-        const u = new URL(raw);
-        if (u.protocol.toLowerCase().startsWith("socks5")) {
-          formKind = "socks5";
-        } else {
-          formKind = "http";
-        }
-        if (u.hostname) formHost = u.hostname;
-        if (u.port) {
-          const parsedPort = parseInt(u.port, 10);
-          if (parsedPort >= 1 && parsedPort <= 65535) formPort = parsedPort;
-        }
-        if (u.username) formUsername = decodeURIComponent(u.username);
-        if (u.password) formPassword = decodeURIComponent(u.password);
-        return;
-      } catch {
-        // ignore
-      }
-    }
-
-    // Dạng host:port hoặc host:port:user:pass (IPv4 / hostname)
-    if (!raw.startsWith("[") && raw.includes(":")) {
-      const parts = raw.split(":");
-      if (parts.length === 2 || parts.length === 4) {
-        const parsedPort = parseInt(parts[1], 10);
-        if (parsedPort >= 1 && parsedPort <= 65535) {
-          formHost = parts[0].trim();
-          formPort = parsedPort;
-          if (parts.length === 4) {
-            formUsername = parts[2].trim();
-            formPassword = parts[3].trim();
-          }
-        }
-      }
+    e.preventDefault();
+    if (parsed.kind) formKind = parsed.kind;
+    formHost = parsed.host;
+    if (parsed.port !== undefined) formPort = parsed.port;
+    if (parsed.username !== undefined) formUsername = parsed.username;
+    if (parsed.password !== undefined) {
+      formPassword = parsed.password; // NEVER .trim()
+      clearPassword = false;
     }
   }
 
@@ -192,15 +182,15 @@
     if (formSaving || $running) return;
     formErr = "";
     const name = formName.trim();
-    const host = formHost.trim();
     const port = Number(formPort);
 
     if (!name) {
       formErr = "Vui lòng nhập tên gợi nhớ cho proxy.";
       return;
     }
-    if (!host) {
-      formErr = "Vui lòng nhập địa chỉ Host / IP của proxy.";
+    const hostCheck = validateProxyHost(formHost);
+    if (!hostCheck.ok) {
+      formErr = hostCheck.error;
       return;
     }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -208,15 +198,17 @@
       return;
     }
 
-    const input: ProxyInput = {
+    const input: ProxyInput = buildProxyInput({
       name,
       kind: formKind,
-      host,
+      host: hostCheck.host,
       port,
-      username: formUsername.trim() || null,
-      password: formPassword.trim() || null,
-      note: formNote.trim() || null,
-    };
+      username: formUsername,
+      password: formPassword,
+      note: formNote,
+      isEditing: Boolean(editingId),
+      clearPassword,
+    });
 
     formSaving = true;
     try {
@@ -241,7 +233,7 @@
   }
 
   function requestDeleteProxy(p: ProxyItem) {
-    if (isProxyBusy(p)) {
+    if (isProxyBusy(p, $running, accountMap)) {
       showToast(
         "warn",
         "Không thể xoá proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận."
@@ -252,8 +244,15 @@
   }
 
   async function confirmDeleteProxy() {
-    if (!deleteTarget || deleting || $running) return;
-    const target = deleteTarget;
+    const target = resolveLiveProxy(deleteTarget, proxies);
+    if (!target || deleting) return;
+    if (isProxyBusy(target, $running, accountMap)) {
+      showToast(
+        "warn",
+        "Không thể xoá proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận."
+      );
+      return;
+    }
     deleting = true;
     try {
       const res = await api.proxy_delete(target.id);
@@ -276,11 +275,12 @@
   }
 
   async function handleTestOne(p: ProxyItem) {
-    if (testingIds.has(p.id) || testingAll) return;
+    if (destroyed || testingIds.has(p.id) || testingAll) return;
     testingIds = new Set([...testingIds, p.id]);
     try {
       const updated = await api.proxy_test(p.id);
-      proxies = proxies.map((item) => (item.id === updated.id ? updated : item));
+      if (destroyed) return;
+      proxies = mergeSingleTestedProxy(proxies, updated);
       if (updated.last_status === "alive") {
         showToast(
           "success",
@@ -293,30 +293,43 @@
         );
       }
     } catch (e) {
+      if (destroyed) return;
       showToast("error", `Lỗi kiểm tra proxy "${p.name}": ${formatApiError(e)}`);
     } finally {
-      const next = new Set(testingIds);
-      next.delete(p.id);
-      testingIds = next;
+      if (!destroyed) {
+        const next = new Set(testingIds);
+        next.delete(p.id);
+        testingIds = next;
+      }
     }
   }
 
   async function handleTestAll() {
-    if (testingAll || proxies.length === 0) return;
+    if (destroyed || testingAll || testingIds.size > 0 || proxies.length === 0) return;
+    const seq = loadSeq;
     testingAll = true;
     try {
       const updated = await api.proxy_test_all();
-      proxies = updated;
+      if (destroyed || seq !== loadSeq) return;
       const aliveCount = updated.filter((p) => p.last_status === "alive").length;
       const deadCount = updated.filter((p) => p.last_status === "dead").length;
       showToast(
-        aliveCount === updated.length ? "success" : deadCount === updated.length ? "error" : "info",
+        updated.length > 0 && aliveCount === updated.length
+          ? "success"
+          : updated.length > 0 && deadCount === updated.length
+            ? "error"
+            : "info",
         `Đã kiểm tra ${updated.length} proxy: ${aliveCount} sống, ${deadCount} lỗi.`
       );
+      await loadData();
     } catch (e) {
-      showToast("error", `Lỗi kiểm tra tất cả proxy: ${formatApiError(e)}`);
+      if (!destroyed && seq === loadSeq) {
+        showToast("error", `Lỗi kiểm tra tất cả proxy: ${formatApiError(e)}`);
+      }
     } finally {
-      testingAll = false;
+      if (!destroyed) {
+        testingAll = false;
+      }
     }
   }
 
@@ -360,7 +373,7 @@
         <button
           type="button"
           class="btn-secondary"
-          disabled={loading || testingAll}
+          disabled={loading || testingAll || testingIds.size > 0}
           on:click={loadData}
           title="Tải lại danh sách proxy"
         >
@@ -371,7 +384,7 @@
         <button
           type="button"
           class="btn-secondary"
-          disabled={proxies.length === 0 || testingAll}
+          disabled={proxies.length === 0 || testingAll || testingIds.size > 0}
           on:click={handleTestAll}
           title="Kiểm tra kết nối thực tế tới muse.ai cho toàn bộ proxy"
         >
@@ -382,7 +395,7 @@
         <button
           type="button"
           class="btn-primary"
-          disabled={$running}
+          disabled={$running || testingAll}
           on:click={openCreateModal}
           title="Thêm cấu hình proxy mới"
         >
@@ -429,8 +442,8 @@
         {#each proxies as p (p.id)}
           {@const badge = statusBadge(p.last_status)}
           {@const isTesting = testingIds.has(p.id) || testingAll}
-          {@const busy = isProxyBusy(p)}
-          {@const ipConflictNames = getSharedIpConflict(p)}
+          {@const busy = isProxyBusy(p, $running, accountMap)}
+          {@const ipConflictNames = getSharedIpConflict(p, exitIpAccountsMap)}
           <article class="proxy-card s-{p.last_status}">
             <div class="p-header">
               <div class="p-title-wrap">
@@ -439,10 +452,14 @@
                   <h3 class="p-name" title={p.name}>{p.name}</h3>
                 </div>
                 <div class="p-endpoint selectable">
-                  {p.host}:{p.port}
+                  {formatHostPort(p.host, p.port)}
                   {#if p.username}
                     <span class="auth-pill" title={`Tài khoản xác thực: ${p.username}`}>
                       · user: {p.username}{p.has_password ? " (có mật khẩu)" : ""}
+                    </span>
+                  {:else if p.has_password}
+                    <span class="auth-pill" title="Proxy có mật khẩu xác thực">
+                      · (có mật khẩu)
                     </span>
                   {/if}
                 </div>
@@ -485,7 +502,7 @@
               {:else}
                 <div class="acc-chips">
                   {#each p.assigned_account_ids as accId (accId)}
-                    <span class="acc-chip">{accountDisplayName(accId)}</span>
+                    <span class="acc-chip">{accountDisplayName(accId, accountMap)}</span>
                   {/each}
                 </div>
               {/if}
@@ -496,7 +513,7 @@
               <div class="anti-link-warn">
                 <Icons name="alert-triangle" size={14} />
                 <span>
-                  Proxy này đang dùng chung cho <b>{p.assigned_account_ids.length} tài khoản</b> ({p.assigned_account_ids.map(accountDisplayName).join(", ")}). Dùng chung IP có nguy cơ bị nối dấu vết giữa các tài khoản.
+                  Proxy này đang dùng chung cho <b>{p.assigned_account_ids.length} tài khoản</b> ({p.assigned_account_ids.map((id) => accountDisplayName(id, accountMap)).join(", ")}). Dùng chung IP có nguy cơ bị nối dấu vết giữa các tài khoản.
                 </span>
               </div>
             {:else if ipConflictNames.length > 1}
@@ -592,7 +609,7 @@
           type="text"
           placeholder="198.51.100.10 hoặc http://user:pass@ip:port"
           bind:value={formHost}
-          on:input={handleHostInput}
+          on:paste={handleHostPaste}
           disabled={formSaving}
           spellcheck="false"
         />
@@ -632,9 +649,13 @@
             <input
               id="px-pass"
               type="text"
-              placeholder="Mật khẩu proxy"
+              placeholder={editingId && editingHasPassword
+                ? clearPassword
+                  ? "Sẽ xoá mật khẩu đã lưu"
+                  : "Để trống để giữ nguyên mật khẩu đã lưu"
+                : "Mật khẩu proxy"}
               bind:value={formPassword}
-              disabled={formSaving}
+              disabled={formSaving || clearPassword}
               spellcheck="false"
               autocomplete="off"
             />
@@ -642,9 +663,13 @@
             <input
               id="px-pass"
               type="password"
-              placeholder="Mật khẩu proxy"
+              placeholder={editingId && editingHasPassword
+                ? clearPassword
+                  ? "Sẽ xoá mật khẩu đã lưu"
+                  : "Để trống để giữ nguyên mật khẩu đã lưu"
+                : "Mật khẩu proxy"}
               bind:value={formPassword}
-              disabled={formSaving}
+              disabled={formSaving || clearPassword}
               spellcheck="false"
               autocomplete="off"
             />
@@ -652,12 +677,27 @@
           <button
             type="button"
             class="btn-eye"
+            disabled={formSaving || clearPassword}
             on:click={() => (showPassword = !showPassword)}
             title={showPassword ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
+            aria-label={showPassword ? "Ẩn mật khẩu" : "Hiện mật khẩu"}
           >
             <Icons name={showPassword ? "eye-off" : "eye"} size={14} />
           </button>
         </div>
+        {#if editingId && editingHasPassword}
+          <label class="clear-pass-toggle">
+            <input
+              type="checkbox"
+              bind:checked={clearPassword}
+              disabled={formSaving}
+              on:change={() => {
+                if (clearPassword) formPassword = "";
+              }}
+            />
+            <span>Xoá mật khẩu đã lưu</span>
+          </label>
+        {/if}
       </div>
     </div>
 
@@ -689,7 +729,7 @@
     <button
       type="button"
       class="btn-primary"
-      disabled={formSaving}
+      disabled={formSaving || $running}
       on:click={handleSaveProxy}
     >
       {formSaving ? "Đang lưu..." : editingId ? "Lưu thay đổi" : "Thêm Proxy"}
@@ -699,26 +739,31 @@
 
 <!-- Modal Xác nhận xoá Proxy -->
 <Modal
-  open={deleteTarget !== null}
+  open={liveDeleteTarget !== null}
   title="Xác nhận xoá Proxy"
   width="460px"
   disableClose={deleting}
   on:close={() => (deleteTarget = null)}
 >
-  {#if deleteTarget}
+  {#if liveDeleteTarget}
     <div class="del-body">
-      {#if deleteTarget.assigned_account_ids.length > 0}
+      {#if liveDeleteTarget.assigned_account_ids.length > 0}
         <p>
-          Proxy <b>{deleteTarget.name}</b> (<code>{deleteTarget.host}:{deleteTarget.port}</code>) đang được gán cho
-          <b>{deleteTarget.assigned_account_ids.length} tài khoản</b>:
-          <b>{deleteTarget.assigned_account_ids.map(accountDisplayName).join(", ")}</b>.
+          Proxy <b>{liveDeleteTarget.name}</b> (<code>{formatHostPort(liveDeleteTarget.host, liveDeleteTarget.port)}</code>) đang được gán cho
+          <b>{liveDeleteTarget.assigned_account_ids.length} tài khoản</b>:
+          <b>{liveDeleteTarget.assigned_account_ids.map((id) => accountDisplayName(id, accountMap)).join(", ")}</b>.
         </p>
         <p>
           Xác nhận xoá proxy này và chuyển các tài khoản đó về kết nối <b>Trực tiếp (không dùng proxy)</b>?
         </p>
       {:else}
         <p>
-          Bạn có chắc chắn muốn xoá proxy <b>{deleteTarget.name}</b> (<code>{deleteTarget.host}:{deleteTarget.port}</code>) khỏi hệ thống?
+          Bạn có chắc chắn muốn xoá proxy <b>{liveDeleteTarget.name}</b> (<code>{formatHostPort(liveDeleteTarget.host, liveDeleteTarget.port)}</code>) khỏi hệ thống?
+        </p>
+      {/if}
+      {#if deleteTargetBusy}
+        <p class="proxy-delete-busy-warn" role="alert">
+          Không thể xoá proxy khi đang chạy batch hoặc tài khoản gắn proxy đang bận.
         </p>
       {/if}
     </div>
@@ -735,7 +780,7 @@
     <button
       type="button"
       class="btn-danger"
-      disabled={deleting}
+      disabled={deleting || deleteTargetBusy}
       on:click={confirmDeleteProxy}
     >
       {deleting ? "Đang xoá..." : "Xác nhận xoá"}
@@ -752,7 +797,7 @@
   }
 
   .card {
-    background: var(--c-surface);
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     border-radius: 12px;
     padding: 16px 18px;
@@ -784,7 +829,7 @@
   .hero-desc {
     margin: 6px 0 0;
     font-size: 12.5px;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     max-width: 720px;
     line-height: 1.45;
   }
@@ -794,6 +839,9 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+  }
+  .hero-actions button {
+    height: var(--h-btn-secondary);
   }
 
   .stats-strip {
@@ -811,19 +859,19 @@
     gap: 8px;
     padding: 6px 12px;
     border-radius: 8px;
-    background: var(--c-bg);
+    background: var(--c-page);
     border: 1px solid var(--c-border);
     font-size: 12px;
   }
   .stat-pill .lbl {
-    color: var(--c-text-muted);
+    color: var(--c-muted);
   }
   .stat-pill b {
     font-size: 13px;
     color: var(--c-text);
   }
   .stat-pill.ok b {
-    color: var(--c-ok);
+    color: var(--c-green);
   }
   .stat-pill.err b {
     color: var(--c-danger);
@@ -836,7 +884,7 @@
   }
 
   .proxy-card {
-    background: var(--c-surface);
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     border-radius: 12px;
     padding: 14px 16px;
@@ -846,7 +894,7 @@
     box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
   }
   .proxy-card.s-alive {
-    border-left: 3px solid var(--c-ok);
+    border-left: 3px solid var(--c-green);
   }
   .proxy-card.s-dead {
     border-left: 3px solid var(--c-danger);
@@ -889,14 +937,14 @@
     margin-top: 3px;
     font-family: var(--font-mono, monospace);
     font-size: 12px;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     word-break: break-all;
   }
 
   .auth-pill {
     font-family: var(--font-sans, sans-serif);
     font-size: 11px;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
   }
 
   .status-badge {
@@ -908,15 +956,15 @@
   }
   .status-badge.ok {
     background: rgba(30, 142, 62, 0.12);
-    color: var(--c-ok);
+    color: var(--c-green);
   }
   .status-badge.err {
     background: rgba(197, 34, 31, 0.12);
     color: var(--c-danger);
   }
   .status-badge.mute {
-    background: var(--c-bg);
-    color: var(--c-text-muted);
+    background: var(--c-page);
+    color: var(--c-muted);
     border: 1px solid var(--c-border);
   }
 
@@ -924,7 +972,7 @@
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 8px;
-    background: var(--c-bg);
+    background: var(--c-page);
     border: 1px solid var(--c-border);
     border-radius: 8px;
     padding: 8px 10px;
@@ -936,7 +984,7 @@
     gap: 2px;
   }
   .m-lbl {
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     font-size: 10.5px;
   }
   .m-val {
@@ -958,7 +1006,7 @@
 
   .p-note {
     font-size: 11.5px;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     font-style: italic;
   }
 
@@ -969,11 +1017,11 @@
     font-size: 11.5px;
   }
   .acc-lbl {
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     font-weight: 500;
   }
   .acc-empty {
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     font-style: italic;
   }
   .acc-chips {
@@ -1020,7 +1068,7 @@
     padding: 5px 10px;
     border-radius: 6px;
     border: 1px solid var(--c-border);
-    background: var(--c-bg);
+    background: var(--c-page);
     color: var(--c-text);
     font-size: 11.5px;
     font-weight: 500;
@@ -1036,7 +1084,7 @@
     border-color: var(--c-teal);
   }
   .btn-action.primary:hover:not(:disabled) {
-    background: var(--c-teal-hover, #0b636b);
+    background: var(--c-teal-dark);
     color: #fff;
   }
   .btn-action.danger {
@@ -1054,12 +1102,12 @@
   }
 
   .empty-state {
-    background: var(--c-surface);
+    background: var(--c-card);
     border: 1px dashed var(--c-border);
     border-radius: 12px;
     padding: 36px 20px;
     text-align: center;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1097,22 +1145,22 @@
     flex-direction: column;
     gap: 4px;
   }
-  .field label {
+  .field label:not(.clear-pass-toggle) {
     font-size: 11.5px;
     font-weight: 600;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
   }
-  .field input,
+  .field input:not([type="checkbox"]),
   .field select {
     padding: 7px 10px;
     border-radius: 7px;
     border: 1px solid var(--c-border);
-    background: var(--c-bg);
+    background: var(--c-page);
     color: var(--c-text);
     font-size: 12.5px;
     outline: none;
   }
-  .field input:focus,
+  .field input:not([type="checkbox"]):focus,
   .field select:focus {
     border-color: var(--c-teal);
   }
@@ -1131,11 +1179,29 @@
     right: 6px;
     background: transparent;
     border: none;
-    color: var(--c-text-muted);
+    color: var(--c-muted);
     cursor: pointer;
     padding: 4px;
     display: flex;
     align-items: center;
+  }
+  .clear-pass-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--c-muted);
+    margin-top: 3px;
+    cursor: pointer;
+  }
+  .clear-pass-toggle input[type="checkbox"] {
+    width: auto;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    cursor: pointer;
+    accent-color: var(--c-teal);
   }
 
   .form-err {
@@ -1152,6 +1218,16 @@
     font-size: 13px;
     line-height: 1.5;
     color: var(--c-text);
+  }
+  .del-body p.proxy-delete-busy-warn {
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
   }
 
   .modal-footer-actions {

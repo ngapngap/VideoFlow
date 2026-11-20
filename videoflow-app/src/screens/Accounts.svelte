@@ -3,20 +3,27 @@
   import {
     api,
     type MuseAccount,
-    type MuseQuotaSnapshot,
-    type MuseStatusView,
     type ProxyItem,
   } from "../lib/api";
+  import { createSeqGuard } from "../lib/asyncGuard";
   import AccountCard from "../lib/AccountCard.svelte";
   import Icons from "../lib/Icons.svelte";
-  import { formatApiError, running, showToast } from "../lib/store";
+  import { isQuotaExhausted } from "../lib/museStatus";
+  import { formatHostPort } from "../lib/proxyInput";
+  import {
+    formatApiError,
+    museAccounts,
+    museSidecarStatus,
+    refreshMuseState,
+    running,
+    showToast,
+    startMusePolling,
+  } from "../lib/store";
 
   const dispatch = createEventDispatcher<{ navigate: string }>();
 
-  let accounts: MuseAccount[] = [];
   let proxies: ProxyItem[] = [];
   let loading = false;
-  let statusView: MuseStatusView | null = null;
   let startingEngine = false;
   let stoppingEngine = false;
   let downloadingExt = false;
@@ -35,15 +42,14 @@
   $: addBusy = loginBusy || manualSaveBusy;
   let addErr = "";
 
-  let refreshTimer: ReturnType<typeof setInterval> | null = null;
-  let loadSeq = 0;
+  const loadGuard = createSeqGuard();
   let destroyed = false;
-  let polling = false;
+  let stopMusePolling: (() => void) | null = null;
 
   function formatProxyOptionLabel(p: ProxyItem): string {
     const dot =
       p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
-    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const ipPart = p.exit_ip ? p.exit_ip : formatHostPort(p.host, p.port);
     const latPart =
       p.latency_ms != null
         ? `${p.latency_ms}ms`
@@ -58,7 +64,7 @@
     const selectedPx = proxies.find((p) => p.id === newProxyId);
     const selIp = (selectedPx?.exit_ip || "").trim();
     const names: string[] = [];
-    for (const acc of accounts) {
+    for (const acc of $museAccounts) {
       const sameProxy = Boolean(acc.proxy_id && acc.proxy_id === newProxyId);
       const accIp = (acc.proxy_exit_ip || "").trim();
       const sameIp = Boolean(selIp && accIp && selIp === accIp);
@@ -68,7 +74,7 @@
     }
     if (names.length === 0 && selectedPx) {
       for (const accId of selectedPx.assigned_account_ids) {
-        const found = accounts.find((a) => a.id === accId);
+        const found = $museAccounts.find((a) => a.id === accId);
         names.push(found?.label || accId);
       }
     }
@@ -76,66 +82,34 @@
   })();
 
   async function loadData() {
-    const seq = ++loadSeq;
+    const seq = loadGuard.next();
     loading = true;
     try {
-      const [nextStatus, pxList] = await Promise.all([
-        api.muse_sidecar_status(),
-        api.proxy_list().catch(() => [] as ProxyItem[]),
+      const [, pxList] = await Promise.all([
+        refreshMuseState({ force: true }),
+        api.proxy_list().catch(() => proxies),
       ]);
-      if (destroyed || seq !== loadSeq) return;
-      statusView = nextStatus;
+      if (destroyed || !loadGuard.isCurrent(seq)) return;
       proxies = pxList;
-      if (nextStatus.sidecar.running) {
-        const res = await api.muse_list_accounts();
-        if (destroyed || seq !== loadSeq) return;
-        accounts = res.data ?? [];
-      } else {
-        accounts = [];
-      }
     } catch {
-      if (destroyed || seq !== loadSeq) return;
-      accounts = [];
+      if (destroyed || !loadGuard.isCurrent(seq)) return;
     } finally {
-      if (!destroyed && seq === loadSeq) {
+      if (!destroyed && loadGuard.isCurrent(seq)) {
         loading = false;
       }
     }
   }
 
-  async function pollAccounts() {
-    if (destroyed || polling || loading) return;
-    polling = true;
-    try {
-      const [st, pxList] = await Promise.all([
-        api.muse_sidecar_status(),
-        api.proxy_list().catch(() => proxies),
-      ]);
-      if (destroyed) return;
-      statusView = st;
-      proxies = pxList;
-      if (st.sidecar.running) {
-        const res = await api.muse_list_accounts();
-        if (destroyed) return;
-        accounts = res.data ?? [];
-      } else {
-        accounts = [];
-      }
-    } catch {
-      // bỏ qua lỗi tạm thời khi poll nền
-    } finally {
-      polling = false;
-    }
-  }
-
   onMount(() => {
-    loadData();
-    refreshTimer = setInterval(pollAccounts, 5000);
+    stopMusePolling = startMusePolling();
+    void loadData();
   });
 
   onDestroy(() => {
     destroyed = true;
-    if (refreshTimer) clearInterval(refreshTimer);
+    loadGuard.invalidate();
+    stopMusePolling?.();
+    stopMusePolling = null;
   });
 
   async function startEngine() {
@@ -172,23 +146,33 @@
     addErr = "";
     try {
       // 1. Tự khởi động engine nếu chưa chạy
-      if (!statusView?.sidecar.running) {
+      if (!$museSidecarStatus?.sidecar.running) {
         await api.muse_start_sidecar();
+        await refreshMuseState({ force: true });
       }
 
       // 2. Tạo tài khoản mới kèm proxy_id (nếu có)
-      const label = newLabel.trim() || `Tài khoản Muse ${accounts.length + 1}`;
+      const label = newLabel.trim() || `Tài khoản Muse ${$museAccounts.length + 1}`;
       const proxyIdToSet = newProxyId.trim() || null;
       const res = await api.muse_add_cookie(label, {}, allowDuplicate, proxyIdToSet);
       const acc = res.account;
       newLabel = "";
       newProxyId = "";
       allowDuplicate = false;
-
-      showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
+      dupPending = false;
 
       // 3. Mở trình duyệt có giao diện để đăng nhập ngay
-      await api.muse_open_login(acc.id);
+      try {
+        const loginRes = await api.muse_open_login(acc.id);
+        if (loginRes?.ok === false) {
+          throw new Error(loginRes.message || "Không thể mở trình duyệt đăng nhập.");
+        }
+        showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
+      } catch (loginErr) {
+        const detail = formatApiError(loginErr);
+        addErr = `Đã tạo tài khoản "${label}" trong danh sách, nhưng không mở được trình duyệt đăng nhập: ${detail}. Bạn có thể bấm "Đăng nhập" trên thẻ tài khoản bên dưới thay vì tạo trùng.`;
+        showToast("warn", addErr);
+      }
     } catch (e) {
       addErr = formatApiError(e);
       showToast("error", `Lỗi thêm tài khoản: ${addErr}`);
@@ -218,7 +202,7 @@
     }
 
     try {
-      const label = newLabel.trim() || `Tài khoản Muse ${accounts.length + 1}`;
+      const label = newLabel.trim() || `Tài khoản Muse ${$museAccounts.length + 1}`;
       const proxyIdToSet = newProxyId.trim() || null;
       await api.muse_add_cookie(label, cookies, allowDuplicate, proxyIdToSet);
 
@@ -231,7 +215,6 @@
       dupPending = false;
       showManualCookies = false;
       showToast("success", `Đã thêm tài khoản "${label}".`);
-      await loadData();
     } catch (e) {
       const msg = formatApiError(e);
       if (/trùng|belongs to account/i.test(msg) && !allowDuplicate) {
@@ -243,6 +226,7 @@
       showToast("error", `Lỗi thêm cookie: ${addErr}`);
     } finally {
       manualSaveBusy = false;
+      await loadData();
     }
   }
 
@@ -259,23 +243,6 @@
     }
   }
 
-  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
-    if (!q) return false;
-    const pct =
-      q.weekly_used_pct != null
-        ? q.weekly_used_pct
-        : q.messages_used != null && q.messages_limit
-          ? Math.round((q.messages_used / q.messages_limit) * 100)
-          : null;
-    if (pct == null || pct < 100) return false;
-    if (q.extra_left && /[1-9]/.test(q.extra_left)) return false;
-    if (q.resets_at) {
-      const parsed = Date.parse(q.resets_at.trim());
-      if (!Number.isNaN(parsed) && parsed <= Date.now()) return false;
-    }
-    return true;
-  }
-
   function museAccStateKey(a: MuseAccount): string {
     const now = Date.now() / 1000;
     const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
@@ -287,7 +254,7 @@
     if (a.status === "cooling" && a.cooldown_until > now) {
       return isQuota ? "quota" : "cooling";
     }
-    if (isQuotaExhausted(a.meta?.quota)) return "quota";
+    if (isQuotaExhausted(a)) return "quota";
     return "active";
   }
 
@@ -300,7 +267,7 @@
       invalid: 0,
       disabled: 0,
     };
-    for (const a of accounts) {
+    for (const a of $museAccounts) {
       const k = museAccStateKey(a);
       if (c[k] !== undefined) c[k] += 1;
     }
@@ -316,7 +283,7 @@
       active: 4,
       disabled: 5,
     };
-    return [...accounts].sort(
+    return [...$museAccounts].sort(
       (a, b) =>
         (order[museAccStateKey(a)] ?? 9) - (order[museAccStateKey(b)] ?? 9) ||
         (a.label || a.id).localeCompare(b.label || b.id)
@@ -328,13 +295,13 @@
   <!-- Top Engine Status Banner -->
   <div class="engine-bar">
     <div class="engine-info">
-      <span class="status-indicator" class:running={statusView?.sidecar.running}></span>
+      <span class="status-indicator" class:running={$museSidecarStatus?.sidecar.running}></span>
       <div class="engine-text">
         <span class="engine-title">
-          Sidecar Engine: {statusView?.sidecar.running ? "Đang hoạt động" : "Đã dừng"}
+          Sidecar Engine: {$museSidecarStatus?.sidecar.running ? "Đang hoạt động" : "Đã dừng"}
         </span>
-        {#if statusView?.sidecar.running}
-          <span class="engine-sub">Port {statusView.sidecar.port ?? statusView.sidecar.cfg_port ?? 18610} · Profile riêng từng tài khoản</span>
+        {#if $museSidecarStatus?.sidecar.running}
+          <span class="engine-sub">Port {$museSidecarStatus.sidecar.port ?? $museSidecarStatus.sidecar.cfg_port ?? 18610} · Profile riêng từng tài khoản</span>
         {:else}
           <span class="engine-sub">Khởi động engine để kiểm tra hạn mức và đăng nhập tài khoản</span>
         {/if}
@@ -342,7 +309,7 @@
     </div>
 
     <div class="engine-actions">
-      {#if statusView?.sidecar.running}
+      {#if $museSidecarStatus?.sidecar.running}
         <button
           type="button"
           class="btn-secondary"
@@ -371,6 +338,7 @@
         disabled={loading}
         on:click={loadData}
         title="Làm mới trạng thái"
+        aria-label="Làm mới trạng thái tài khoản"
       >
         <Icons name="refresh" size={15} />
       </button>
@@ -542,7 +510,7 @@
   <section class="section-card accounts-list-card">
     <div class="list-header-row">
       <div class="list-title-wrap">
-        <h2 class="section-title">Danh sách tài khoản ({accounts.length})</h2>
+        <h2 class="section-title">Danh sách tài khoản ({$museAccounts.length})</h2>
       </div>
 
       <!-- Thống kê trạng thái -->
@@ -568,9 +536,9 @@
       </div>
     </div>
 
-    {#if loading && accounts.length === 0}
+    {#if loading && $museAccounts.length === 0}
       <div class="empty-state">Đang tải danh sách tài khoản...</div>
-    {:else if accounts.length === 0}
+    {:else if $museAccounts.length === 0}
       <div class="empty-state">
         <Icons name="video-source" size={36} />
         <p class="empty-title">Chưa có tài khoản Muse nào trong pool</p>
@@ -584,11 +552,13 @@
           <AccountCard
             {account}
             {proxies}
-            allAccounts={accounts}
+            allAccounts={$museAccounts}
             running={$running}
             on:refresh={loadData}
             on:updated={loadData}
             on:deleted={loadData}
+            on:openLogin={loadData}
+            on:openView={loadData}
           />
         {/each}
       </div>

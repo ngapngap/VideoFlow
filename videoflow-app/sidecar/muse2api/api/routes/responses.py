@@ -31,6 +31,7 @@ from ...drivers.base import ChatRequest, InputImage
 from ...errors import InvalidRequest, Muse2APIError
 from ...services.container import Services
 from ..deps import conversation_key, get_services, require_api_key
+from .images import MAX_REFERENCE_IMAGES
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["responses"], dependencies=[Depends(require_api_key)])
@@ -81,8 +82,10 @@ def _to_messages(body: ResponseRequest) -> list[dict]:
                     f"input item type '{itype}' is not supported: "
                     "muse.ai has no function calling")
             if "role" in item or itype in ("message", None):
-                messages.append({"role": item.get("role", "user"),
-                                 "content": item.get("content")})
+                role = item.get("role", "user")
+                if not isinstance(role, str) or not role.strip():
+                    raise InvalidRequest("input item role must be a non-empty string")
+                messages.append({"role": role, "content": item.get("content")})
             else:
                 raise InvalidRequest(f"unsupported input item type '{itype}'")
     else:
@@ -121,6 +124,8 @@ async def create_response(body: ResponseRequest, request: Request,
     flat = flatten_messages(messages)
     if not flat.text and not flat.images:
         raise InvalidRequest("input contains no text or images")
+    if len(flat.images) > MAX_REFERENCE_IMAGES:
+        raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
 
     images = [InputImage(*(await load_image_ref(ref))) for ref in flat.images]
     cancel = asyncio.Event()

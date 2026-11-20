@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,12 +16,14 @@ from muse2api.accounts.model import Account, AccountStatus
 from muse2api.accounts.pool import AccountPool
 from muse2api.accounts.store import JsonAccountStore
 from muse2api.config import Settings
-from muse2api.drivers.base import InputImage, VideoRequest
+from muse2api.drivers.base import InputImage, MediaResult, VideoRequest
 from muse2api.drivers.browser import dom
 from muse2api.drivers.browser.driver import BrowserDriver, _Tab
 from muse2api.errors import (
     NoAccountAvailable,
+    UpstreamAuthError,
     UpstreamError,
+    UpstreamQuotaError,
     UpstreamTimeout,
     UpstreamVideoLocked,
 )
@@ -384,3 +387,229 @@ async def test_gateway_does_not_retry_on_upstream_video_locked(tmp_path: Path):
     acc2_updated = pool.get("acc_2")
     locked_accounts = [a for a in (acc1_updated, acc2_updated) if a and a.status == AccountStatus.VIDEO_LOCKED]
     assert len(locked_accounts) == 1
+
+
+# =========================================================================
+# M6 Cluster B: Bounded _video_locks, Cancellation & Post-Lock Validation
+# =========================================================================
+
+def _valid_video_account(account_id: str = "acc_1", **kw) -> Account:
+    return Account(
+        id=account_id,
+        label=account_id,
+        status=AccountStatus.ACTIVE,
+        enabled=True,
+        cookies={"hatch_sess": f"sess_{account_id}", "hatch_native_auth_device": f"dev_{account_id}"},
+        **kw,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_video_times_out_waiting_for_video_lock(settings: Settings):
+    acc = _valid_video_account("acc_1")
+    drv = BrowserDriver(settings, account=acc)
+    lock = drv._video_locks.setdefault(acc.id, asyncio.Lock())
+    await lock.acquire()
+
+    gen_mock = AsyncMock()
+    with patch.object(drv, "_generate", gen_mock):
+        start = time.monotonic()
+        with pytest.raises(UpstreamTimeout, match="video lock"):
+            await drv.generate_video(acc, VideoRequest(prompt="v", model="muse-video", timeout=0.05))
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 0.5
+    assert gen_mock.call_count == 0
+    assert lock.locked() is True
+    lock.release()
+    assert lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_generate_video_subtracts_lock_wait_from_remaining_timeout(settings: Settings):
+    acc = _valid_video_account("acc_1")
+    drv = BrowserDriver(settings, account=acc)
+    lock = drv._video_locks.setdefault(acc.id, asyncio.Lock())
+    await lock.acquire()
+
+    seen_timeouts: list[float] = []
+
+    async def fake_generate(account, prompt, images, kind, timeout, on_progress, cancel):
+        seen_timeouts.append(timeout)
+        return MediaResult(data=b"ok", mime="video/mp4", kind="video")
+
+    async def release_soon():
+        await asyncio.sleep(0.15)
+        lock.release()
+
+    releaser = asyncio.create_task(release_soon())
+    with patch.object(drv, "_generate", side_effect=fake_generate):
+        res = await drv.generate_video(acc, VideoRequest(prompt="v", model="muse-video", timeout=0.8))
+    await releaser
+
+    assert res.data == b"ok"
+    assert len(seen_timeouts) == 1
+    assert 0.0 < seen_timeouts[0] < 0.72
+    assert lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_generate_video_cancel_while_waiting_for_video_lock_does_not_leak(settings: Settings):
+    acc = _valid_video_account("acc_1")
+    drv = BrowserDriver(settings, account=acc)
+    lock = drv._video_locks.setdefault(acc.id, asyncio.Lock())
+    await lock.acquire()
+
+    cancel = asyncio.Event()
+
+    async def trigger_cancel():
+        await asyncio.sleep(0.05)
+        cancel.set()
+
+    gen_mock = AsyncMock()
+    canceller = asyncio.create_task(trigger_cancel())
+    with patch.object(drv, "_generate", gen_mock):
+        with pytest.raises(asyncio.CancelledError):
+            await drv.generate_video(
+                acc, VideoRequest(prompt="v", model="muse-video", timeout=5.0, cancel=cancel)
+            )
+    await canceller
+
+    assert gen_mock.call_count == 0
+    assert lock.locked() is True
+    lock.release()
+    assert lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_generate_video_cancel_same_tick_as_lock_release_releases_lock(settings: Settings):
+    """If lock is released and cancel fires on the same turn, the cancelled waiter must not leak the lock."""
+    acc = _valid_video_account("acc_1")
+    drv = BrowserDriver(settings, account=acc)
+    lock = drv._video_locks.setdefault(acc.id, asyncio.Lock())
+    await lock.acquire()
+
+    cancel = asyncio.Event()
+    gen_mock = AsyncMock()
+    with patch.object(drv, "_generate", gen_mock):
+        waiter = asyncio.create_task(
+            drv.generate_video(
+                acc, VideoRequest(prompt="v", model="muse-video", timeout=5.0, cancel=cancel)
+            )
+        )
+        await asyncio.sleep(0.02)
+        lock.release()
+        cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+    assert gen_mock.call_count == 0
+    assert lock.locked() is False
+
+
+@pytest.mark.parametrize(
+    "mutator,expected_exc",
+    [
+        (lambda a, d: setattr(a, "status", AccountStatus.VIDEO_LOCKED), UpstreamVideoLocked),
+        (lambda a, d: setattr(a, "status", AccountStatus.INVALID), UpstreamAuthError),
+        (lambda a, d: setattr(a, "enabled", False), UpstreamError),
+        (
+            lambda a, d: a.meta.__setitem__(
+                "quota", {"weekly_used_pct": 100, "resets_at": "Jan 1, 2099", "extra_left": "0 tokens"}
+            ),
+            UpstreamQuotaError,
+        ),
+        (
+            lambda a, d: (
+                setattr(a, "status", AccountStatus.COOLING),
+                setattr(a, "cooldown_until", time.time() + 3600),
+            ),
+            UpstreamTimeout,
+        ),
+        (lambda a, d: a.cookies.clear(), UpstreamAuthError),
+        (lambda a, d: setattr(d, "_closed", True), UpstreamError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_generate_video_post_lock_recheck_invalid_states(settings: Settings, mutator, expected_exc):
+    acc = _valid_video_account("acc_1")
+    drv = BrowserDriver(settings, account=acc)
+    lock = drv._video_locks.setdefault(acc.id, asyncio.Lock())
+    await lock.acquire()
+
+    gen_mock = AsyncMock()
+
+    async def mutate_and_release():
+        await asyncio.sleep(0.03)
+        mutator(acc, drv)
+        lock.release()
+
+    mutator_task = asyncio.create_task(mutate_and_release())
+    with patch.object(drv, "_generate", gen_mock):
+        with pytest.raises(expected_exc):
+            await drv.generate_video(acc, VideoRequest(prompt="v", model="muse-video", timeout=2.0))
+    await mutator_task
+
+    assert gen_mock.call_count == 0
+    assert lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_generate_video_concurrent_waiter_fails_over_on_invalid_and_cooling(
+    settings: Settings, tmp_path: Path
+):
+    store = JsonAccountStore(tmp_path / "accounts.json")
+    pool = AccountPool(store, strategy="round_robin", max_concurrency=4, cooldown=120)
+    acc1 = _valid_video_account("acc_1")
+    acc2 = _valid_video_account("acc_2")
+    await pool.upsert(acc1)
+    await pool.upsert(acc2)
+
+    drv = BrowserDriver(settings)
+    sub1 = BrowserDriver(settings, account=acc1)
+    sub2 = BrowserDriver(settings, account=acc2)
+    drv._account_drivers = {"acc_1": sub1, "acc_2": sub2}
+
+    entered_acc1 = asyncio.Event()
+    release_acc1 = asyncio.Event()
+    calls: list[str] = []
+
+    async def sub1_generate(account, prompt, images, kind, timeout, on_progress, cancel):
+        calls.append(account.id)
+        entered_acc1.set()
+        await release_acc1.wait()
+        raise UpstreamQuotaError("quota exhausted on acc_1")
+
+    async def sub2_generate(account, prompt, images, kind, timeout, on_progress, cancel):
+        calls.append(account.id)
+        return MediaResult(data=b"video_from_acc2", mime="video/mp4", kind="video")
+
+    gateway = Gateway(pool, drv, max_failover=2)
+
+    with (
+        patch.object(sub1, "_generate", side_effect=sub1_generate),
+        patch.object(sub2, "_generate", side_effect=sub2_generate),
+    ):
+        task1 = asyncio.create_task(
+            gateway.generate_video(VideoRequest(prompt="v1", model="muse-video", timeout=5.0))
+        )
+        await entered_acc1.wait()
+        # R2 leases acc_1 concurrently while R1 holds _video_locks["acc_1"]
+        task2 = asyncio.create_task(
+            gateway.generate_video(VideoRequest(prompt="v2", model="muse-video", timeout=5.0))
+        )
+        await asyncio.sleep(0.05)
+        release_acc1.set()
+
+        res1, res2 = await asyncio.gather(task1, task2)
+
+    assert res1.data == b"video_from_acc2"
+    assert res2.data == b"video_from_acc2"
+    # sub1._generate must have been called only once (R2 skipped _generate after post-lock recheck)
+    assert calls.count("acc_1") == 1
+    assert calls.count("acc_2") == 2
+    # acc_1 must remain COOLING with >= 3500s cooldown (not overwritten to 120s)
+    acc1_after = pool.get("acc_1")
+    assert acc1_after is not None
+    assert acc1_after.status == AccountStatus.COOLING
+    assert acc1_after.cooldown_until > time.time() + 3000

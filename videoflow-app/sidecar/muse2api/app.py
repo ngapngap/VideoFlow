@@ -23,6 +23,7 @@ from .config import Settings, get_settings
 from .drivers.base import MuseDriver
 from .errors import Muse2APIError
 from .services.container import Services
+from .upstream.muse import missing_session_cookies
 
 log = logging.getLogger("muse2api")
 
@@ -63,9 +64,15 @@ def create_app(settings: Settings | None = None, driver: MuseDriver | None = Non
         await services.requests.prune(settings.request_log_retention_days)
         await services.requests.backfill_tasks(services.tasks.list(limit=services.tasks.max_kept))
         await services.driver.startup()
-        for acc in services.pool.all():
-            if acc.enabled and acc.status != AccountStatus.INVALID:
-                services.driver.prewarm(acc)
+        if not settings.defer_prewarm:
+            for acc in services.pool.all():
+                if (
+                    acc.enabled
+                    and acc.status == AccountStatus.ACTIVE
+                    and not acc.quota_exhausted()
+                    and not missing_session_cookies(acc.cookies)
+                ):
+                    services.driver.prewarm(acc)
         housekeeping = asyncio.create_task(_housekeeping(services))
         keepalive = None
         if settings.keepalive_enabled and services.driver.capabilities.renew_session:

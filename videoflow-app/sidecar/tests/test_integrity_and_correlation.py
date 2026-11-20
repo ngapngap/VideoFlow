@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -397,3 +399,109 @@ async def test_driver_download_corrupted_raises_upstream_error(settings: Setting
 
     with pytest.raises(UpstreamError, match="invalid magic bytes"):
         await driver._download(tab, {"src": "blob:dummy"}, "video")
+
+
+# =========================================================================
+# M6 Cluster B: GIF / AVIF / WebM Magic Bytes, FFmpeg CancelledError & MIME
+# =========================================================================
+
+def test_verify_magic_bytes_gif_avif_and_webm():
+    gif87 = b"GIF87a" + b"\x00" * 16
+    gif89 = b"GIF89a" + b"\x00" * 16
+    assert verify_magic_bytes(gif87, "image") is True
+    assert verify_magic_bytes(gif89, "image") is True
+    assert verify_magic_bytes(gif87, "video") is False
+
+    avif_major = b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00avifmif1"
+    avis_major = b"\x00\x00\x00\x1cftypavis\x00\x00\x00\x00avismsf1"
+    mif1_major = b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00mif1heic"
+    avif_compat = b"\x00\x00\x00\x1cftypisom\x00\x00\x00\x00isomavif"
+    assert verify_magic_bytes(avif_major, "image") is True
+    assert verify_magic_bytes(avis_major, "image") is True
+    assert verify_magic_bytes(mif1_major, "image") is True
+    assert verify_magic_bytes(avif_compat, "image") is True
+
+    # Plain MP4 isom/mp42 without avif compatible brand must still be rejected for "image"
+    mp4_isom = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+    assert verify_magic_bytes(mp4_isom, "image") is False
+
+    webm = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 16
+    assert verify_magic_bytes(webm, "video") is True
+    assert verify_magic_bytes(webm, "image") is False
+
+
+@pytest.mark.asyncio
+async def test_verify_and_save_download_webm_fallback():
+    valid_webm = b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 32
+    with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError("ffmpeg missing")):
+        verified = await verify_and_save_download(valid_webm, "video")
+    assert verified == valid_webm
+
+
+@pytest.mark.asyncio
+async def test_verify_and_save_download_kills_ffmpeg_on_cancelled_error():
+    valid_mp4 = b"\x00\x00\x00\x1cftypmp42\x00\x00\x00\x00mp42mp41isom" + b"\x00" * 64
+    started = asyncio.Event()
+    temp_dir = Path(tempfile.gettempdir()) / "videoflow_downloads"
+    before = set(temp_dir.iterdir()) if temp_dir.exists() else set()
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    mock_proc.kill = MagicMock()
+    mock_proc.wait = AsyncMock(return_value=-9)
+
+    async def blocking_communicate():
+        started.set()
+        await asyncio.Future()
+
+    mock_proc.communicate = blocking_communicate
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        task = asyncio.create_task(verify_and_save_download(valid_mp4, "video"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.kill.assert_called_once()
+    mock_proc.wait.assert_awaited_once()
+    after = set(temp_dir.iterdir()) if temp_dir.exists() else set()
+    new_files = after - before
+    assert not any(p.suffix in (".partial", ".verified", ".mp4") for p in new_files)
+
+
+@pytest.mark.parametrize(
+    "payload,kind,upstream_mime,expected_mime",
+    [
+        (b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 32, "video", "", "video/webm"),
+        (
+            b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 32,
+            "video",
+            "application/octet-stream",
+            "video/webm",
+        ),
+        (b"GIF89a" + b"\x00" * 24, "image", "", "image/gif"),
+        (b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00avif", "image", "application/octet-stream", "image/avif"),
+        (b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24, "image", "image/webp", "image/webp"),
+        (b"\x00\x00\x00\x1cftypmp42\x00\x00\x00\x00mp42" + b"\x00" * 32, "video", "video/quicktime", "video/quicktime"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_driver_download_infers_mime_fallback(
+    settings: Settings, payload: bytes, kind: str, upstream_mime: str, expected_mime: str
+):
+    driver = BrowserDriver(settings)
+    mock_session = MagicMock()
+    tab = _Tab(account_id="acc1", context_id="ctx1", target_id="tgt1", session=mock_session)
+
+    mock_session.evaluate = AsyncMock(return_value={
+        "ok": True,
+        "mime": upstream_mime,
+        "b64": base64.b64encode(payload).decode(),
+    })
+
+    with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
+        res = await driver._download(tab, {"src": "blob:dummy"}, kind)
+
+    assert res.data == payload
+    assert res.mime == expected_mime

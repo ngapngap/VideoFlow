@@ -1,8 +1,11 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import { api, type MuseAccount, type MuseQuotaSnapshot, type ProxyItem } from "./api";
+  import { isAccountActionBlocked, shouldSyncSelectedProxy } from "./asyncGuard";
   import Icons from "./Icons.svelte";
   import Modal from "./Modal.svelte";
+  import { isQuotaExhausted } from "./museStatus";
+  import { formatHostPort } from "./proxyInput";
   import { formatApiError, showToast } from "./store";
 
   export let account: MuseAccount;
@@ -21,18 +24,41 @@
   let actionBusy = false;
   let quotaBusy = false;
   let quotaErr = "";
-  let selectedProxyId = account.proxy_id || "";
+  let prevPropProxyId = account.proxy_id || "";
+  let selectedProxyId = prevPropProxyId;
   let proxySaving = false;
   let deleteConfirmOpen = false;
 
-  $: if (!proxySaving) {
-    selectedProxyId = account.proxy_id || "";
+  $: {
+    const nextPropProxyId = account.proxy_id || "";
+    if (shouldSyncSelectedProxy(prevPropProxyId, nextPropProxyId, proxySaving)) {
+      prevPropProxyId = nextPropProxyId;
+      selectedProxyId = nextPropProxyId;
+    }
   }
+
+  function isCardBusy(): boolean {
+    return isAccountActionBlocked({
+      actionBusy,
+      proxySaving,
+      quotaBusy,
+      running,
+      accountBusy: Boolean(account.busy),
+    });
+  }
+
+  $: actionBlocked = isAccountActionBlocked({
+    actionBusy,
+    proxySaving,
+    quotaBusy,
+    running,
+    accountBusy: Boolean(account.busy),
+  });
 
   function formatProxyOptionLabel(p: ProxyItem): string {
     const dot =
       p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
-    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const ipPart = p.exit_ip ? p.exit_ip : formatHostPort(p.host, p.port);
     const latPart =
       p.latency_ms != null
         ? `${p.latency_ms}ms`
@@ -68,29 +94,6 @@
     return Array.from(new Set(names));
   })();
 
-  function hasPositiveExtra(extra: string | null | undefined): boolean {
-    if (!extra || !extra.trim()) return false;
-    return /[1-9]/.test(extra);
-  }
-
-  function isResetDatePassed(resetsAt: string | null | undefined): boolean {
-    if (!resetsAt || !resetsAt.trim()) return false;
-    const raw = resetsAt.trim();
-    const parsed = Date.parse(raw);
-    if (!Number.isNaN(parsed)) {
-      return parsed <= Date.now();
-    }
-    return false;
-  }
-
-  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
-    const usedPct = museQuotaPct(q);
-    if (usedPct == null || usedPct < 100) return false;
-    if (hasPositiveExtra(q?.extra_left)) return false;
-    if (isResetDatePassed(q?.resets_at)) return false;
-    return true;
-  }
-
   function museAccState(a: MuseAccount): { key: string; label: string; cls: string } {
     const now = Date.now() / 1000;
     const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
@@ -104,7 +107,7 @@
         ? { key: "quota", label: "Hết hạn mức", cls: "warn" }
         : { key: "cooling", label: "Tạm chờ", cls: "info" };
     }
-    if (isQuotaExhausted(a.meta?.quota)) {
+    if (isQuotaExhausted(a)) {
       return { key: "quota", label: "Hết hạn mức", cls: "warn" };
     }
     return { key: "active", label: "Hoạt động", cls: "ok" };
@@ -151,7 +154,7 @@
 
   async function handleToggle(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
-    if (actionBusy || running) {
+    if (isCardBusy()) {
       input.checked = account.enabled;
       return;
     }
@@ -170,7 +173,7 @@
   async function handleProxySelectChange(e: Event) {
     const selectEl = e.currentTarget as HTMLSelectElement;
     const nextPid = selectEl.value;
-    if (proxySaving || running || actionBusy || quotaBusy || account.busy) {
+    if (isCardBusy()) {
       selectEl.value = account.proxy_id || "";
       return;
     }
@@ -178,7 +181,12 @@
     selectedProxyId = nextPid;
     proxySaving = true;
     try {
-      await api.muse_update_account(account.id, undefined, undefined, undefined, nextPid);
+      const res = await api.muse_update_account(account.id, undefined, undefined, undefined, nextPid);
+      if (res?.account) {
+        account = res.account;
+        prevPropProxyId = account.proxy_id || "";
+        selectedProxyId = prevPropProxyId;
+      }
       const pxName = proxies.find((p) => p.id === nextPid)?.name;
       showToast(
         "success",
@@ -197,7 +205,9 @@
   }
 
   async function handleRefreshQuota() {
-    if (quotaBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     quotaBusy = true;
     quotaErr = "";
     try {
@@ -218,7 +228,9 @@
   }
 
   async function handleRenew() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_renew_account(account.id);
@@ -236,7 +248,9 @@
   }
 
   async function handleReset() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     actionBusy = true;
     try {
       await api.muse_reset_account(account.id);
@@ -250,11 +264,17 @@
   }
 
   async function handleOpenLogin() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_open_login(account.id);
-      showToast("info", res.message || "Đang mở trình duyệt đăng nhập...");
+      if (res?.ok === false) {
+        showToast("error", res.message || "Không thể mở trình duyệt đăng nhập.");
+        return;
+      }
+      showToast("info", res?.message || "Đang mở trình duyệt đăng nhập...");
       dispatch("openLogin", { id: account.id });
     } catch (e) {
       showToast("error", `Không thể mở trình duyệt: ${formatApiError(e)}`);
@@ -264,11 +284,17 @@
   }
 
   async function handleOpenView() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_open_view(account.id);
-      showToast("info", res.message || "Đang mở trình duyệt xem hội thoại...");
+      if (res?.ok === false) {
+        showToast("error", res.message || "Không thể mở trình duyệt xem hội thoại.");
+        return;
+      }
+      showToast("info", res?.message || "Đang mở trình duyệt xem hội thoại...");
       dispatch("openView", { id: account.id });
     } catch (e) {
       showToast("error", `Không thể mở xem web: ${formatApiError(e)}`);
@@ -278,12 +304,16 @@
   }
 
   function requestDelete() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     deleteConfirmOpen = true;
   }
 
   async function confirmDelete() {
-    if (actionBusy || running) return;
+    if (isCardBusy()) {
+      return;
+    }
     actionBusy = true;
     try {
       await api.muse_delete_account(account.id);
@@ -318,7 +348,10 @@
       <input
         type="checkbox"
         checked={account.enabled}
-        disabled={actionBusy || running}
+        disabled={actionBlocked}
+        aria-label={account.enabled
+          ? `Tắt tài khoản ${account.label || account.id}`
+          : `Bật tài khoản ${account.label || account.id}`}
         on:change={handleToggle}
       />
       <span class="slider"></span>
@@ -369,8 +402,9 @@
     <select
       class="proxy-select"
       value={selectedProxyId}
+      aria-label={`Chọn proxy cho tài khoản ${account.label || account.id}`}
       on:change={handleProxySelectChange}
-      disabled={proxySaving || running || actionBusy || quotaBusy || Boolean(account.busy)}
+      disabled={actionBlocked}
     >
       <option value="">Trực tiếp (không dùng proxy)</option>
       {#each proxies as p (p.id)}
@@ -417,7 +451,7 @@
     <button
       type="button"
       class="btn-action primary"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleOpenLogin}
       title="Mở trình duyệt có giao diện để đăng nhập tài khoản Muse và tự động bắt token"
     >
@@ -429,7 +463,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleOpenView}
       title="Mở trình duyệt xem lịch sử hội thoại trên web của tài khoản này"
     >
@@ -440,7 +474,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={quotaBusy || running}
+      disabled={actionBlocked}
       on:click={handleRefreshQuota}
       title="Đọc lại hạn mức từ trang Settings → Usage của muse.ai"
     >
@@ -451,7 +485,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleRenew}
       title="Gia hạn phiên muse.ai và làm mới cookie"
     >
@@ -463,7 +497,7 @@
       <button
         type="button"
         class="btn-action"
-        disabled={actionBusy || running}
+        disabled={actionBlocked}
         on:click={handleReset}
         title="Đặt lại trạng thái khóa/tạm chờ về hoạt động để thử lại"
       >
@@ -475,7 +509,7 @@
     <button
       type="button"
       class="btn-action danger"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={requestDelete}
       title="Xóa tài khoản khỏi danh sách"
     >
@@ -496,6 +530,11 @@
     Bạn có chắc muốn xóa tài khoản <b>{account.label || account.id}</b> khỏi danh sách không?
     Hồ sơ trình duyệt và cookie lưu cục bộ của tài khoản này sẽ bị xóa khỏi pool.
   </p>
+  {#if running || Boolean(account.busy)}
+    <p class="acc-delete-busy-warn" role="alert">
+      Tài khoản đang bận hoặc batch đang chạy — không thể xóa lúc này.
+    </p>
+  {/if}
   <div slot="footer">
     <button
       type="button"
@@ -508,7 +547,7 @@
     <button
       type="button"
       class="btn-danger"
-      disabled={actionBusy}
+      disabled={actionBlocked}
       on:click={confirmDelete}
     >
       {actionBusy ? "Đang xóa..." : "Xóa tài khoản"}
@@ -857,5 +896,15 @@
   .btn-action:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .acc-delete-busy-warn {
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
   }
 </style>

@@ -1,7 +1,14 @@
 // Store toàn cục: dự án đang mở, trạng thái chạy, sự kiện từ lõi & hệ thống Toast (13.2)
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { api, type ChecklistItem, type ProjectInfo, type RunSummary } from "./api";
+import {
+  api,
+  type ChecklistItem,
+  type MuseAccount,
+  type MuseStatusView,
+  type ProjectInfo,
+  type RunSummary,
+} from "./api.js";
 
 export const project = writable<ProjectInfo | null>(null);
 export const running = writable(false);
@@ -26,6 +33,168 @@ export const maxAttemptsStore = writable<number>(3);
 export const assetCacheBust = writable<number>(Date.now());
 export const rowAssetRevs = writable<Record<string, number>>({});
 export const closeConfirmOpen = writable(false);
+
+// ━━ VideoFlow Muse centralized state & singleton 5s poller (M4) ━━
+export interface LockedAccountEvent {
+  id: string;
+  label?: string;
+}
+
+export interface MuseRefreshResult {
+  status: MuseStatusView | null;
+  accounts: MuseAccount[];
+  error: string | null;
+}
+
+export const museSidecarStatus = writable<MuseStatusView | null>(null);
+export const museAccounts = writable<MuseAccount[]>([]);
+export const eventLockedAccount = writable<LockedAccountEvent | null>(null);
+export const museLoading = writable<boolean>(false);
+
+let museRefreshSeq = 0;
+let museLockSeq = 0;
+let museRefreshInFlight: Promise<MuseRefreshResult> | null = null;
+let musePollRefs = 0;
+let musePollTimer: ReturnType<typeof setInterval> | null = null;
+
+export function clearEventLockedAccount(): void {
+  museLockSeq += 1;
+  eventLockedAccount.set(null);
+}
+
+function isSidecarStoppedError(err: unknown): boolean {
+  if (err && typeof err === "object" && (err as { code?: unknown }).code === "MUSE_SIDECAR_STOPPED") {
+    return true;
+  }
+  return formatApiError(err).includes("MUSE_SIDECAR_STOPPED");
+}
+
+export function refreshMuseState(opts?: { force?: boolean }): Promise<MuseRefreshResult> {
+  if (!opts?.force && museRefreshInFlight) {
+    return museRefreshInFlight;
+  }
+
+  const seq = ++museRefreshSeq;
+  const lockSeqAtStart = museLockSeq;
+  museLoading.set(true);
+
+  let run!: Promise<MuseRefreshResult>;
+  run = (async (): Promise<MuseRefreshResult> => {
+    let needsFollowUp = false;
+    try {
+      const st = await api.muse_sidecar_status();
+      if (seq !== museRefreshSeq) {
+        return { status: st, accounts: get(museAccounts), error: null };
+      }
+
+      museSidecarStatus.set(st);
+
+      if (!st.sidecar.running) {
+        museAccounts.set([]);
+        if (lockSeqAtStart === museLockSeq) {
+          eventLockedAccount.set(null);
+        } else {
+          needsFollowUp = true;
+        }
+        return { status: st, accounts: [], error: null };
+      }
+
+      try {
+        const accRes = await api.muse_list_accounts();
+        if (seq !== museRefreshSeq) {
+          return { status: st, accounts: accRes.data ?? [], error: null };
+        }
+
+        const accounts = accRes.data ?? [];
+        museAccounts.set(accounts);
+
+        if (lockSeqAtStart === museLockSeq) {
+          eventLockedAccount.update((cur) => {
+            if (!cur) return null;
+            const matched = accounts.find((a) => a.id === cur.id);
+            if (!matched || !matched.enabled || matched.status !== "video_locked") {
+              return null;
+            }
+            return cur;
+          });
+        } else {
+          needsFollowUp = true;
+        }
+
+        return { status: st, accounts, error: null };
+      } catch (accErr) {
+        if (seq === museRefreshSeq && isSidecarStoppedError(accErr)) {
+          museSidecarStatus.set({
+            ...st,
+            sidecar: { ...st.sidecar, running: false },
+          });
+          museAccounts.set([]);
+          if (lockSeqAtStart === museLockSeq) {
+            eventLockedAccount.set(null);
+          } else {
+            needsFollowUp = true;
+          }
+          return { status: get(museSidecarStatus), accounts: [], error: formatApiError(accErr) };
+        }
+        return {
+          status: st,
+          accounts: get(museAccounts),
+          error: formatApiError(accErr),
+        };
+      }
+    } catch (err) {
+      if (seq === museRefreshSeq && isSidecarStoppedError(err)) {
+        museSidecarStatus.set(null);
+        museAccounts.set([]);
+        if (lockSeqAtStart === museLockSeq) {
+          eventLockedAccount.set(null);
+        } else {
+          needsFollowUp = true;
+        }
+        return { status: null, accounts: [], error: formatApiError(err) };
+      }
+      return {
+        status: get(museSidecarStatus),
+        accounts: get(museAccounts),
+        error: formatApiError(err),
+      };
+    } finally {
+      if (seq === museRefreshSeq) {
+        museLoading.set(false);
+        if (museRefreshInFlight === run) {
+          museRefreshInFlight = null;
+        }
+      }
+      if (needsFollowUp && seq === museRefreshSeq) {
+        void refreshMuseState({ force: true });
+      }
+    }
+  })();
+
+  museRefreshInFlight = run;
+  return run;
+}
+
+export function startMusePolling(): () => void {
+  musePollRefs += 1;
+  if (musePollRefs === 1) {
+    void refreshMuseState();
+    musePollTimer = setInterval(() => {
+      void refreshMuseState();
+    }, 5000);
+  }
+
+  let stopped = false;
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    musePollRefs = Math.max(0, musePollRefs - 1);
+    if (musePollRefs === 0 && musePollTimer !== null) {
+      clearInterval(musePollTimer);
+      musePollTimer = null;
+    }
+  };
+}
 
 export function bumpRowAssetRev(rowKey?: string | null): void {
   const now = Date.now();
@@ -102,6 +271,19 @@ export function resetProjectRunState(): void {
     chip: "Tất cả",
     search: "",
   }));
+}
+
+let projectSwitchSeq = 0;
+
+/** Advances and returns the monotonic project-switch sequence counter. */
+export function beginProjectSwitch(): number {
+  projectSwitchSeq += 1;
+  return projectSwitchSeq;
+}
+
+/** Returns the current monotonic project-switch sequence counter. */
+export function getProjectSwitchSeq(): number {
+  return projectSwitchSeq;
 }
 
 export type ToastType = "success" | "warn" | "error" | "info";
@@ -429,4 +611,16 @@ export async function initEvents(): Promise<void> {
       // bỏ qua nếu môi trường không hỗ trợ Web Notification
     }
   });
+
+  await safeListen<{ account_id?: string; id?: string; label?: string }>(
+    "account_video_locked",
+    (p) => {
+      const accId = p?.account_id || p?.id || "";
+      if (accId) {
+        museLockSeq += 1;
+        eventLockedAccount.set({ id: accId, label: p?.label || accId });
+      }
+      void refreshMuseState({ force: true });
+    }
+  );
 }

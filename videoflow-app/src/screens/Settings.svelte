@@ -3,18 +3,34 @@
   import { createEventDispatcher, onDestroy, onMount } from "svelte";
   const dispatch = createEventDispatcher<{ navigate: string }>();
   import {
+    beginProjectSwitch,
     confirmStartEnabled,
     endpointStatus,
     formatApiError,
     maxAttemptsStore,
+    museAccounts,
+    museSidecarStatus,
     project,
+    refreshMuseState,
     resetProjectRunState,
     rowChangedTick,
     running,
     settingsDirty,
     showToast,
   } from "../lib/store";
-  import { api, type ProbeResult, type Settings, type SettingsView } from "../lib/api";
+  import {
+    api,
+    type MuseStatusView,
+    type ProbeResult,
+    type Settings,
+    type SettingsView,
+  } from "../lib/api";
+  import {
+    executeSettingsSave,
+    getVideoSecondsMax,
+    isValidIntInRange,
+    validateVideoSeconds,
+  } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
@@ -69,41 +85,39 @@
   let videoModelMsg = "";
 
   // ━━ VideoFlow Muse nội bộ: engine + pool cookie + hạn mức (tab Endpoint video) ━━
-  type MuseAccount = import("../lib/api").MuseAccount;
-  type MuseQuotaSnapshot = import("../lib/api").MuseQuotaSnapshot;
-  type MuseStatusView = import("../lib/api").MuseStatusView;
-
-  let museStatus: import("../lib/api").MuseStatusView | null = null;
-  let museAccounts: MuseAccount[] = [];
   let museLoading = false;
   let museErr = "";
-  let museSidecarBusy = false;
+  let museStarting = false;
+  let museStopping = false;
+  let museRestarting = false;
+  $: museSidecarBusy = museStarting || museStopping || museRestarting;
+  let destroyed = false;
+  let museRefreshSeq = 0;
 
   async function museRefresh() {
+    const seq = ++museRefreshSeq;
     museLoading = true;
     museErr = "";
     try {
-      museStatus = await api.muse_sidecar_status();
-      if (museStatus.sidecar.running) {
-        try {
-          const accs = await api.muse_list_accounts();
-          museAccounts = accs.data ?? [];
-        } catch {
-          museAccounts = [];
-        }
-      } else {
-        museAccounts = [];
+      const res = await refreshMuseState({ force: true });
+      if (destroyed || seq !== museRefreshSeq) return;
+      if (res.error) {
+        museErr = res.error;
       }
     } catch (e) {
-      museErr = formatApiError(e);
+      if (!destroyed && seq === museRefreshSeq) {
+        museErr = formatApiError(e);
+      }
     } finally {
-      museLoading = false;
+      if (!destroyed && seq === museRefreshSeq) {
+        museLoading = false;
+      }
     }
   }
 
   async function museStart() {
-    if (museSidecarBusy || $running) return;
-    museSidecarBusy = true;
+    if (museSidecarBusy || $running || $museSidecarStatus?.sidecar.running) return;
+    museStarting = true;
     museErr = "";
     try {
       await api.muse_start_sidecar();
@@ -113,7 +127,7 @@
       museErr = formatApiError(e);
       showToast("error", museErr);
     } finally {
-      museSidecarBusy = false;
+      museStarting = false;
     }
   }
 
@@ -129,7 +143,7 @@
       await save();
       if (dirty) return;
     }
-    museSidecarBusy = true;
+    museRestarting = true;
     museErr = "";
     try {
       await api.muse_stop_sidecar();
@@ -149,13 +163,13 @@
     } finally {
       // Luôn đồng bộ badge/nút theo trạng thái THẬT, kể cả khi lỗi.
       await museRefresh();
-      museSidecarBusy = false;
+      museRestarting = false;
     }
   }
 
   async function museStop() {
     if (museSidecarBusy || $running) return;
-    museSidecarBusy = true;
+    museStopping = true;
     try {
       await api.muse_stop_sidecar();
       showToast("info", "Đã dừng engine VideoFlow Muse.");
@@ -163,7 +177,7 @@
     } catch (e) {
       museErr = formatApiError(e);
     } finally {
-      museSidecarBusy = false;
+      museStopping = false;
     }
   }
 
@@ -195,16 +209,12 @@
     return out;
   }
 
-  $: museChanged = museChangedFields(museStatus, s);
+  $: museChanged = museChangedFields($museSidecarStatus, s);
 
-  // Khi mở tab Video lần đầu: nạp status sidecar (chưa spawn — chỉ đọc trạng thái)
-  let museLoadedOnce = false;
+  // Khi mở tab Video: luôn nạp status sidecar mới nhất từ store
   function onSelectTabVideo() {
     selectTab("video");
-    if (!museLoadedOnce) {
-      museLoadedOnce = true;
-      museRefresh();
-    }
+    void museRefresh();
   }
 
   // Modal xác nhận khi thư mục mới trống / thiếu thành phần / lỗi CSV
@@ -273,18 +283,12 @@
   }
 
   onDestroy(() => {
+    destroyed = true;
+    ++museRefreshSeq;
     clearSaveMsgTimer();
     hideAllKeyVisibility();
     if (!dirty) settingsDirty.set(false);
   });
-
-  function isValidIntInRange(val: unknown, min: number, max: number): boolean {
-    if (val === null || val === undefined || (typeof val === "string" && val.trim() === "")) {
-      return false;
-    }
-    const n = Number(val);
-    return Number.isFinite(n) && Number.isInteger(n) && n >= min && n <= max;
-  }
 
   function isValidHttpUrl(val: string | undefined | null): boolean {
     if (!val) return false;
@@ -320,8 +324,9 @@
     if (!cfg.video_size?.trim()) {
       errs.push("Kích thước khung hình video không được để trống.");
     }
-    if (!isValidIntInRange(cfg.video_seconds, 1, 120)) {
-      errs.push("Thời lượng video phải là số nguyên từ 1 đến 120 giây.");
+    const videoSecondsErr = validateVideoSeconds(cfg.video_seconds, cfg.video_source);
+    if (videoSecondsErr) {
+      errs.push(videoSecondsErr);
     }
     if (!isValidIntInRange(cfg.poll_interval_s, 1, 600)) {
       errs.push("Chu kỳ poll trạng thái phải là số nguyên từ 1 đến 600 giây.");
@@ -448,20 +453,6 @@
     if (!s || !formValid || $running || saving) return;
     saving = true;
     try {
-      if (imageKeyInput.trim()) {
-        await api.set_api_key("anh", imageKeyInput.trim());
-        imageKeyInput = "";
-      } else if (pendingClearImageKey) {
-        await api.set_api_key("anh", "");
-      }
-
-      if (videoKeyInput.trim()) {
-        await api.set_api_key("video", videoKeyInput.trim());
-        videoKeyInput = "";
-      } else if (pendingClearVideoKey) {
-        await api.set_api_key("video", "");
-      }
-
       const payload: Settings = {
         ...s,
         endpoint_image_base_url: s.endpoint_image_base_url.trim(),
@@ -483,25 +474,69 @@
         ],
         schedule_hours: Math.round(Number(s.schedule_hours)),
         auto_cleanup_days: Math.round(Number(s.auto_cleanup_days)),
+        muse_chromium_path: (s.muse_chromium_path || "").trim(),
+        muse_sidecar_port: Math.round(Number(s.muse_sidecar_port)),
       };
 
-      await api.save_settings(payload);
-      const view = await api.get_settings();
-      applySettingsView(view);
-      hideAllKeyVisibility();
-      dirty = false;
-      // Cấu hình engine (port/Edge/headless) đổi → hỏi lại trạng thái để hiện cảnh báo
-      // "cần khởi động lại" ngay, không bắt người dùng bấm Làm mới.
-      if (museStatus?.sidecar.running) {
-        museRefresh();
+      const result = await executeSettingsSave({
+        payload,
+        imageKeyInput,
+        videoKeyInput,
+        pendingClearImageKey,
+        pendingClearVideoKey,
+        deps: {
+          saveSettings: (cfg) => api.save_settings(cfg),
+          setApiKey: (which, value) => api.set_api_key(which, value),
+          getSettings: () => api.get_settings(),
+        },
+        onImageKeyApplied: () => {
+          imageKeyInput = "";
+          pendingClearImageKey = false;
+        },
+        onVideoKeyApplied: () => {
+          videoKeyInput = "";
+          pendingClearVideoKey = false;
+        },
+      });
+
+      const shouldRefreshMuse =
+        Boolean($museSidecarStatus?.sidecar.running) ||
+        payload.video_source === "internal" ||
+        payload.image_source === "internal";
+
+      if (result.ok) {
+        applySettingsView(result.view);
+        hideAllKeyVisibility();
+        dirty = false;
+        // Cấu hình engine (port/Edge/headless) đổi → hỏi lại trạng thái để hiện cảnh báo
+        // "cần khởi động lại" ngay, không bắt người dùng bấm Làm mới.
+        if (shouldRefreshMuse) {
+          void museRefresh();
+        }
+        saveMsg = "Đã lưu cài đặt thành công";
+        showToast("success", "Đã lưu cấu hình hệ thống.");
+        clearSaveMsgTimer();
+        if (!destroyed) {
+          saveMsgTimer = setTimeout(() => {
+            saveMsgTimer = null;
+            if (!dirty) saveMsg = "";
+          }, 3000);
+        }
+      } else {
+        if (result.settingsPersisted) {
+          const keepPendingClearImage = pendingClearImageKey;
+          const keepPendingClearVideo = pendingClearVideoKey;
+          if (result.refreshedView) {
+            applySettingsView(result.refreshedView);
+          }
+          pendingClearImageKey = keepPendingClearImage;
+          pendingClearVideoKey = keepPendingClearVideo;
+          if (shouldRefreshMuse) {
+            void museRefresh();
+          }
+        }
+        showToast("error", formatApiError(result.error));
       }
-      saveMsg = "Đã lưu cài đặt thành công";
-      showToast("success", "Đã lưu cấu hình hệ thống.");
-      clearSaveMsgTimer();
-      saveMsgTimer = setTimeout(() => {
-        saveMsgTimer = null;
-        if (!dirty) saveMsg = "";
-      }, 3000);
     } catch (e) {
       showToast("error", formatApiError(e));
     } finally {
@@ -523,6 +558,7 @@
     try {
       const dir = await api.pick_folder();
       if (!dir) return;
+      beginProjectSwitch();
       const probe = await api.probe_folder(dir);
       const writeItem = probe.checklist.find((i) => i.key === "write");
       if (writeItem && !writeItem.ok) {
@@ -531,6 +567,7 @@
       }
 
       if (probe.has_full_structure && probe.prompts_valid !== false) {
+        beginProjectSwitch();
         const info = await api.load_project(dir);
         resetProjectRunState();
         project.set(info);
@@ -552,6 +589,7 @@
   async function confirmSwitchProjectFolder() {
     if (!probedDir || !probeInfo) return;
     switchingFolder = true;
+    beginProjectSwitch();
     try {
       const info =
         probeInfo.has_full_structure &&
@@ -1182,8 +1220,8 @@
             <div class="muse-title">
               <Icons name="video" size={16} />
               <strong>VideoFlow Muse (nội bộ)</strong>
-              {#if museStatus?.sidecar.running}
-                <span class="muse-badge ok">Đang chạy{museStatus.sidecar.version ? ` · v${museStatus.sidecar.version}` : ""}</span>
+              {#if $museSidecarStatus?.sidecar.running}
+                <span class="muse-badge ok">Đang chạy{$museSidecarStatus.sidecar.version ? ` · v${$museSidecarStatus.sidecar.version}` : ""}</span>
               {:else}
                 <span class="muse-badge mute">Đã dừng</span>
               {/if}
@@ -1192,26 +1230,26 @@
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy || $running}
+                disabled={museSidecarBusy || $running || Boolean($museSidecarStatus?.sidecar.running)}
                 on:click={museStart}
               >
                 <Icons name="play" size={14} />
-                <span>{museSidecarBusy ? "Đang khởi động..." : "Khởi động"}</span>
+                <span>{museStarting ? "Đang khởi động..." : "Khởi động"}</span>
               </button>
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy || $running || !museStatus?.sidecar.running}
+                disabled={museSidecarBusy || $running || !$museSidecarStatus?.sidecar.running}
                 on:click={museStop}
               >
                 <Icons name="stop" size={14} />
-                <span>Dừng</span>
+                <span>{museStopping ? "Đang dừng..." : "Dừng"}</span>
               </button>
               <button type="button" class="btn-secondary" disabled={museLoading} on:click={museRefresh}>
                 <Icons name="refresh" size={14} />
                 <span>{museLoading ? "Đang tải..." : "Làm mới"}</span>
               </button>
-              {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+              {#if $museSidecarStatus?.sidecar.running && $museSidecarStatus.sidecar.restart_required}
                 <button
                   type="button"
                   class="btn-primary"
@@ -1220,13 +1258,13 @@
                   title="Cài đặt Port / Edge / headless đã đổi — áp dụng bằng cách khởi động lại engine"
                 >
                   <Icons name="redo" size={14} />
-                  <span>{museSidecarBusy ? "Đang áp dụng..." : "Áp dụng & khởi động lại"}</span>
+                  <span>{museRestarting ? "Đang áp dụng..." : "Áp dụng & khởi động lại"}</span>
                 </button>
               {/if}
             </div>
           </div>
 
-          {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+          {#if $museSidecarStatus?.sidecar.running && $museSidecarStatus.sidecar.restart_required}
             <div class="muse-stale-config">
               <Icons name="alert" size={14} />
               <span>
@@ -1242,8 +1280,8 @@
           <div class="hint">
             Sidecar tự dò Microsoft Edge/Chrome trên máy và điều khiển headless. Cookie muse.ai lưu
             trong thư mục dữ liệu app và tự gia hạn phiên mỗi 10 phút.
-            {#if museStatus?.chromium_path}
-              <br />Trình duyệt: <code>{museStatus.chromium_path}</code>
+            {#if $museSidecarStatus?.chromium_path}
+              <br />Trình duyệt: <code>{$museSidecarStatus.chromium_path}</code>
             {/if}
           </div>
 
@@ -1293,7 +1331,7 @@
             <div class="muse-summary-info">
               <Icons name="video-source" size={16} />
               <span>
-                {museAccounts.length} tài khoản · {museAccounts.filter((a) => a.enabled).length} đang bật
+                {$museAccounts.length} tài khoản · {$museAccounts.filter((a) => a.enabled).length} đang bật
               </span>
             </div>
             <button
@@ -1323,14 +1361,16 @@
             />
           </div>
           <div>
-            <label class="label" for="cfg-vid-seconds">Thời lượng video (giây)</label>
+            <label class="label" for="cfg-vid-seconds">
+              Thời lượng video (giây){s.video_source === "internal" ? " — tối đa 60s" : ""}
+            </label>
             <input
               id="cfg-vid-seconds"
               class="input full"
-              class:invalid={!isValidIntInRange(s.video_seconds, 1, 120)}
+              class:invalid={!isValidIntInRange(s.video_seconds, 1, getVideoSecondsMax(s.video_source))}
               type="number"
               min="1"
-              max="120"
+              max={getVideoSecondsMax(s.video_source)}
               bind:value={s.video_seconds}
               on:input={mark}
               disabled={$running}

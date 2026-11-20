@@ -50,24 +50,35 @@ fn active_api_key(base_url: &str, which: &str) -> String {
     crate::settings::get_api_key(which).unwrap_or_default()
 }
 
-/// Resolve base URL + key cho nguồn video theo `video_source`:
-/// - `"internal"`: sidecar muse2api nội bộ `http://127.0.0.1:{port}/v1` + key phiên.
+/// Resolve base URL + key + model cho nguồn video theo `video_source`:
+/// - `"internal"`: sidecar muse2api nội bộ `http://127.0.0.1:{port}/v1`, key phiên,
+///   model cố định `"muse-video"` (muse2api tự resolve alias).
 ///   Sidecar chưa chạy thì tự spawn (lazy). Lỗi spawn → ApiFail NghiepVu (không
 ///   retry — lỗi cấu hình/môi trường, người dùng phải sửa xong mới chạy lại).
-/// - Mặc định `"gateway"`: giữ nguyên endpoint ngoài đã lưu + key từ keyring.
-fn resolve_video_base_and_key(cfg: &Settings) -> Result<(String, String), ApiFail> {
+/// - Mặc định `"gateway"`: giữ nguyên endpoint ngoài đã lưu + model đã cấu hình + key keyring.
+fn resolve_video_base_and_key(cfg: &Settings) -> Result<(String, String, String), ApiFail> {
+    resolve_video_base_and_key_with(cfg, crate::muse_sidecar::ensure_running)
+}
+
+fn resolve_video_base_and_key_with<F>(
+    cfg: &Settings,
+    ensure_sidecar: F,
+) -> Result<(String, String, String), ApiFail>
+where
+    F: FnOnce(&Settings) -> AppResult<crate::muse_sidecar::SidecarSession>,
+{
     if cfg.video_source != "internal" {
         let base = cfg.endpoint_video_base_url.trim().trim_end_matches('/').to_string();
         let key = active_api_key(&base, "video");
-        return Ok((base, key));
+        return Ok((base, key, cfg.endpoint_video_model.trim().to_string()));
     }
-    match crate::muse_sidecar::ensure_running(cfg) {
-        Ok(session) => Ok((session.v1_base(), session.api_key)),
+    match ensure_sidecar(cfg) {
+        Ok(session) => Ok((session.v1_base(), session.api_key, "muse-video".to_string())),
         Err(e) => Err(ApiFail {
             kind: ApiFailKind::NghiepVu,
             http_status: None,
             code: "MUSE_SIDECAR_UNAVAILABLE".into(),
-            message: e.message,
+            message: crate::settings::redact_secrets(&e.message),
         }),
     }
 }
@@ -92,7 +103,7 @@ fn resolve_image_base_and_key(cfg: &Settings) -> Result<(String, String, String)
             kind: ApiFailKind::NghiepVu,
             http_status: None,
             code: "MUSE_SIDECAR_UNAVAILABLE".into(),
-            message: e.message,
+            message: crate::settings::redact_secrets(&e.message),
         }),
     }
 }
@@ -193,8 +204,11 @@ impl ApiFail {
                     .or_else(|| v.get("detail"))
                     .and_then(|m| m.as_str().map(|s| s.to_string()).or_else(|| Some(m.to_string())))
             })
-            .unwrap_or_else(|| body.chars().take(300).collect::<String>().trim().to_string());
-        let msg = crate::settings::redact_secrets(&msg);
+            .unwrap_or_else(|| body.trim().to_string());
+        let msg: String = crate::settings::redact_secrets(&msg)
+            .chars()
+            .take(300)
+            .collect();
 
         let err_code_json = parsed
             .as_ref()
@@ -363,7 +377,9 @@ pub fn sanitize_url_segment(seg: &str, allow_slash: bool) -> Result<String, ApiF
             kind: ApiFailKind::NghiepVu,
             http_status: None,
             code: "UNSAFE_URL_SEGMENT".into(),
-            message: format!("Định danh từ server chứa ký tự không an toàn: '{trimmed}'"),
+            message: crate::settings::redact_secrets(&format!(
+                "Định danh từ server chứa ký tự không an toàn: '{trimmed}'"
+            )),
         });
     }
     Ok(trimmed.to_string())
@@ -419,6 +435,7 @@ pub fn ensure_png_bytes(raw_bytes: Vec<u8>, status: u16) -> Result<Vec<u8>, ApiF
 
 // ━━━━━━━━━━━━━━━━━━━━━━ B2 - Tạo ảnh (5.1, 5.5) ━━━━━━━━━━━━━━━━━━━━━━
 
+#[derive(Debug)]
 pub struct ImageResult {
     pub png_bytes: Vec<u8>,
     pub duration_ms: u128,
@@ -497,7 +514,10 @@ pub fn create_image(cfg: &Settings, image_path: &Path, prompt: &str) -> Result<I
             code: "BAD_RESPONSE".into(),
             message: format!(
                 "Thiếu trường data[0].b64_json trong response: {}",
-                body.chars().take(200).collect::<String>()
+                crate::settings::redact_secrets(&body)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             ),
         })?;
 
@@ -526,6 +546,7 @@ pub fn create_image(cfg: &Settings, image_path: &Path, prompt: &str) -> Result<I
 
 // ━━━━━━━━━━━━━━━━━━━━━━ B3 - Tạo video (5.1, 5.5, 5.6, 13.3, 13.6) ━━━━━━━━━━━━━━━━━━━━━━
 
+#[derive(Debug)]
 pub struct VideoTask {
     pub task_id: String,
     pub reencoded_jpeg: bool,
@@ -597,6 +618,25 @@ pub fn create_video_task(
     prompt: &str,
     idempotency_key: Option<&str>,
 ) -> Result<VideoTask, ApiFail> {
+    create_video_task_inner(
+        cfg,
+        image_path,
+        prompt,
+        idempotency_key,
+        crate::muse_sidecar::ensure_running,
+    )
+}
+
+fn create_video_task_inner<F>(
+    cfg: &Settings,
+    image_path: &Path,
+    prompt: &str,
+    idempotency_key: Option<&str>,
+    ensure_sidecar: F,
+) -> Result<VideoTask, ApiFail>
+where
+    F: FnOnce(&Settings) -> AppResult<crate::muse_sidecar::SidecarSession>,
+{
     let file_bytes = std::fs::read(image_path).map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
         http_status: None,
@@ -608,11 +648,11 @@ pub fn create_video_task(
     let (data_url, reencoded_jpeg) =
         build_video_image_data_url_info(&file_bytes, image_path, MAX_VIDEO_INPUT_IMAGE_BYTES)?;
 
-    let (base_clean, key) = resolve_video_base_and_key(cfg)?;
+    let (base_clean, key, model) = resolve_video_base_and_key_with(cfg, ensure_sidecar)?;
     let url = format!("{base_clean}/videos");
 
     let payload = serde_json::json!({
-        "model": cfg.endpoint_video_model.trim(),
+        "model": model,
         "prompt": prompt,
         "image": data_url,
         "input_reference": data_url,
@@ -666,7 +706,10 @@ pub fn create_video_task(
             code: "BAD_RESPONSE".into(),
             message: format!(
                 "Không tìm thấy task_id trong response: {}",
-                body.chars().take(200).collect::<String>()
+                crate::settings::redact_secrets(&body)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             ),
         })?;
 
@@ -710,6 +753,7 @@ pub fn classify_poll_task_failure(json: &Value) -> PollOutcome {
             }
         })
         .unwrap_or_else(|| "Task báo lỗi trên máy chủ".into());
+    let msg = crate::settings::redact_secrets(&msg);
 
     let raw_code = err_obj
         .and_then(|e| {
@@ -819,7 +863,7 @@ pub fn classify_poll_task_failure(json: &Value) -> PollOutcome {
 /// Bước 2 của B3: poll một lần GET /v1/videos/{task_id} theo bảng giá trị 13.3.
 pub fn poll_once(cfg: &Settings, task_id: &str) -> Result<PollOutcome, ApiFail> {
     let safe_tid = sanitize_url_segment(task_id, false)?;
-    let (base_clean, key) = resolve_video_base_and_key(cfg)?;
+    let (base_clean, key, _model) = resolve_video_base_and_key(cfg)?;
     let url = format!("{base_clean}/videos/{safe_tid}");
 
     let resp = client_for_url(60, &url)
@@ -995,7 +1039,7 @@ pub fn media_url(cfg: &Settings, name: &str) -> Result<String, ApiFail> {
     let clean = clean.strip_prefix("v1/media/").unwrap_or(clean);
     let clean = clean.strip_prefix("media/").unwrap_or(clean);
     let safe = sanitize_url_segment(clean, true)?;
-    let (base, _key) = resolve_video_base_and_key(cfg)?;
+    let (base, _key, _model) = resolve_video_base_and_key(cfg)?;
     Ok(format!("{base}/media/{safe}"))
 }
 
@@ -1070,6 +1114,7 @@ pub fn verify_mp4_file(path: &Path, expected_len: Option<u64>) -> Result<u64, St
     Ok(actual_len)
 }
 
+#[derive(Debug)]
 pub struct DownloadResult {
     pub bytes: u64,
     pub final_url: String,
@@ -1100,7 +1145,7 @@ pub fn download_video(
             ));
         }
 
-        let (base_clean, key) = resolve_video_base_and_key(cfg)?;
+        let (base_clean, key, _model) = resolve_video_base_and_key(cfg)?;
         let attach_auth = !key.is_empty() && is_same_origin(&current_url, &base_clean);
 
         let mut req = client_for_url(600, current_url.trim()).get(current_url.trim());
@@ -1124,7 +1169,10 @@ pub fn download_video(
                                 continue;
                             }
                             Err(e) => {
-                                last_err = format!("HTTP_{st} (URL mới không hợp lệ: {})", e.message);
+                                last_err = crate::settings::redact_secrets(&format!(
+                                    "HTTP_{st} (URL mới không hợp lệ: {})",
+                                    e.message
+                                ));
                             }
                         },
                         Ok(PollOutcome::TaskGone) => {
@@ -1133,19 +1181,22 @@ pub fn download_video(
                                 kind: ApiFailKind::TamThoi { retry_after_s: None },
                                 http_status: Some(404),
                                 code: "DOWNLOAD_TASK_GONE".into(),
-                                message: format!(
+                                message: crate::settings::redact_secrets(&format!(
                                     "URL tải hết hạn ({st}) và task {task_id} không còn tồn tại trên server (404)"
-                                ),
+                                )),
                             });
                         }
                         Ok(_) => {
                             last_err = format!("HTTP_{st} (không lấy được URL mới từ task)");
                         }
                         Err(e) => {
-                            last_err = format!("HTTP_{st} (làm mới URL lỗi: {})", e.message);
+                            last_err = crate::settings::redact_secrets(&format!(
+                                "HTTP_{st} (làm mới URL lỗi: {})",
+                                e.message
+                            ));
                         }
                     }
-                } else if st == 200 || st == 206 {
+                } else if st == 200 {
                     let expected_len = if resp.headers().contains_key(reqwest::header::CONTENT_ENCODING) {
                         None
                     } else {
@@ -1173,9 +1224,9 @@ pub fn download_video(
                                         kind: ApiFailKind::NghiepVu,
                                         http_status: None,
                                         code: "WRITE_FAIL".into(),
-                                        message: format!(
+                                        message: crate::settings::redact_secrets(&format!(
                                             "Không đổi tên được file tạm sang MP4: {e}"
-                                        ),
+                                        )),
                                     }
                                 })?;
                                 return Ok(DownloadResult {
@@ -1194,7 +1245,9 @@ pub fn download_video(
                                 kind: ApiFailKind::NghiepVu,
                                 http_status: None,
                                 code: "WRITE_FAIL".into(),
-                                message: format!("Không ghi được file tạm vào video_out/: {e}"),
+                                message: crate::settings::redact_secrets(&format!(
+                                    "Không ghi được file tạm vào video_out/: {e}"
+                                )),
                             });
                         }
                         Err(stream_err) => {
@@ -1207,7 +1260,7 @@ pub fn download_video(
                 }
             }
             Err(e) => {
-                last_err = format!("Lỗi mạng khi tải video: {e}");
+                last_err = crate::settings::redact_secrets(&format!("Lỗi mạng khi tải video: {e}"));
             }
         }
 
@@ -1229,7 +1282,9 @@ pub fn download_video(
         kind: ApiFailKind::TamThoi { retry_after_s: None },
         http_status: None,
         code: "DOWNLOAD_FAIL".into(),
-        message: format!("Tải video thất bại sau 3 lần thử: {last_err}"),
+        message: crate::settings::redact_secrets(&format!(
+            "Tải video thất bại sau 3 lần thử: {last_err}"
+        )),
     })
 }
 
@@ -1254,7 +1309,7 @@ pub fn resolve_endpoint_and_key(
             let resolved = if which == "anh" {
                 resolve_image_base_and_key(cfg).map(|(b, k, _m)| (b, k))
             } else {
-                resolve_video_base_and_key(cfg)
+                resolve_video_base_and_key(cfg).map(|(b, k, _m)| (b, k))
             };
             // Lỗi engine: về rỗng để caller báo "Chưa nhập Base URL" dễ hiểu hơn là
             // nổ lỗi nội bộ trong lúc user chỉ đang bấm Test kết nối.
@@ -1272,7 +1327,10 @@ pub fn resolve_endpoint_and_key(
     let resolved_key = api_key
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|k| {
+            crate::settings::register_secret_for_redaction(k);
+            k.to_owned()
+        })
         .unwrap_or_else(|| crate::settings::get_api_key(which).unwrap_or_default());
 
     (resolved_base, resolved_key)
@@ -1308,7 +1366,11 @@ pub fn test_connection(
                 Ok((false, elapsed, fail.message))
             }
         }
-        Err(e) => Ok((false, elapsed, format!("Không kết nối được: {e}"))),
+        Err(e) => Ok((
+            false,
+            elapsed,
+            crate::settings::redact_secrets(&format!("Không kết nối được: {e}")),
+        )),
     }
 }
 
@@ -1331,19 +1393,29 @@ pub fn list_models(
     if !key.is_empty() {
         req = req.bearer_auth(&key);
     }
-    let resp = req
-        .send()
-        .map_err(|e| AppError::new("NETWORK", format!("Không gọi được endpoint: {e}")))?;
+    let resp = req.send().map_err(|e| {
+        AppError::new(
+            "NETWORK",
+            crate::settings::redact_secrets(&format!("Không gọi được endpoint: {e}")),
+        )
+    })?;
     let status = resp.status().as_u16();
-    let body = resp
-        .text()
-        .map_err(|e| AppError::new("NETWORK", format!("Đọc response lỗi: {e}")))?;
+    let body = resp.text().map_err(|e| {
+        AppError::new(
+            "NETWORK",
+            crate::settings::redact_secrets(&format!("Đọc response lỗi: {e}")),
+        )
+    })?;
     if status != 200 {
         let fail = ApiFail::classify_http(status, None, &body);
         return Err(AppError::new(&fail.code, fail.message));
     }
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| AppError::new("BAD_RESPONSE", format!("Response không phải JSON: {e}")))?;
+    let json: Value = serde_json::from_str(&body).map_err(|e| {
+        AppError::new(
+            "BAD_RESPONSE",
+            crate::settings::redact_secrets(&format!("Response không phải JSON: {e}")),
+        )
+    })?;
     let ids = json
         .get("data")
         .and_then(|d| d.as_array())
@@ -1692,5 +1764,338 @@ mod tests {
         );
         assert_eq!(fail.kind, ApiFailKind::HetQuota);
         assert_eq!(fail.code, "QUOTA_EXHAUSTED");
+    }
+
+    #[test]
+    fn internal_video_mode_uses_muse_video_model() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_m3_video_model_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let img_path = tmp_dir.join("prod.png");
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(&img_path, image::ImageFormat::Png)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock video server");
+        let port = listener.local_addr().unwrap().port();
+        let captured_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let models_clone = Arc::clone(&captured_models);
+
+        let server = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let s = String::from_utf8_lossy(&buf);
+                    if let Some(idx) = s.find("\r\n\r\n") {
+                        let headers_part = &s[..idx];
+                        let content_len = headers_part
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= idx + 4 + content_len {
+                            let body_bytes = &buf[idx + 4..idx + 4 + content_len];
+                            let v: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
+                            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                                models_clone.lock().unwrap().push(m.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+                let resp_body = format!(r#"{{"id":"task_m3_{i}"}}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        // 1. Internal video mode MUST send "muse-video" even when endpoint_video_model is "sora-2".
+        let internal_cfg = Settings {
+            video_source: "internal".to_string(),
+            endpoint_video_model: "sora-2".to_string(),
+            ..Settings::default()
+        };
+        let (base, key, model) = resolve_video_base_and_key_with(&internal_cfg, |_| {
+            Ok(crate::muse_sidecar::SidecarSession {
+                port,
+                api_key: "vf_mock_key".to_string(),
+            })
+        })
+        .expect("resolve internal");
+        assert_eq!(base, format!("http://127.0.0.1:{port}/v1"));
+        assert_eq!(key, "vf_mock_key");
+        assert_eq!(model, "muse-video");
+
+        let task_int = create_video_task_inner(
+            &internal_cfg,
+            &img_path,
+            "animate product",
+            None,
+            |_| {
+                Ok(crate::muse_sidecar::SidecarSession {
+                    port,
+                    api_key: "vf_mock_key".to_string(),
+                })
+            },
+        )
+        .expect("create internal video task");
+        assert_eq!(task_int.task_id, "task_m3_0");
+
+        // 2. Gateway video mode MUST send cfg.endpoint_video_model.
+        let gateway_base = format!("http://127.0.0.1:{port}/v1");
+        register_test_api_key(&gateway_base, "gw_test_key");
+        let gateway_cfg = Settings {
+            video_source: "gateway".to_string(),
+            endpoint_video_base_url: gateway_base,
+            endpoint_video_model: "sora-2-pro".to_string(),
+            ..Settings::default()
+        };
+        let (_, _, gw_model) = resolve_video_base_and_key(&gateway_cfg).expect("resolve gateway");
+        assert_eq!(gw_model, "sora-2-pro");
+
+        let task_gw = create_video_task(&gateway_cfg, &img_path, "animate product", None)
+            .expect("create gateway video task");
+        assert_eq!(task_gw.task_id, "task_m3_1");
+
+        server.join().expect("mock video server");
+        let models = captured_models.lock().unwrap();
+        assert_eq!(models.as_slice(), &["muse-video", "sora-2-pro"]);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn adapters_error_paths_redact_secrets() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let known_secret = "secret_tok_adapters_m7_xyz";
+        crate::settings::register_secret_for_redaction(known_secret);
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_m7_redact_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let img_path = tmp_dir.join("ref.png");
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(&img_path, image::ImageFormat::Png)
+            .unwrap();
+
+        // 1. classify_poll_task_failure redacts Bearer, sk-, and KNOWN_SECRETS
+        let poll_err = classify_poll_task_failure(&serde_json::json!({
+            "status": "failed",
+            "error": {
+                "message": format!("failed with Bearer secret_bearer_999 sk-secret_sk_999 {known_secret}")
+            }
+        }));
+        match poll_err {
+            PollOutcome::Loi { message, .. } => {
+                assert!(!message.contains("secret_bearer_999"));
+                assert!(!message.contains("secret_sk_999"));
+                assert!(!message.contains(known_secret));
+                assert!(message.contains("[REDACTED]"));
+            }
+            other => panic!("expected PollOutcome::Loi, got {other:?}"),
+        }
+
+        // 2. sanitize_url_segment redacts secrets
+        let seg_err = sanitize_url_segment(
+            &format!("bad?Bearer secret_bearer_999 {known_secret}"),
+            false,
+        )
+        .unwrap_err();
+        assert!(!seg_err.message.contains("secret_bearer_999"));
+        assert!(!seg_err.message.contains(known_secret));
+        assert!(seg_err.message.contains("[REDACTED]"));
+
+        // 3. Mock server returning missing-field JSON (200 OK) for create_image & create_video_task, plus 200 OK for download_video write failure
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().unwrap().port();
+        let secret_body = format!(
+            r#"{{"unexpected":"Bearer secret_bearer_999 sk-secret_sk_999 {known_secret}"}}"#
+        );
+        let secret_body_clone = secret_body.clone();
+        let server = std::thread::spawn(move || {
+            for i in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if i < 2 {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        secret_body_clone.len(),
+                        secret_body_clone
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let payload = b"0000ftypmp420000";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(payload);
+                }
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        register_test_api_key(&base_url, "gw_test_key");
+        let cfg = Settings {
+            image_source: "gateway".to_string(),
+            video_source: "gateway".to_string(),
+            endpoint_image_base_url: base_url.clone(),
+            endpoint_video_base_url: base_url.clone(),
+            ..Settings::default()
+        };
+
+        let img_err = create_image(&cfg, &img_path, "prompt").expect_err("missing b64_json");
+        assert!(!img_err.message.contains("secret_bearer_999"));
+        assert!(!img_err.message.contains("secret_sk_999"));
+        assert!(!img_err.message.contains(known_secret));
+        assert!(img_err.message.contains("[REDACTED]"));
+
+        let vid_err = create_video_task(&cfg, &img_path, "prompt", None)
+            .expect_err("missing task_id");
+        assert!(!vid_err.message.contains("secret_bearer_999"));
+        assert!(!vid_err.message.contains("secret_sk_999"));
+        assert!(!vid_err.message.contains(known_secret));
+        assert!(vid_err.message.contains("[REDACTED]"));
+
+        // download_video WRITE_FAIL with secret in non-existent destination path
+        let missing_dest = tmp_dir.join(known_secret).join("out.mp4");
+        let stop = AtomicBool::new(false);
+        let dl_write_err = download_video(
+            &cfg,
+            &format!("{base_url}/media/vid.mp4"),
+            &missing_dest,
+            "task_1",
+            &stop,
+        )
+        .expect_err("missing dest parent must fail write");
+        assert_eq!(dl_write_err.code, "WRITE_FAIL");
+        assert!(!dl_write_err.message.contains(known_secret));
+
+        server.join().expect("mock server");
+
+        // 4. Closed port for test_connection, list_models, and download_video reqwest::Error redaction
+        let closed_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+        let secret_url = format!("http://127.0.0.1:{closed_port}/v1?token=sk-secret_sk_999&k={known_secret}");
+
+        let (ok_tc, _, tc_msg) =
+            test_connection(&cfg, "video", Some(&secret_url), None).expect("test_connection Ok");
+        assert!(!ok_tc);
+        assert!(!tc_msg.contains("secret_sk_999"));
+        assert!(!tc_msg.contains(known_secret));
+
+        let lm_err = list_models(&cfg, "video", Some(&secret_url), None)
+            .expect_err("list_models closed port");
+        assert!(!lm_err.message.contains("secret_sk_999"));
+        assert!(!lm_err.message.contains(known_secret));
+
+        let dl_net_err = download_video(
+            &cfg,
+            &format!("http://127.0.0.1:{closed_port}/v.mp4?token=sk-secret_sk_999&k={known_secret}"),
+            &tmp_dir.join("never.mp4"),
+            "task_net",
+            &stop,
+        )
+        .expect_err("closed port download must fail");
+        assert!(!dl_net_err.message.contains("secret_sk_999"));
+        assert!(!dl_net_err.message.contains(known_secret));
+        assert!(dl_net_err.message.contains("[REDACTED]"));
+
+        // 5. Redaction before 200-char truncation & download_video rejecting 206 Partial Content
+        crate::settings::register_secret_for_redaction("longtail_tok_777");
+        let pad = "a".repeat(190);
+        let long_body = format!("{pad} Bearer longtail_tok_777 suffix");
+        let classified = ApiFail::classify_http(502, None, &long_body);
+        assert!(
+            !classified.message.contains("longtail_tok_777"),
+            "secret crossing 300-char boundary must still be redacted: {}",
+            classified.message
+        );
+
+        let img_long_srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let img_long_port = img_long_srv.local_addr().unwrap().port();
+        let img_thread = std::thread::spawn(move || {
+            for i in 0..2 {
+                if let Ok((mut s, _)) = img_long_srv.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    if i == 0 {
+                        let json_body = serde_json::json!({
+                            "pad": pad,
+                            "token": "Bearer longtail_tok_777",
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            json_body.len(),
+                            json_body
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    } else {
+                        let resp = "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfake";
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+
+        let base_long = format!("http://127.0.0.1:{img_long_port}/v1");
+        let cfg_long = Settings {
+            endpoint_image_base_url: base_long.clone(),
+            endpoint_video_base_url: base_long.clone(),
+            ..Settings::default()
+        };
+        let long_err = create_image(&cfg_long, &img_path, "prompt").expect_err("missing b64");
+        assert!(
+            !long_err.message.contains("longtail_tok_777"),
+            "secret crossing 200-char truncation leaked: {}",
+            long_err.message
+        );
+        let err_206 = download_video(
+            &cfg_long,
+            &format!("{base_long}/partial.mp4"),
+            &tmp_dir.join("out206.mp4"),
+            "t206",
+            &stop,
+        )
+        .expect_err("206 Partial Content must be rejected");
+        assert_ne!(err_206.code, "OK");
+        img_thread.join().unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

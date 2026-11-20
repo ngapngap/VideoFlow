@@ -3,7 +3,7 @@
 Thư mục này chứa bản sao source `muse2api` v0.4.0 (upstream: https://github.com/www222fff/muse2api)
 được đóng gói thành engine onefile `videoflow-muse.exe` (tên file dev: `videoflow-muse-x86_64-pc-windows-msvc.exe`) cho VideoFlow Desktop.
 
-Bản sao này **không giống 100% upstream** — nó có 3 bản vá lỗi bên dưới. Khi cập nhật
+Bản sao này **không giống 100% upstream** — nó gồm các bản vá lỗi bên dưới (cùng các gia cố proxy relay/SSRF/lifecycle cho VideoFlow Desktop). Khi cập nhật
 muse2api từ upstream, phải áp lại (hoặc re-apply) các vá này.
 
 ## Fix 1 — Báo đúng lỗi khi muse.ai cắt VM (workspace bị ngắt)
@@ -63,14 +63,15 @@ port DevTools không bao giờ mở → `RuntimeError: Chromium did not expose a
 → uvicorn thoát **exit code 3** (`MUSE_SIDECAR_EXITED`).
 
 **Sửa:**
-- `chromium.py`: thêm `_kill_stale_browsers(profile_dir)` — taskkill `/T /F` mọi `msedge.exe`
-  khớp ranh giới đường dẫn profile (hoặc bộ ba `VideoFlowDesktop` +
-  `muse` + `<profile_name>`) vì process con của Edge trên Windows có thể báo path dạng 8.3
-  (`USER~1`) nên chỉ so path đầy đủ sẽ bỏ sót. Không bao giờ khớp browser của
-  người dùng hay cắt nhầm giữa `browser-profile-acc_1` và `browser-profile-acc_10`. Chờ 1.5s cho Windows nhả singleton mutex.
+- `chromium.py`: thêm `_kill_stale_browsers(profile_dir, port=None)` — dùng
+  `_build_wmi_filter(profile_dir, port)` lọc `Win32_Process` (`Name='msedge.exe' OR Name='chrome.exe'`)
+  và chạy `taskkill /T /F` theo một trong hai điều kiện: khớp ranh giới `--user-data-dir="?<profile_dir>"?(\s|$)`,
+  hoặc (khi có `port`) khớp đồng thời thư mục cha `profile_dir.parent` và `--remote-debugging-port={port}(\s|$)`.
+  Nhờ vậy không bao giờ khớp browser của người dùng hay cắt nhầm giữa `browser-profile-acc_1` và `browser-profile-acc_10`.
+  Nếu đã dọn được process stale thì chờ 1.5s cho Windows nhả singleton mutex (và cấp port trống khác nếu `port` vẫn bận).
 - `start()`: 3 lần thử — lần 1 dọn stale + xoá lock; lần 3 **xoá hẳn profile** (cookie
   nằm ở `accounts.json` riêng, profile chỉ là cache của browser); mỗi lần chờ CDP 60s.
-- stderr của Edge giờ ghi ra `<data>/chromium-stderr.log` và **log 800 ký tự cuối khi
+- stderr của Edge giờ ghi ra `<data>/browser-profile/chromium-stderr.log` (hoặc `<data>/profiles/<account_id>/chromium-stderr.log` theo profile) và **log 800 ký tự cuối khi
   Edge thoát sớm** — trước đây nuốt vào DEVNULL nên không biết nguyên nhân.
 - Rust: `start()` tự thử lại **1 lần** (dọn orphan + chờ 1.5s) trước khi báo lỗi; thông
   báo lỗi gắn thêm dòng cuối của `chromium-stderr.log` / `engine-stderr.log` để user
@@ -82,7 +83,7 @@ Yêu cầu: Python 3.10+ với các dependency của muse2api + PyInstaller.
 
 ```powershell
 cd videoflow-app/sidecar
-pip install "fastapi>=0.115" "uvicorn[standard]>=0.32" "pydantic>=2.9" "pydantic-settings>=2.5" "httpx[socks]>=0.27" "websockets>=13.0" "python-multipart>=0.0.9" pyinstaller
+pip install -r requirements.txt pyinstaller
 pyinstaller muse2api.spec --distpath ../src-tauri/binaries --workpath build --noconfirm
 ```
 
@@ -91,16 +92,24 @@ pyinstaller muse2api.spec --distpath ../src-tauri/binaries --workpath build --no
 
 ## Kiểm thử nhanh
 
+Từ `videoflow-app/sidecar` sau khi build xong binary ở `..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe`:
+
 ```powershell
-# Mock driver — không cần Chromium, kiểm API surface
+# 1. Mock driver — không cần Chromium, kiểm tra API surface
 $env:MUSE2API_DRIVER="mock"; $env:MUSE2API_PORT="18699"; $env:MUSE2API_DATA_DIR="$env:TEMP\m2a"
-$env:MUSE2API_API_KEY="testkey123"
-.\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
+$env:MUSE2API_API_KEY="testkey123"; $env:MUSE2API_ADMIN_KEY="testkey123"
+..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
 curl http://127.0.0.1:18699/healthz
+curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/v1/models
 curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/admin/status
 
-# Browser driver — cần Edge/Chrome
-$env:MUSE2API_DRIVER="browser"; $env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+# 2. Browser driver — cần Edge/Chrome (kiểm tra Playwright/Chromium/CDP/proxy_relay packaging)
+$env:MUSE2API_DRIVER="browser"; $env:MUSE2API_PORT="18703"; $env:MUSE2API_CDP_PORT="19203"
+$env:MUSE2API_DATA_DIR="$env:TEMP\m2a-browser"; $env:MUSE2API_HEADLESS="true"
+$env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
+curl http://127.0.0.1:18703/healthz
+curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18703/admin/status
 ```
 
 ## Fix 5 — Enforce hạn mức khi lease (trước đây quota chỉ để xem)
@@ -136,14 +145,19 @@ Fix 3 chỉ chặn ở `POST /admin/accounts` và `/accounts/import`; `PATCH` (�
 account đã có) vẫn cho gán `hatch_sess` của account khác → hai account tranh nhau cookie
 rotation và cùng chết. Nay PATCH kiểm tra cùng logic, có cờ `?allow_duplicate_session=true`.
 
-**Test:** `tests/test_engine_fixes.py` (pytest, chạy trong CI) — 19 test phủ quota
-enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `UpstreamVmDisabled`.
+**Test:** `tests/test_engine_fixes.py` (pytest, chạy trong CI) — 27 test phủ quota
+enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `UpstreamVmDisabled` và prewarm.
 
 ## Build & phát hành
 
-Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`).
+Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`, cũng như bước build/smoke ở `.github/workflows/ci.yml`).
 Trên GitHub runner môi trường Python sạch nên exe ~17.6 MB (máy dev local cài nhiều
-package nên ~43 MB) — cả hai đều chạy được; release job có smoke test exe thật
-(mock driver + `/healthz` + `/v1/models`) trước khi bundle.
+package nên ~43 MB) — cả hai đều chạy được:
+- `.github/workflows/ci.yml`:
+  - Job `sidecar` chạy từ source (`python -m muse2api`, `MUSE2API_DRIVER=mock`) và kiểm `/healthz`, `/admin/status` (`driver == "mock"`) cùng chặn trùng session qua `POST /admin/accounts` (không gọi `/v1/models`).
+  - Job `rust` build exe PyInstaller một file, chạy `cargo test`, rồi chạy **Browser smoke test** trên exe với Edge/Chrome headless kiểm `/healthz` + `/admin/status` (`driver == "browser"`, `ok == true`).
+- `.github/workflows/release.yml` chạy hai smoke test độc lập cho exe PyInstaller:
+  - **Smoke 1/2 (Browser driver):** chạy với Edge headless và kiểm `/healthz` + `/admin/status` (`driver == "browser"`, `ok == true`).
+  - **Smoke 2/2 (Mock driver):** kiểm `/healthz`, `/admin/status`, `/v1/models` (`muse-video`, `muse-image`), `POST /admin/accounts`, `POST /v1/videos` (tạo → poll → tải media) và `POST /v1/images/edits`.
 
 Chi tiết quy trình phát hành + secrets: `videoflow-app/docs/RELEASE.md`.

@@ -31,13 +31,16 @@ class CDPSession:
 
     @classmethod
     async def connect(cls, ws_url: str) -> CDPSession:
-        ws = await connect(
-            ws_url,
-            max_size=None,
-            ping_interval=20,
-            ping_timeout=10,
-            open_timeout=15,
-        )
+        try:
+            ws = await connect(
+                ws_url,
+                max_size=None,
+                ping_interval=20,
+                ping_timeout=10,
+                open_timeout=15,
+            )
+        except (WebSocketException, OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            raise CDPError(f"cdp connect failed: {exc}") from exc
         return cls(ws)
 
     @property

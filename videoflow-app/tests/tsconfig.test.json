@@ -1,0 +1,18 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "../node_modules/.cache/vf-tests",
+    "rootDir": ".."
+  },
+  "include": [
+    "./**/*.ts",
+    "./**/*.d.ts",
+    "../src/lib/proxyInput.ts",
+    "../src/lib/museStatus.ts",
+    "../src/lib/asyncGuard.ts",
+    "../src/lib/settingsSave.ts",
+    "../src/lib/api.ts",
+    "../src/lib/store.ts"
+  ]
+}

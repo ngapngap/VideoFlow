@@ -9,45 +9,89 @@ the loop skips them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
 from ..drivers.base import MuseDriver
 from ..errors import FeatureNotImplemented, UpstreamAuthError
-from .model import AccountStatus
+from .model import Account, AccountStatus
 from .pool import AccountPool, note_wake
 
 log = logging.getLogger(__name__)
 
 
 async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) -> dict:
-    acc = pool.get(account_id)
+    if hasattr(pool, "snapshot"):
+        acc = await pool.snapshot(account_id)
+    else:
+        raw = pool.get(account_id)
+        acc = raw.model_copy(deep=True) if raw is not None else None
     if acc is None:
         return {"ok": False, "error": "not found"}
     if pool.is_blocked_cb and pool.is_blocked_cb(account_id):
         return {"ok": False, "error": "account is busy in an interactive browser session"}
+    orig_cookies = dict(acc.cookies)
     try:
         info = await driver.renew_session(acc)
     except FeatureNotImplemented as exc:
         return {"ok": False, "error": exc.message}
     except UpstreamAuthError as exc:
-        if pool.get(account_id) is None:
-            return {"ok": False, "error": "account deleted"}
-        acc.status = AccountStatus.INVALID
-        acc.last_error = exc.message
-        await pool.upsert(acc)
-        return {"ok": False, "error": exc.message}
+        err_msg = exc.message
 
-    latest = pool.get(account_id)
-    if latest is None:
-        return {"ok": False, "error": "account deleted"}
-    latest.cookies.update(info.cookies)
-    latest.cookie_expires.update(info.cookie_expires)
-    latest.meta.update(info.meta)
-    latest.meta["renewed_at"] = time.time()
-    note_wake(latest, info.meta)
-    await pool.upsert(latest)
-    return {"ok": info.ok, "meta": info.meta}
+        def _on_auth_error(latest: Account) -> tuple[bool, dict]:
+            if pool.is_blocked_cb and pool.is_blocked_cb(account_id):
+                return False, {"ok": False, "error": "account is busy in an interactive browser session"}
+            if latest.cookies != orig_cookies:
+                return False, {"ok": False, "error": "account cookies replaced concurrently"}
+            latest.status = AccountStatus.INVALID
+            latest.last_error = err_msg
+            return True, {"ok": False, "error": err_msg}
+
+        if hasattr(pool, "try_update"):
+            found, res = await pool.try_update(account_id, _on_auth_error)
+            if not found:
+                return {"ok": False, "error": "account deleted"}
+            return res  # type: ignore[return-value]
+        latest = pool.get(account_id)
+        if latest is None:
+            return {"ok": False, "error": "account deleted"}
+        changed, res = _on_auth_error(latest)
+        if changed:
+            await pool.upsert(latest)
+        return res
+
+    committed_snapshot: list[Account] = []
+
+    def _on_success(latest: Account) -> tuple[bool, dict]:
+        if pool.is_blocked_cb and pool.is_blocked_cb(account_id):
+            return False, {"ok": False, "error": "account is busy in an interactive browser session"}
+        if latest.cookies != orig_cookies:
+            return False, {"ok": False, "error": "account cookies replaced concurrently"}
+        latest.cookies.update(info.cookies)
+        latest.cookie_expires.update(info.cookie_expires)
+        latest.meta.update(info.meta)
+        latest.meta["renewed_at"] = time.time()
+        note_wake(latest, info.meta)
+        committed_snapshot.append(latest.model_copy(deep=True))
+        return True, {"ok": info.ok, "meta": info.meta}
+
+    if hasattr(pool, "try_update"):
+        found, res = await pool.try_update(account_id, _on_success)
+        if not found:
+            return {"ok": False, "error": "account deleted"}
+    else:
+        latest = pool.get(account_id)
+        if latest is None:
+            return {"ok": False, "error": "account deleted"}
+        changed, res = _on_success(latest)
+        if changed:
+            await pool.upsert(latest)
+
+    if committed_snapshot and hasattr(driver, "sync_renewed_cookies"):
+        with contextlib.suppress(Exception):
+            await driver.sync_renewed_cookies(committed_snapshot[0])
+    return res  # type: ignore[return-value]
 
 
 async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float) -> None:

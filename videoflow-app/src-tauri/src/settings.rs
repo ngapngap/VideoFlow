@@ -148,7 +148,12 @@ impl Settings {
 
         clean.concurrency = clean.concurrency.clamp(1, 3);
         clean.max_attempts = clean.max_attempts.clamp(1, 10);
-        clean.video_seconds = clean.video_seconds.max(1);
+        let max_video_seconds = if clean.video_source == "internal" {
+            60
+        } else {
+            120
+        };
+        clean.video_seconds = clean.video_seconds.clamp(1, max_video_seconds);
         clean.image_timeout_s = clean.image_timeout_s.max(1);
         clean.video_create_timeout_s = clean.video_create_timeout_s.max(1);
         clean.poll_interval_s = clean.poll_interval_s.max(1);
@@ -433,8 +438,9 @@ fn is_bearer_token_char(c: char) -> bool {
 
 /// Che mọi chuỗi nhạy cảm:
 /// 1) Các khóa API thực tế đã nạp/lưu từ Keyring (kể cả định dạng không có `sk-`/`Bearer`)
-/// 2) `Bearer <token>`
-/// 3) `sk-[A-Za-z0-9_-]+` (tôn trọng ranh giới từ để không hỏng `task-123`)
+/// 2) Thông tin đăng nhập trong URL (`scheme://[user]:pass@host`)
+/// 3) `Bearer <token>`
+/// 4) `sk-[A-Za-z0-9_-]+` (tôn trọng ranh giới từ để không hỏng `task-123`)
 pub fn redact_secrets(input: &str) -> String {
     #[cfg(not(test))]
     {
@@ -455,8 +461,78 @@ pub fn redact_secrets(input: &str) -> String {
         }
     }
 
-    let pass1 = redact_bearer(&stage0);
+    let pass0_url = redact_url_credentials(&stage0);
+    let pass1 = redact_bearer(&pass0_url);
     redact_sk(&pass1)
+}
+
+fn is_url_authority_delimiter(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '/' | '?' | '#' | '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '{' | '}'
+        )
+}
+
+fn redact_url_credentials(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    while idx < input.len() {
+        let rest = &input[idx..];
+        let prev_ok = idx == 0
+            || !input[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if prev_ok {
+            let mut scheme_bytes = 0usize;
+            let mut chars = rest.char_indices();
+            if let Some((_, first)) = chars.next() {
+                if first.is_ascii_alphabetic() {
+                    scheme_bytes = first.len_utf8();
+                    for (pos, ch) in chars {
+                        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.') {
+                            scheme_bytes = pos + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            if scheme_bytes > 0 && rest[scheme_bytes..].starts_with("://") {
+                let prefix_len = scheme_bytes + 3;
+                let after_scheme = &rest[prefix_len..];
+                let auth_bytes: usize = after_scheme
+                    .chars()
+                    .take_while(|c| !is_url_authority_delimiter(*c))
+                    .map(char::len_utf8)
+                    .sum();
+                let authority = &after_scheme[..auth_bytes];
+                if let Some(at_pos) = authority.rfind('@') {
+                    let userinfo = &authority[..at_pos];
+                    let host_port = &authority[at_pos + 1..];
+                    if !host_port.is_empty() {
+                        if let Some(colon_pos) = userinfo.find(':') {
+                            let user_part = &userinfo[..colon_pos];
+                            let pass_part = &userinfo[colon_pos + 1..];
+                            if !pass_part.is_empty() {
+                                out.push_str(&rest[..prefix_len]);
+                                out.push_str(user_part);
+                                out.push_str(":[REDACTED]@");
+                                out.push_str(host_port);
+                                idx += prefix_len + auth_bytes;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("idx < input.len()");
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
 }
 
 fn redact_bearer(input: &str) -> String {
@@ -478,6 +554,15 @@ fn redact_bearer(input: &str) -> String {
                 .sum();
             if prev_ok && ws_bytes > 0 {
                 let after_ws = &after_kw[ws_bytes..];
+                if after_ws
+                    .strip_prefix("[REDACTED]")
+                    .is_some_and(|tail| tail.chars().next().map_or(true, |c| !is_bearer_token_char(c)))
+                {
+                    let keep_len = 6 + ws_bytes + "[REDACTED]".len();
+                    out.push_str(&rest[..keep_len]);
+                    idx += keep_len;
+                    continue;
+                }
                 let tok_bytes: usize = after_ws
                     .chars()
                     .take_while(|c| is_bearer_token_char(*c))
@@ -743,6 +828,154 @@ mod tests {
         let reloaded_false = store.load();
         assert!(!reloaded_false.auto_merge, "reloaded settings must preserve auto_merge = false");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_h3_redact_secrets_proxy_urls_at_in_password_and_password_only() {
+        let msg = concat!(
+            "Failed connecting via socks5h://user1:p@ss@word!@198.51.100.10:1080/tunnel?email=alice@example.com ",
+            "and fallback http://:only_secret@203.0.113.5:8080, ",
+            "also \"https://admin:sk-rawtoken99@[::1]:8443\" and https://public.example.com/u?contact=bob@example.com"
+        );
+        let redacted = redact_secrets(msg);
+
+        assert!(!redacted.contains("p@ss@word!"));
+        assert!(!redacted.contains("only_secret"));
+        assert!(!redacted.contains("sk-rawtoken99"));
+
+        assert!(redacted.contains("socks5h://user1:[REDACTED]@198.51.100.10:1080/tunnel?email=alice@example.com"));
+        assert!(redacted.contains("http://:[REDACTED]@203.0.113.5:8080"));
+        assert!(redacted.contains("\"https://admin:[REDACTED]@[::1]:8443\""));
+        assert!(redacted.contains("https://public.example.com/u?contact=bob@example.com"));
+
+        // Username-only URL without password and short 2-char password URL
+        let edge = "http://useronly@1.2.3.4:8080 and socks5://u:ab@5.6.7.8:1080";
+        let redacted_edge = redact_secrets(edge);
+        assert!(redacted_edge.contains("http://useronly@1.2.3.4:8080"));
+        assert!(redacted_edge.contains("socks5://u:[REDACTED]@5.6.7.8:1080"));
+        assert!(!redacted_edge.contains(":ab@"));
+
+        // Bearer & URL redaction must remain idempotent across multiple passes
+        let twice = redact_secrets(&redact_secrets("ERROR Bearer tok123 and http://u:p@1.2.3.4:8080/x"));
+        assert_eq!(twice, "ERROR Bearer [REDACTED] and http://u:[REDACTED]@1.2.3.4:8080/x");
+    }
+
+    #[test]
+    fn test_settings_video_seconds_bounds_by_video_source() {
+        // Gateway mode: clamp 1..=120
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 0,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            1
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 90,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            90
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 120,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            120
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 999,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            120
+        );
+
+        // Internal Muse mode: clamp 1..=60 (matches sidecar/muse2api schemas.py le=60)
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 0,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            1
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 60,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 61,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 120,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+
+        // Unknown video_source normalizes to gateway (cap 120)
+        let unknown_src = Settings {
+            video_source: "custom".into(),
+            video_seconds: 250,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(unknown_src.video_source, "gateway");
+        assert_eq!(unknown_src.video_seconds, 120);
+
+        // Store roundtrip preserves clamp
+        let idx = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "videoflow_settings_vidsec_{}_{}",
+            std::process::id(),
+            idx
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SettingsStore::with_path(dir.join("settings.json"));
+        store
+            .save(&Settings {
+                video_source: "internal".into(),
+                video_seconds: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        let reloaded = store.load();
+        assert_eq!(reloaded.video_source, "internal");
+        assert_eq!(reloaded.video_seconds, 60);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
