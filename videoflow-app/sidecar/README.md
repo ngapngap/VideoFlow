@@ -319,7 +319,7 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `4` | Parallel requests per account (browser driver: one tab each, about 300 MB of memory per tab) |
 | `MUSE2API_WARM_THREADS` | `2` | Pre-started threads kept per account. A new muse.ai thread takes 20-40s to answer its first message, a started one about 5s, so chats that need a new thread go into a warm one. Each costs one extra short message of quota; needs a concurrency of at least 2 |
 | `MUSE2API_CHROMIUM_PATH` | auto-detected | Path to the browser executable |
-| `MUSE2API_CDP_PORT` | `19200` | Base CDP port used for managed Chromium instances |
+| `MUSE2API_CDP_PORT` | `19210` | Base CDP port used for managed Chromium instances |
 | `MUSE2API_HEADLESS` | `true` | Run managed browser profiles headless (`false` displays browser windows) |
 | `MUSE2API_DATA_DIR` | `./data` | Directory for `accounts.json`, `keys.json`, `requests.db`, browser profiles and media |
 | `MUSE2API_DEFER_PREWARM` | `false` | Defer initial warm-tab startup until Desktop calls `POST /admin/prewarm` after syncing proxy assignments |

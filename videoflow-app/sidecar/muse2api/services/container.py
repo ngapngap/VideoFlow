@@ -52,6 +52,11 @@ class Services:
 
         interactive = InteractiveBrowserManager(settings, pool, driver)
         pool.is_blocked_cb = interactive.is_session_active
+        if hasattr(driver, "set_account_guards"):
+            driver.set_account_guards(
+                lookup=pool.get,
+                is_blocked=interactive.is_session_active,
+            )
 
         return cls(
             settings=settings,

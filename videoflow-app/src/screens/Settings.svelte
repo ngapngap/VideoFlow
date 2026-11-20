@@ -24,7 +24,12 @@
     type Settings,
     type SettingsView,
   } from "../lib/api";
-  import { executeSettingsSave } from "../lib/settingsSave";
+  import {
+    executeSettingsSave,
+    getVideoSecondsMax,
+    isValidIntInRange,
+    validateVideoSeconds,
+  } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
@@ -284,14 +289,6 @@
     if (!dirty) settingsDirty.set(false);
   });
 
-  function isValidIntInRange(val: unknown, min: number, max: number): boolean {
-    if (val === null || val === undefined || (typeof val === "string" && val.trim() === "")) {
-      return false;
-    }
-    const n = Number(val);
-    return Number.isFinite(n) && Number.isInteger(n) && n >= min && n <= max;
-  }
-
   function isValidHttpUrl(val: string | undefined | null): boolean {
     if (!val) return false;
     const t = val.trim();
@@ -326,8 +323,9 @@
     if (!cfg.video_size?.trim()) {
       errs.push("Kích thước khung hình video không được để trống.");
     }
-    if (!isValidIntInRange(cfg.video_seconds, 1, 120)) {
-      errs.push("Thời lượng video phải là số nguyên từ 1 đến 120 giây.");
+    const videoSecondsErr = validateVideoSeconds(cfg.video_seconds, cfg.video_source);
+    if (videoSecondsErr) {
+      errs.push(videoSecondsErr);
     }
     if (!isValidIntInRange(cfg.poll_interval_s, 1, 600)) {
       errs.push("Chu kỳ poll trạng thái phải là số nguyên từ 1 đến 600 giây.");
@@ -1359,14 +1357,16 @@
             />
           </div>
           <div>
-            <label class="label" for="cfg-vid-seconds">Thời lượng video (giây)</label>
+            <label class="label" for="cfg-vid-seconds">
+              Thời lượng video (giây){s.video_source === "internal" ? " — tối đa 60s" : ""}
+            </label>
             <input
               id="cfg-vid-seconds"
               class="input full"
-              class:invalid={!isValidIntInRange(s.video_seconds, 1, 120)}
+              class:invalid={!isValidIntInRange(s.video_seconds, 1, getVideoSecondsMax(s.video_source))}
               type="number"
               min="1"
-              max="120"
+              max={getVideoSecondsMax(s.video_source)}
               bind:value={s.video_seconds}
               on:input={mark}
               disabled={$running}

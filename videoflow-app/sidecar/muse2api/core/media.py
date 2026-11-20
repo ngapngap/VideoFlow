@@ -247,7 +247,7 @@ async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
                                 if declared_len is not None and declared_len > _MAX_FETCH_BYTES:
                                     raise InvalidRequest("image_url response exceeds 20 MiB")
                             mime = (
-                                resp.headers.get("content-type", "image/png").split(";")[0].strip()
+                                resp.headers.get("content-type", "image/png").split(";")[0].strip().lower()
                                 or "image/png"
                             )
                             body = bytearray()
@@ -257,6 +257,8 @@ async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
                                 body.extend(chunk)
                                 if len(body) > _MAX_FETCH_BYTES:
                                     raise InvalidRequest("image_url response exceeds 20 MiB")
+                            if not body:
+                                raise InvalidRequest("image_url returned empty body")
                             return bytes(body), mime
                     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                         last_connect_exc = exc
@@ -298,13 +300,13 @@ def _decode_base64_bounded(payload: str, *, err_msg: str) -> bytes:
 async def load_image_ref(ref: str, *, timeout: float = 20.0) -> tuple[bytes, str]:
     """Decode a data URL or download an http(s) URL. Returns ``(bytes, mime)``."""
     ref = ref.strip()
-    if ref.startswith("data:"):
+    if ref[:5].lower() == "data:":
         header, sep, payload = ref.partition(",")
         if not sep:
             raise InvalidRequest("invalid base64 image data")
-        mime = header[5:].split(";")[0].strip() or "image/png"
+        mime = header[5:].split(";")[0].strip().lower() or "image/png"
         return _decode_base64_bounded(payload, err_msg="invalid base64 image data"), mime
-    if ref.startswith(("http://", "https://")):
+    if ref.lower().startswith(("http://", "https://")):
         return await _fetch_public_image(ref, timeout=timeout)
     return _decode_base64_bounded(
         ref, err_msg="image must be a data URL, http(s) URL or base64 string"

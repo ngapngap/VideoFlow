@@ -11,6 +11,8 @@
     "../src/lib/proxyInput.ts",
     "../src/lib/museStatus.ts",
     "../src/lib/asyncGuard.ts",
-    "../src/lib/settingsSave.ts"
+    "../src/lib/settingsSave.ts",
+    "../src/lib/api.ts",
+    "../src/lib/store.ts"
   ]
 }

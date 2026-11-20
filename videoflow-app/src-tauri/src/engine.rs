@@ -629,6 +629,16 @@ pub fn reserve_next_version(
     row_key: &str,
     kind: &str,
 ) -> VersionReservation {
+    reserve_next_version_with_keys(conn, out_dir, row_key, &[], kind)
+}
+
+fn reserve_next_version_with_keys(
+    conn: &Connection,
+    out_dir: &Path,
+    row_key: &str,
+    extra_row_keys: &[String],
+    kind: &str,
+) -> VersionReservation {
     let ext = if kind == "anh" { "png" } else { "mp4" };
     // row_key là "<tên ảnh>#<hash prompt>" → stem phải lấy từ tên ảnh, nếu không tên
     // file đầu ra sẽ dính hash và khác hoàn toàn quy ước `stem_gen.png`.
@@ -643,7 +653,7 @@ pub fn reserve_next_version(
 
     let mut reg = version_registry().lock();
 
-    let db_max: i64 = conn
+    let mut db_max: i64 = conn
         .query_row(
             r#"SELECT COALESCE(MAX(version), 0) FROM file_refs
                WHERE (LOWER(row_key) = LOWER(?1) OR LOWER(file_name) LIKE LOWER(?2) ESCAPE '\')
@@ -652,6 +662,69 @@ pub fn reserve_next_version(
             |r| r.get(0),
         )
         .unwrap_or(0);
+
+    // Tính cả các `old_keys` sắp được migrate sang `row_key` trong transaction commit
+    // (kể cả trường hợp va chạm version với `row_key` làm `migrate_file_refs_row_key` tăng version).
+    let mut extra_lows: Vec<String> = Vec::new();
+    if !extra_row_keys.is_empty() {
+        let mut target_versions: HashMap<i64, String> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT version, file_name FROM file_refs WHERE row_key = ?1 AND kind = ?2",
+        ) {
+            if let Ok(iter) = stmt.query_map(rusqlite::params![row_key, kind], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            }) {
+                for (ver, fname) in iter.flatten() {
+                    db_max = db_max.max(ver);
+                    target_versions.insert(ver, fname);
+                }
+            }
+        }
+        let mut seen_extra: Vec<String> = Vec::new();
+        for ek in extra_row_keys {
+            let trimmed = ek.trim();
+            if trimmed.is_empty()
+                || trimmed == row_key
+                || seen_extra.iter().any(|s| s.eq_ignore_ascii_case(trimmed))
+            {
+                continue;
+            }
+            seen_extra.push(trimmed.to_string());
+            let low = trimmed.to_lowercase();
+            if low != row_key_low && !extra_lows.contains(&low) {
+                extra_lows.push(low);
+            }
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT row_key, version, file_name
+                 FROM file_refs
+                 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2
+                 ORDER BY version ASC, id ASC",
+            ) {
+                if let Ok(iter) = stmt.query_map(rusqlite::params![trimmed, kind], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                }) {
+                    for (cur_rk, ver, fname) in iter.flatten() {
+                        if cur_rk == row_key {
+                            continue;
+                        }
+                        db_max = db_max.max(ver);
+                        if let Some(existing_fname) = target_versions.get(&ver) {
+                            if !existing_fname.eq_ignore_ascii_case(&fname) {
+                                db_max += 1;
+                                target_versions.insert(db_max, fname);
+                            }
+                        } else {
+                            target_versions.insert(ver, fname);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let v1_name = format!("{stem_low}_gen.{ext}");
     let vn_prefix = format!("{stem_low}_gen_v");
@@ -688,9 +761,14 @@ pub fn reserve_next_version(
         let d = out_dir.join(&fname);
         let pk = normalize_reserved_path(&d);
         let dk = (row_key_low.clone(), kind.to_string(), candidate);
+        let extra_reserved = extra_lows.iter().any(|ek_low| {
+            reg.reserved_db_versions
+                .contains(&(ek_low.clone(), kind.to_string(), candidate))
+        });
         if !d.exists()
             && !reg.reserved_paths.contains(&pk)
             && !reg.reserved_db_versions.contains(&dk)
+            && !extra_reserved
         {
             break (fname, d, pk, dk);
         }
@@ -2055,7 +2133,20 @@ fn run_b2(
         }
     };
 
-    let reservation = reserve_next_version(ctx.conn, ctx.image_out, &row_key, "anh");
+    let prev_img = row.anh_da_tao.trim().to_string();
+    let old_keys = if !prev_img.is_empty() {
+        collect_file_ref_row_keys_by_name(ctx.conn, &prev_img).map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("{e}"),
+        })?
+    } else {
+        Vec::new()
+    };
+
+    let reservation =
+        reserve_next_version_with_keys(ctx.conn, ctx.image_out, &row_key, &old_keys, "anh");
     let ver = reservation.version;
     let file_name = reservation.file_name.clone();
     let dest = reservation.dest.clone();
@@ -2069,12 +2160,29 @@ fn run_b2(
     // [P2-1] + [P0-2]: Bọc cập nhật `file_refs` + `jobs` (bao gồm `image_prompt_hash` mới!) trong 1 transaction nguyên tử
     let rel = format!("image_out/{file_name}");
     let ts = chrono::Local::now().to_rfc3339();
-    let tx = ctx.conn.unchecked_transaction().map_err(|e| ApiFail {
+    let tx = rusqlite::Transaction::new_unchecked(
+        ctx.conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
         http_status: None,
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu ảnh: {e}"),
     })?;
+    for old_rk in &old_keys {
+        if old_rk == &row_key {
+            continue;
+        }
+        crate::state_db::migrate_file_refs_row_key(&tx, old_rk, &row_key, None).map_err(|e| {
+            ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("{e}"),
+            }
+        })?;
+    }
     tx.execute(
         "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'anh'",
         rusqlite::params![row_key, ctx.job_id],
@@ -2097,35 +2205,16 @@ fn run_b2(
         message: format!("{e}"),
     })?;
     let new_ref_id = tx.last_insert_rowid();
-    let prev_img = row.anh_da_tao.trim();
-    if !prev_img.is_empty() {
-        let old_keys = collect_file_ref_row_keys_by_name(&tx, prev_img).map_err(|e| ApiFail {
-            kind: ApiFailKind::NghiepVu,
-            http_status: None,
-            code: "DB_TX_FAIL".into(),
-            message: format!("{e}"),
-        })?;
-        for old_rk in old_keys {
-            crate::state_db::migrate_file_refs_row_key(&tx, &old_rk, &row_key, None).map_err(
-                |e| ApiFail {
-                    kind: ApiFailKind::NghiepVu,
-                    http_status: None,
-                    code: "DB_TX_FAIL".into(),
-                    message: format!("{e}"),
-                },
-            )?;
-        }
-        tx.execute(
-            "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'anh' AND id != ?2",
-            rusqlite::params![row_key, new_ref_id],
-        )
-        .map_err(|e| ApiFail {
-            kind: ApiFailKind::NghiepVu,
-            http_status: None,
-            code: "DB_TX_FAIL".into(),
-            message: format!("{e}"),
-        })?;
-    }
+    tx.execute(
+        "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'anh' AND id != ?3",
+        rusqlite::params![row_key, ctx.job_id, new_ref_id],
+    )
+    .map_err(|e| ApiFail {
+        kind: ApiFailKind::NghiepVu,
+        http_status: None,
+        code: "DB_TX_FAIL".into(),
+        message: format!("{e}"),
+    })?;
     tx.execute(
         "UPDATE jobs
          SET status = 'da_tao_image', image_status = 'xong',
@@ -2301,7 +2390,25 @@ fn download_and_commit_video(
         "Đang tải video về video_out/".to_string(),
     );
 
-    let reservation = reserve_next_version(ctx.conn, ctx.video_out, &row_key, "video");
+    let mut old_keys: Vec<String> = Vec::new();
+    for fname in [row.video_da_tao.trim(), row.anh_da_tao.trim()] {
+        if !fname.is_empty() {
+            let keys = collect_file_ref_row_keys_by_name(ctx.conn, fname).map_err(|e| ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("{e}"),
+            })?;
+            for k in keys {
+                if !old_keys.iter().any(|existing| existing.eq_ignore_ascii_case(&k)) {
+                    old_keys.push(k);
+                }
+            }
+        }
+    }
+
+    let reservation =
+        reserve_next_version_with_keys(ctx.conn, ctx.video_out, &row_key, &old_keys, "video");
     let ver = reservation.version;
     let file_name = reservation.file_name.clone();
     let dest = reservation.dest.clone();
@@ -2313,12 +2420,29 @@ fn download_and_commit_video(
     let ts = chrono::Local::now().to_rfc3339();
     let cur_vid_hash = sha2hex(row.promt_tao_video.trim());
 
-    let tx = ctx.conn.unchecked_transaction().map_err(|e| ApiFail {
+    let tx = rusqlite::Transaction::new_unchecked(
+        ctx.conn,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
         http_status: None,
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu video: {e}"),
     })?;
+    for old_rk in &old_keys {
+        if old_rk == &row_key {
+            continue;
+        }
+        crate::state_db::migrate_file_refs_row_key(&tx, old_rk, &row_key, None).map_err(|e| {
+            ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("{e}"),
+            }
+        })?;
+    }
     tx.execute(
         "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'video'",
         rusqlite::params![row_key, ctx.job_id],
@@ -2341,39 +2465,16 @@ fn download_and_commit_video(
         message: format!("{e}"),
     })?;
     let new_ref_id = tx.last_insert_rowid();
-    let mut migrated_any = false;
-    for fname in [row.video_da_tao.trim(), row.anh_da_tao.trim()] {
-        if !fname.is_empty() {
-            let old_keys = collect_file_ref_row_keys_by_name(&tx, fname).map_err(|e| ApiFail {
-                kind: ApiFailKind::NghiepVu,
-                http_status: None,
-                code: "DB_TX_FAIL".into(),
-                message: format!("{e}"),
-            })?;
-            for old_rk in old_keys {
-                migrated_any = true;
-                crate::state_db::migrate_file_refs_row_key(&tx, &old_rk, &row_key, None)
-                    .map_err(|e| ApiFail {
-                        kind: ApiFailKind::NghiepVu,
-                        http_status: None,
-                        code: "DB_TX_FAIL".into(),
-                        message: format!("{e}"),
-                    })?;
-            }
-        }
-    }
-    if migrated_any {
-        tx.execute(
-            "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video' AND id != ?2",
-            rusqlite::params![row_key, new_ref_id],
-        )
-        .map_err(|e| ApiFail {
-            kind: ApiFailKind::NghiepVu,
-            http_status: None,
-            code: "DB_TX_FAIL".into(),
-            message: format!("{e}"),
-        })?;
-    }
+    tx.execute(
+        "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'video' AND id != ?3",
+        rusqlite::params![row_key, ctx.job_id, new_ref_id],
+    )
+    .map_err(|e| ApiFail {
+        kind: ApiFailKind::NghiepVu,
+        http_status: None,
+        code: "DB_TX_FAIL".into(),
+        message: format!("{e}"),
+    })?;
     tx.execute(
         "UPDATE jobs
          SET status = 'da_tao_video', image_status = 'xong', video_status = 'xong',
@@ -5373,6 +5474,273 @@ mod tests {
         let plan = plan_row(&row, None, &cfg, &eng_cfg, &img_out, None, 1)
             .expect("Cho with empty image prompt must plan B3");
         assert_eq!(plan.steps, vec![Step::B3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_b2_migrates_old_key_before_insert_and_preserves_single_current() {
+        let dir = make_temp_project("run_b2_old_key_ver");
+        let csv_path = dir.join("prompts.csv");
+        let img_out = dir.join("image_out");
+        let vid_out = dir.join("video_out");
+        std::fs::write(dir.join("input").join("new_ref.png"), sample_png_bytes(10, 20, 30)).unwrap();
+        std::fs::write(img_out.join("legacy_old_gen.png"), sample_png_bytes(1, 2, 3)).unwrap();
+
+        let mut row = Row {
+            row_no: 2,
+            anh_tham_chieu: "new_ref.png".into(),
+            promt_tao_image: "img prompt".into(),
+            promt_tao_video: "vid prompt".into(),
+            anh_da_tao: "legacy_old_gen.png".into(),
+            trang_thai: "Đang chờ".into(),
+            ..Default::default()
+        };
+        prompts_csv::write_all(&csv_path, std::slice::from_ref(&row)).unwrap();
+
+        let old_row_key = "old_ref.png#abcd";
+        let new_row_key = prompts_csv::row_key_of(&row.anh_tham_chieu, &row.promt_tao_image, &row.promt_tao_video);
+        let conn = crate::state_db::open(&dir).unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-11-20T00:00:00Z', 1)",
+            [],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+             VALUES (?1, ?2, 2, 'da_tao_image', 'xong', 'chua_chay')",
+            rusqlite::params![run_id, old_row_key],
+        )
+        .unwrap();
+        let old_job_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, ?2, 'anh', 'legacy_old_gen.png', 'image_out/legacy_old_gen.png', 1, 1, '2026-11-20T00:00:01Z')",
+            rusqlite::params![old_job_id, old_row_key],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+             VALUES (?1, ?2, 2, 'dang_cho', 'chua_chay', 'chua_chay')",
+            rusqlite::params![run_id, new_row_key],
+        )
+        .unwrap();
+        let new_job_id = conn.last_insert_rowid();
+
+        let (port, stop_srv, join_srv) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/images/edits" {
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(50, 60, 70) }] }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port}/v1");
+        adapters::register_test_api_key(&api_base, "sk-b2-old-key");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            ..Settings::default()
+        };
+        let noop = |_name: &str, _val: serde_json::Value| {};
+        let stop_flag = AtomicBool::new(false);
+        let done_count = AtomicUsize::new(0);
+        let active_rows = parking_lot::Mutex::new(Vec::new());
+        let ctx = WorkerRowCtx {
+            emitter: &noop,
+            cfg: &cfg,
+            conn: &conn,
+            csv_path: &csv_path,
+            image_out: &img_out,
+            video_out: &vid_out,
+            stop_flag: &stop_flag,
+            run_id,
+            job_id: new_job_id,
+            total: 1,
+            done_count: &done_count,
+            active_rows: &active_rows,
+        };
+
+        let status = run_b2(&ctx, &mut row, true).expect("run_b2 should succeed");
+        assert_eq!(status, RowStatus::DaTaoImage);
+        assert_eq!(row.anh_da_tao, "new_ref_gen_v2.png");
+
+        let refs: Vec<(String, String, i64, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT row_key, file_name, version, is_current FROM file_refs WHERE kind = 'anh' ORDER BY version ASC")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            refs,
+            vec![
+                (new_row_key.clone(), "legacy_old_gen.png".to_string(), 1, 0),
+                (new_row_key.clone(), "new_ref_gen_v2.png".to_string(), 2, 1),
+            ]
+        );
+
+        stop_srv.store(true, Ordering::SeqCst);
+        let _ = join_srv.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_download_and_commit_video_migrates_old_key_before_insert_and_preserves_single_current() {
+        let dir = make_temp_project("dl_vid_old_key_ver");
+        let csv_path = dir.join("prompts.csv");
+        let img_out = dir.join("image_out");
+        let vid_out = dir.join("video_out");
+        std::fs::write(img_out.join("old_clip_gen.png"), sample_png_bytes(1, 2, 3)).unwrap();
+        std::fs::write(vid_out.join("old_clip_gen.mp4"), sample_mp4_bytes(b"OLD1")).unwrap();
+
+        let mut row = Row {
+            row_no: 2,
+            anh_tham_chieu: "new_clip.png".into(),
+            promt_tao_image: "".into(),
+            promt_tao_video: "animate clip".into(),
+            anh_da_tao: "old_clip_gen.png".into(),
+            video_da_tao: "old_clip_gen.mp4".into(),
+            trang_thai: "Đã tạo image".into(),
+            ..Default::default()
+        };
+        prompts_csv::write_all(&csv_path, std::slice::from_ref(&row)).unwrap();
+
+        let old_row_key = "old_clip.png#1234";
+        let new_row_key = prompts_csv::row_key_of(&row.anh_tham_chieu, &row.promt_tao_image, &row.promt_tao_video);
+        let conn = crate::state_db::open(&dir).unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-11-20T00:00:00Z', 1)",
+            [],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+             VALUES (?1, ?2, 2, 'da_tao_video', 'xong', 'xong')",
+            rusqlite::params![run_id, old_row_key],
+        )
+        .unwrap();
+        let old_job_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, ?2, 'anh', 'old_clip_gen.png', 'image_out/old_clip_gen.png', 1, 1, '2026-11-20T00:00:01Z')",
+            rusqlite::params![old_job_id, old_row_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, ?2, 'video', 'old_clip_gen.mp4', 'video_out/old_clip_gen.mp4', 1, 1, '2026-11-20T00:00:02Z')",
+            rusqlite::params![old_job_id, old_row_key],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+             VALUES (?1, ?2, 2, 'da_tao_image', 'xong', 'dang_chay')",
+            rusqlite::params![run_id, new_row_key],
+        )
+        .unwrap();
+        let new_job_id = conn.last_insert_rowid();
+
+        let (port, stop_srv, join_srv) = spawn_mock_http_server(move |_req| {
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"NEW2"))
+        });
+
+        let cfg = Settings {
+            endpoint_video_base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Settings::default()
+        };
+        let noop = |_name: &str, _val: serde_json::Value| {};
+        let stop_flag = AtomicBool::new(false);
+        let done_count = AtomicUsize::new(0);
+        let active_rows = parking_lot::Mutex::new(Vec::new());
+        let ctx = WorkerRowCtx {
+            emitter: &noop,
+            cfg: &cfg,
+            conn: &conn,
+            csv_path: &csv_path,
+            image_out: &img_out,
+            video_out: &vid_out,
+            stop_flag: &stop_flag,
+            run_id,
+            job_id: new_job_id,
+            total: 1,
+            done_count: &done_count,
+            active_rows: &active_rows,
+        };
+
+        let url = format!("http://127.0.0.1:{port}/out.mp4");
+        download_and_commit_video(&ctx, &mut row, &url, "task_v2")
+            .expect("download_and_commit_video should succeed");
+        assert_eq!(row.video_da_tao, "new_clip_gen_v2.mp4");
+
+        let video_refs: Vec<(String, String, i64, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT row_key, file_name, version, is_current FROM file_refs WHERE kind = 'video' ORDER BY version ASC")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            video_refs,
+            vec![
+                (new_row_key.clone(), "old_clip_gen.mp4".to_string(), 1, 0),
+                (new_row_key.clone(), "new_clip_gen_v2.mp4".to_string(), 2, 1),
+            ]
+        );
+
+        let img_ref: (String, i64, i64) = conn
+            .query_row(
+                "SELECT row_key, version, is_current FROM file_refs WHERE kind = 'anh'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(img_ref, (new_row_key, 1, 1));
+
+        stop_srv.store(true, Ordering::SeqCst);
+        let _ = join_srv.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reserve_next_version_with_keys_accounts_for_colliding_old_key_bump() {
+        let dir = make_temp_project("reserve_colliding_old_key");
+        let img_out = dir.join("image_out");
+        let conn = crate::state_db::open(&dir).unwrap();
+        let target_key = "cur.png#h2";
+        let old_key = "old.png#h1";
+
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (NULL, ?1, 'anh', 'cur_a.png', 'image_out/cur_a.png', 1, 1, '2026-11-20T00:00:00Z')",
+            rusqlite::params![target_key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (NULL, ?1, 'anh', 'old_b.png', 'image_out/old_b.png', 1, 1, '2026-11-20T00:00:01Z')",
+            rusqlite::params![old_key],
+        )
+        .unwrap();
+
+        let res =
+            reserve_next_version_with_keys(&conn, &img_out, target_key, &[old_key.into()], "anh");
+        assert_eq!(
+            res.version, 3,
+            "colliding v1 from old_key will bump to v2 during migration, so new ref must reserve v3"
+        );
+        drop(res);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

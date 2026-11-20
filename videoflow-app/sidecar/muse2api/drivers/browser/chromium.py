@@ -235,28 +235,35 @@ class ChromiumProcess:
     async def stop(self) -> None:
         try:
             if self.proc and self.proc.returncode is None:
-                if os.name == "nt":
-                    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(
-                            subprocess.run,
-                            ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                            capture_output=True,
-                            timeout=15,
-                            creationflags=creationflags,
-                        )
-                else:
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        self.proc.terminate()
                 try:
-                    await asyncio.wait_for(self.proc.wait(), 10)
-                except asyncio.TimeoutError:
+                    if os.name == "nt":
+                        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(
+                                subprocess.run,
+                                ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                                capture_output=True,
+                                timeout=15,
+                                creationflags=creationflags,
+                            )
+                    else:
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            self.proc.terminate()
+                    try:
+                        await asyncio.wait_for(self.proc.wait(), 10)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            self.proc.kill()
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(self.proc.wait(), 5)
+                except asyncio.CancelledError:
                     with contextlib.suppress(ProcessLookupError, OSError):
                         self.proc.kill()
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(self.proc.wait(), 5)
-            self.proc = None
+                    raise
         finally:
+            self.proc = None
             if self._proxy_relay is not None:
-                await self._proxy_relay.stop()
-                self._proxy_relay = None
+                try:
+                    await self._proxy_relay.stop()
+                finally:
+                    self._proxy_relay = None

@@ -294,6 +294,8 @@ class _Tab:
     """Last ignored quota-hint snippet, so a page polled every 0.6s logs it once."""
     warm: bool = False
     """The page shows a started thread holding only the warm-up exchange."""
+    warming: bool = False
+    """Checked out by background ``_fill_warm``, not a user/API request."""
     busy: bool = False
     stale: bool = False
     """Cookies were renewed; close this tab once it is idle."""
@@ -336,6 +338,7 @@ class BrowserDriver(MuseDriver):
         self._contexts: dict[str, str] = {}
         self._tabs: dict[str, list[_Tab]] = {}
         self._opening: dict[str, int] = {}
+        self._opening_warming: dict[str, int] = {}
         self._tab_cond = asyncio.Condition()
         self._ctx_lock = asyncio.Lock()
         # Last quota snapshot per account (see ``quota``) and the lock serialising reads.
@@ -346,11 +349,24 @@ class BrowserDriver(MuseDriver):
         self._recovery_lock = asyncio.Lock()
         self._coordinator_ready = False
         self._closed = False
+        self._account_lookup: Callable[[str], Account | None] | None = None
+        self._account_blocked_cb: Callable[[str], bool] | None = None
 
         # Multi-driver registry per account (when self.account is None)
         self._account_drivers: dict[str, BrowserDriver] = {}
         self._driver_locks: dict[str, asyncio.Lock] = {}
         self._prewarm_tasks: dict[str, asyncio.Task] = {}
+
+    def set_account_guards(
+        self,
+        *,
+        lookup: Callable[[str], Account | None] | None = None,
+        is_blocked: Callable[[str], bool] | None = None,
+    ) -> None:
+        self._account_lookup = lookup
+        self._account_blocked_cb = is_blocked
+        for drv in self._account_drivers.values():
+            drv.set_account_guards(lookup=lookup, is_blocked=is_blocked)
 
     @property
     def account_drivers(self) -> dict[str, BrowserDriver]:
@@ -384,6 +400,10 @@ class BrowserDriver(MuseDriver):
                     profile_dir=pdir,
                     proxy=expected_proxy,
                 )
+                drv.set_account_guards(
+                    lookup=self._account_lookup,
+                    is_blocked=self._account_blocked_cb,
+                )
                 self._account_drivers[account.id] = drv
             return drv
 
@@ -416,6 +436,11 @@ class BrowserDriver(MuseDriver):
                 await task
         lock = self._driver_locks.setdefault(account_id, asyncio.Lock())
         async with lock:
+            task2 = self._prewarm_tasks.pop(account_id, None)
+            if task2 and not task2.done():
+                task2.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task2
             drv = self._account_drivers.get(account_id)
             if drv is None:
                 self._quota_cache.pop(account_id, None)
@@ -425,6 +450,11 @@ class BrowserDriver(MuseDriver):
                 and drv.proxy == (only_if_proxy_mismatch or "")
             ):
                 return
+            warm_task = drv._warming.pop(account_id, None)
+            if warm_task and not warm_task.done():
+                warm_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await warm_task
             if drv.is_account_busy(account_id):
                 log.warning(
                     "skipping release_account_driver for busy account %s",
@@ -471,6 +501,10 @@ class BrowserDriver(MuseDriver):
                 port=port,
                 profile_dir=pdir,
                 proxy=expected_proxy,
+            )
+            drv.set_account_guards(
+                lookup=self._account_lookup,
+                is_blocked=self._account_blocked_cb,
             )
             self._account_drivers[account.id] = drv
         return drv
@@ -546,6 +580,8 @@ class BrowserDriver(MuseDriver):
             log.info("browser recovery complete on driver (account=%s)", self.account_id or "default")
 
     async def startup(self) -> None:
+        if self._closed:
+            raise UpstreamError("browser driver is closed")
         exe = find_chromium(self.settings.chromium_path)
         if self.account is None:
             # Root coordinator delegates every request to per-account sub-drivers;
@@ -556,16 +592,33 @@ class BrowserDriver(MuseDriver):
                 exe,
             )
             return
-        self._chromium = ChromiumProcess(
+        chromium = ChromiumProcess(
             exe, self.port, self.profile_dir, self.settings.headless,
             proxy=self.proxy,
         )
-        ws_url = await self._chromium.start()
-        if self._chromium.port != self.port:
-            release_cdp_port(self.port)
-            self.port = self._chromium.port
+        self._chromium = chromium
+        try:
+            ws_url = await chromium.start()
+            if chromium.port != self.port:
+                release_cdp_port(self.port)
+                self.port = chromium.port
             _USED_PORTS.add(self.port)
-        self._browser = await CDPSession.connect(ws_url)
+            if self._closed:
+                raise UpstreamError("browser driver is closed")
+            self._browser = await CDPSession.connect(ws_url)
+        except BaseException:
+            try:
+                if self._browser is not None:
+                    with contextlib.suppress(Exception):
+                        await self._browser.close()
+                    self._browser = None
+                with contextlib.suppress(Exception):
+                    await chromium.stop()
+            finally:
+                if self._chromium is chromium:
+                    self._chromium = None
+                release_cdp_port(self.port)
+            raise
         log.info("browser driver ready (account=%s, profile=%s, proxy=%s, port=%d)",
                  self.account_id or "default", self.profile_dir, mask_proxy(self.proxy), self.port)
 
@@ -631,31 +684,44 @@ class BrowserDriver(MuseDriver):
             }
         ok = self.browser_alive or getattr(self, "_coordinator_ready", False)
         tabs = [t for ts in self._tabs.values() for t in ts]
+        has_active_req = any(t.busy and not getattr(t, "warming", False) for t in tabs)
         return {
             "driver": self.name,
             "ok": ok,
             "browser_alive": self.browser_alive,
             "tabs": len(tabs),
             "busy_tabs": sum(t.busy for t in tabs),
-            "active_account_id": self.account_id if any(t.busy for t in tabs) else None,
-            "active_proxy": mask_proxy_url(self.proxy) if any(t.busy for t in tabs) else None,
+            "active_account_id": self.account_id if has_active_req else None,
+            "active_proxy": mask_proxy_url(self.proxy) if has_active_req else None,
         }
 
     def is_account_busy(self, account_id: str) -> bool:
         if self.account is None and account_id in self._account_drivers:
             return self._account_drivers[account_id].is_account_busy(account_id)
-        if self._opening.get(account_id, 0) > 0:
+        non_warming_opening = max(
+            0,
+            self._opening.get(account_id, 0) - self._opening_warming.get(account_id, 0),
+        )
+        if non_warming_opening > 0:
             return True
         if (q_lock := self._quota_locks.get(account_id)) and q_lock.locked():
             return True
         if (v_lock := self._video_locks.get(account_id)) and v_lock.locked():
             return True
         tabs = self._tabs.get(account_id, [])
-        return any(getattr(t, "busy", False) for t in tabs)
+        return any(
+            getattr(t, "busy", False) and not getattr(t, "warming", False)
+            for t in tabs
+        )
 
     # ------------------------------------------------------------ tabs
-    async def _checkout(self, account: Account,
-                        prefer: Callable[[_Tab], bool] | None = None) -> _Tab:
+    async def _checkout(
+        self,
+        account: Account,
+        prefer: Callable[[_Tab], bool] | None = None,
+        *,
+        warming: bool = False,
+    ) -> _Tab:
         """Reserve an idle tab of ``account``, opening a new one while under the
         per-account limit. An idle tab matching ``prefer`` wins; without one, a new
         tab beats reusing (and so wiping) a tab that holds another conversation.
@@ -664,6 +730,8 @@ class BrowserDriver(MuseDriver):
         dead: list[_Tab] = []
         async with self._tab_cond:
             while True:
+                if self._closed:
+                    raise UpstreamError("browser driver is closed")
                 tabs = self._tabs.setdefault(account.id, [])
                 for t in [t for t in tabs
                           if t.closed or (not t.busy and (t.stale or t.session.closed))]:
@@ -676,9 +744,14 @@ class BrowserDriver(MuseDriver):
                 if match or (idle and not can_open):
                     tab = match or next((t for t in idle if not t.has_state), idle[0])
                     tab.busy = True
+                    tab.warming = warming
                     break
                 if can_open:
                     self._opening[account.id] = self._opening.get(account.id, 0) + 1
+                    if warming:
+                        self._opening_warming[account.id] = (
+                            self._opening_warming.get(account.id, 0) + 1
+                        )
                     tab = None
                     break
                 # The pool caps requests per account, so this only waits out a tab
@@ -691,15 +764,22 @@ class BrowserDriver(MuseDriver):
         try:
             tab = await self._open_tab(account)
         finally:
-            await asyncio.shield(self._finish_open(account.id, tab))
+            await asyncio.shield(self._finish_open(account.id, tab, warming=warming))
         log.info("opened tab %d for account %s", len(self._tabs[account.id]), account.id)
         return tab
 
-    async def _finish_open(self, account_id: str, tab: _Tab | None) -> None:
+    async def _finish_open(
+        self, account_id: str, tab: _Tab | None, *, warming: bool = False
+    ) -> None:
         async with self._tab_cond:
             self._opening[account_id] = max(0, self._opening.get(account_id, 1) - 1)
+            if warming:
+                self._opening_warming[account_id] = max(
+                    0, self._opening_warming.get(account_id, 1) - 1
+                )
             if tab:
                 tab.busy = True
+                tab.warming = warming
                 self._tabs.setdefault(account_id, []).append(tab)
             self._tab_cond.notify_all()
 
@@ -707,6 +787,7 @@ class BrowserDriver(MuseDriver):
         # Free the tab before taking the lock: a request cancelled while waiting for
         # the lock (client gone) must not leave its tab marked busy for good.
         tab.busy = False
+        tab.warming = False
         await asyncio.shield(self._notify_tabs())
         if tab.stale:
             await self._close_tab(tab)
@@ -717,36 +798,54 @@ class BrowserDriver(MuseDriver):
 
     async def _context(self, account: Account) -> str:
         async with self._ctx_lock:
+            if self._closed:
+                raise UpstreamError("browser driver is closed")
             if ctx := self._contexts.get(account.id):
                 return ctx
             for attempt in (1, 2):
+                if self._closed:
+                    raise UpstreamError("browser driver is closed")
                 if not self._browser or self._browser.closed:
                     await self._recover_browser()
-                assert self._browser
+                if self._closed:
+                    raise UpstreamError("browser driver is closed")
+                if not self._browser or self._browser.closed:
+                    raise CDPError("browser is unavailable after recovery")
                 try:
                     res = await self._browser.send("Target.createBrowserContext", {"disposeOnDetach": False})
                     self._contexts[account.id] = res["browserContextId"]
                     return res["browserContextId"]
                 except CDPError as exc:
                     log.warning("CDP error in _context (attempt %d): %s", attempt, exc)
-                    if attempt == 1:
+                    if attempt == 1 and not self._closed:
                         await self._recover_browser()
                     else:
                         raise
             raise RuntimeError("unreachable in _context")
 
     async def _open_tab(self, account: Account) -> _Tab:
+        if self._closed:
+            raise UpstreamError("browser driver is closed")
         if missing := muse.missing_session_cookies(account.cookies):
             raise UpstreamAuthError(f"account is missing session cookies: {', '.join(missing)}")
         for attempt in (1, 2):
+            if self._closed:
+                raise UpstreamError("browser driver is closed")
             if not self._browser or self._browser.closed:
                 if self._chromium is None and self._browser is None:
                     async with self._recovery_lock:
+                        if self._closed:
+                            raise UpstreamError("browser driver is closed")
                         if self._chromium is None and self._browser is None:
                             await self.startup()
+                if self._closed:
+                    raise UpstreamError("browser driver is closed")
                 if not self._browser or self._browser.closed:
                     await self._recover_browser()
-            assert self._browser and self._chromium
+            if self._closed:
+                raise UpstreamError("browser driver is closed")
+            if not self._browser or not self._chromium:
+                raise CDPError("browser is unavailable after recovery")
             target_id: str | None = None
             session: CDPSession | None = None
             try:
@@ -766,6 +865,8 @@ class BrowserDriver(MuseDriver):
                 await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
                 await session.send("Page.setWebLifecycleState", {"state": "active"})
                 await self._set_cookies(session, account)
+                if self._closed:
+                    raise UpstreamError("browser driver is closed")
                 return _Tab(account.id, context_id, target_id, session)
             except CDPError as exc:
                 if session is not None:
@@ -775,7 +876,7 @@ class BrowserDriver(MuseDriver):
                     with contextlib.suppress(Exception):
                         await self._browser.send("Target.closeTarget", {"targetId": target_id})
                 log.warning("CDP error in _open_tab (attempt %d): %s", attempt, exc)
-                if attempt == 1:
+                if attempt == 1 and not self._closed:
                     await self._recover_browser()
                 else:
                     raise
@@ -794,7 +895,7 @@ class BrowserDriver(MuseDriver):
         counted as open or busy."""
         if tab.closed:
             return
-        tab.closed, tab.busy = True, False
+        tab.closed, tab.busy, tab.warming = True, False, False
         await asyncio.shield(self._dispose_tab(tab))
 
     async def _dispose_tab(self, tab: _Tab) -> None:
@@ -928,16 +1029,28 @@ class BrowserDriver(MuseDriver):
         deadline = time.monotonic() + self.settings.page_ready_timeout
         state: dict = {}
         while time.monotonic() < deadline:
+            if getattr(tab.session, "closed", False) is True:
+                raise CDPError("cdp connection closed")
             await asyncio.sleep(0.25)
+            if getattr(tab.session, "closed", False) is True:
+                raise CDPError("cdp connection closed")
             # A busy page can leave Runtime.evaluate unanswered while it loads; poll again.
-            with contextlib.suppress(CDPError, TimeoutError):
+            try:
                 state = await tab.session.evaluate(dom.PAGE_STATE, timeout=5.0) or {}
-                if state.get("vmDisabled"):
-                    raise UpstreamVmDisabled(
-                        "muse.ai disconnected this account's workspace (vm_state=DISABLED); "
-                        "it needs a support ticket on muse.ai to reconnect")
-                if state.get("ready"):
-                    return
+            except CDPError:
+                if getattr(tab.session, "closed", False) is True:
+                    raise
+                continue
+            except TimeoutError as exc:
+                if getattr(tab.session, "closed", False) is True:
+                    raise CDPError("cdp connection closed") from exc
+                continue
+            if state.get("vmDisabled"):
+                raise UpstreamVmDisabled(
+                    "muse.ai disconnected this account's workspace (vm_state=DISABLED); "
+                    "it needs a support ticket on muse.ai to reconnect")
+            if state.get("ready"):
+                return
         head = (state.get("head") or "").lower()
         if any(h in head for h in dom.LOGIN_HINTS):
             raise UpstreamAuthError("muse.ai redirected to login; cookies are no longer valid")
@@ -1239,9 +1352,22 @@ class BrowserDriver(MuseDriver):
             and not muse.missing_session_cookies(account.cookies)
         )
 
+    def _can_prewarm(self, account: Account) -> bool:
+        if self._closed or self.settings.warm_threads <= 0:
+            return False
+        if not self._is_prewarm_eligible(account):
+            return False
+        if self._account_blocked_cb is not None and self._account_blocked_cb(account.id):
+            return False
+        if self._account_lookup is not None:
+            latest = self._account_lookup(account.id)
+            if latest is None or not self._is_prewarm_eligible(latest):
+                return False
+        return True
+
     def prewarm(self, account: Account) -> None:
         """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
-        if self._closed or self.settings.warm_threads <= 0 or not self._is_prewarm_eligible(account):
+        if not self._can_prewarm(account):
             return
         if self.account is None:
             existing = self._prewarm_tasks.get(account.id)
@@ -1249,18 +1375,18 @@ class BrowserDriver(MuseDriver):
                 return
             async def _kick() -> None:
                 try:
-                    if self._closed or not self._is_prewarm_eligible(account):
+                    if not self._can_prewarm(account):
                         return
                     drv = await self._ensure_account_driver(account)
-                    if drv._closed or not self._is_prewarm_eligible(account):
+                    if not drv._can_prewarm(account):
                         return
                     if not drv.browser_alive:
                         async with drv._recovery_lock:
                             if not drv._closed and not drv.browser_alive:
-                                if not self._is_prewarm_eligible(account):
+                                if not drv._can_prewarm(account):
                                     return
                                 await drv.startup()
-                    if not drv._closed and self._is_prewarm_eligible(account):
+                    if drv._can_prewarm(account):
                         drv.prewarm(account)
                 except asyncio.CancelledError:
                     raise
@@ -1280,23 +1406,42 @@ class BrowserDriver(MuseDriver):
         enough. A failed round (a cold page load often times out) is retried after a
         pause, up to ``_WARM_MAX_FAILED_ROUNDS`` in a row."""
         failed = 0
-        while not self._closed and self._is_prewarm_eligible(account):
+        while self._can_prewarm(account):
             batch: list[_Tab] = []
             try:
-                while not self._closed and self._is_prewarm_eligible(account):
+                while self._can_prewarm(account):
                     tab = await self._checkout_for_warming(account, len(batch))
                     if tab is None:
                         break
                     batch.append(tab)
             except BaseException as exc:
                 for t in batch:
-                    with contextlib.suppress(Exception):
+                    t.busy = False
+                    t.warming = False
+                cancelled: asyncio.CancelledError | None = (
+                    exc if isinstance(exc, asyncio.CancelledError) else None
+                )
+                for t in batch:
+                    try:
                         await asyncio.shield(self._checkin(t))
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
+                    except asyncio.CancelledError as c_exc:
+                        if cancelled is None:
+                            cancelled = c_exc
+                    except Exception:  # noqa: BLE001
+                        pass
+                if cancelled is not None:
+                    if cancelled is exc:
+                        raise
+                    raise cancelled from exc
                 log.warning("prewarm checkout aborted for %s: %s", account.id, exc)
                 return
             if not batch:
+                return
+            if not self._can_prewarm(account):
+                for t in batch:
+                    t.busy = False
+                    t.warming = False
+                await asyncio.shield(self._notify_tabs())
                 return
             results = await asyncio.gather(*(self._warm_one(account, t) for t in batch))
             if any(r is None for r in results):
@@ -1307,12 +1452,15 @@ class BrowserDriver(MuseDriver):
             failed += 1
             if failed >= self._WARM_MAX_FAILED_ROUNDS:
                 return
-            if self._closed or not self._is_prewarm_eligible(account):
+            if not self._can_prewarm(account):
                 return
             await asyncio.sleep(self._WARM_RETRY_DELAY)
 
     async def _warm_one(self, account: Account, tab: _Tab) -> bool | None:
         try:
+            if not self._can_prewarm(account):
+                self._forget(tab)
+                return None
             await self._warm_up(tab)
         except (UpstreamAuthError, UpstreamVmDisabled, UpstreamQuotaError) as exc:
             self._forget(tab)
@@ -1334,6 +1482,8 @@ class BrowserDriver(MuseDriver):
         the ``pending`` ones being warmed) and a slot is still left for a real request."""
         limit = max(1, self.settings.account_max_concurrency)
         async with self._tab_cond:
+            if not self._can_prewarm(account):
+                return None
             tabs = [t for t in self._tabs.get(account.id, []) if not t.closed]
             if sum(t.warm for t in tabs) + pending >= self.settings.warm_threads:
                 return None
@@ -1341,7 +1491,11 @@ class BrowserDriver(MuseDriver):
             free = len(idle) + limit - len(tabs) - self._opening.get(account.id, 0)
             if free < 2:
                 return None
-        return await self._checkout(account, prefer=lambda t: not t.has_state and not t.warm)
+        return await self._checkout(
+            account,
+            prefer=lambda t: not t.has_state and not t.warm,
+            warming=True,
+        )
 
     async def _warm_up(self, tab: _Tab) -> None:
         await self._new_thread(tab)
@@ -1780,8 +1934,13 @@ class BrowserDriver(MuseDriver):
                 # Prefer a tab without a conversation; the dialog does not navigate anyway.
                 tab = next((t for t in idle if not t.has_state), idle[0])
                 tab.busy = True
+                tab.warming = False
                 return tab
-            if any(t.busy for t in tabs) or self._opening.get(account.id):
+            non_warming_opening = max(
+                0,
+                self._opening.get(account.id, 0) - self._opening_warming.get(account.id, 0),
+            )
+            if any(t.busy and not getattr(t, "warming", False) for t in tabs) or non_warming_opening > 0:
                 raise AccountBusy(f"account '{account.id}' is serving a request; "
                                   "try the quota again when it is idle")
         return await self._checkout(account, prefer=lambda t: not t.has_state)

@@ -148,7 +148,12 @@ impl Settings {
 
         clean.concurrency = clean.concurrency.clamp(1, 3);
         clean.max_attempts = clean.max_attempts.clamp(1, 10);
-        clean.video_seconds = clean.video_seconds.max(1);
+        let max_video_seconds = if clean.video_source == "internal" {
+            60
+        } else {
+            120
+        };
+        clean.video_seconds = clean.video_seconds.clamp(1, max_video_seconds);
         clean.image_timeout_s = clean.image_timeout_s.max(1);
         clean.video_create_timeout_s = clean.video_create_timeout_s.max(1);
         clean.poll_interval_s = clean.poll_interval_s.max(1);
@@ -854,5 +859,123 @@ mod tests {
         // Bearer & URL redaction must remain idempotent across multiple passes
         let twice = redact_secrets(&redact_secrets("ERROR Bearer tok123 and http://u:p@1.2.3.4:8080/x"));
         assert_eq!(twice, "ERROR Bearer [REDACTED] and http://u:[REDACTED]@1.2.3.4:8080/x");
+    }
+
+    #[test]
+    fn test_settings_video_seconds_bounds_by_video_source() {
+        // Gateway mode: clamp 1..=120
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 0,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            1
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 90,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            90
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 120,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            120
+        );
+        assert_eq!(
+            Settings {
+                video_source: "gateway".into(),
+                video_seconds: 999,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            120
+        );
+
+        // Internal Muse mode: clamp 1..=60 (matches sidecar/muse2api schemas.py le=60)
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 0,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            1
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 60,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 61,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+        assert_eq!(
+            Settings {
+                video_source: "internal".into(),
+                video_seconds: 120,
+                ..Default::default()
+            }
+            .sanitized()
+            .video_seconds,
+            60
+        );
+
+        // Unknown video_source normalizes to gateway (cap 120)
+        let unknown_src = Settings {
+            video_source: "custom".into(),
+            video_seconds: 250,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(unknown_src.video_source, "gateway");
+        assert_eq!(unknown_src.video_seconds, 120);
+
+        // Store roundtrip preserves clamp
+        let idx = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "videoflow_settings_vidsec_{}_{}",
+            std::process::id(),
+            idx
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SettingsStore::with_path(dir.join("settings.json"));
+        store
+            .save(&Settings {
+                video_source: "internal".into(),
+                video_seconds: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        let reloaded = store.load();
+        assert_eq!(reloaded.video_source, "internal");
+        assert_eq!(reloaded.video_seconds, 60);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -132,6 +132,8 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
             cl_val = int(raw_cl.strip())
         except ValueError as exc:
             raise InvalidRequest("invalid Content-Length header") from exc
+        if cl_val < 0:
+            raise InvalidRequest("invalid Content-Length header")
         if cl_val > max_body:
             raise InvalidRequest("request body too large")
 
@@ -156,7 +158,7 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
         for f in files:
             if f.size is not None and f.size > _MAX_FETCH_BYTES:
                 raise InvalidRequest("uploaded image exceeds 20 MiB")
-            mime = f.content_type or ""
+            mime = (f.content_type or "").split(";", 1)[0].strip().lower()
             if not mime.startswith("image/"):
                 mime = mimetypes.guess_type(f.filename or "")[0] or "image/png"
             raw = await f.read(_MAX_FETCH_BYTES + 1)

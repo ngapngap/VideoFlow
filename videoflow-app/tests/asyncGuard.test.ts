@@ -4,6 +4,7 @@ import {
   createSeqGuard,
   isAccountActionBlocked,
   mergeSingleTestedProxy,
+  runWithLoadingGuard,
   shouldSyncSelectedProxy,
 } from "../src/lib/asyncGuard.js";
 
@@ -50,5 +51,142 @@ describe("mergeSingleTestedProxy", () => {
 
     assert.deepEqual(mergeSingleTestedProxy([p1, p2], updatedP1), [updatedP1, p2]);
     assert.deepEqual(mergeSingleTestedProxy([p1, p2], deletedP3), [p1, p2]);
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (val: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe("runWithLoadingGuard", () => {
+  it("clears loading after a silent reload overlaps an in-flight non-silent load", async () => {
+    const guard = createSeqGuard();
+    let loading = false;
+    let applied: string | null = null;
+    const errors: unknown[] = [];
+
+    const first = deferred<string>();
+    const second = deferred<string>();
+
+    const p1 = runWithLoadingGuard(
+      guard,
+      false,
+      (v) => {
+        loading = v;
+      },
+      async (seq) => {
+        const res = await first.promise;
+        if (guard.isCurrent(seq)) applied = res;
+        return res;
+      },
+      (err) => errors.push(err)
+    );
+    assert.equal(loading, true);
+
+    const p2 = runWithLoadingGuard(
+      guard,
+      true,
+      (v) => {
+        loading = v;
+      },
+      async (seq) => {
+        const res = await second.promise;
+        if (guard.isCurrent(seq)) applied = res;
+        return res;
+      },
+      (err) => errors.push(err)
+    );
+    assert.equal(loading, true);
+
+    first.resolve("stale");
+    await p1;
+    assert.equal(applied, null);
+    assert.equal(loading, true);
+
+    second.resolve("fresh");
+    await p2;
+    assert.equal(applied, "fresh");
+    assert.equal(loading, false);
+    assert.equal(errors.length, 0);
+  });
+
+  it("clears loading even when the overlapping silent reload rejects", async () => {
+    const guard = createSeqGuard();
+    let loading = false;
+    const errors: unknown[] = [];
+
+    const first = deferred<string>();
+    const second = deferred<string>();
+
+    const p1 = runWithLoadingGuard(
+      guard,
+      false,
+      (v) => {
+        loading = v;
+      },
+      async () => first.promise,
+      (err) => errors.push(err)
+    );
+    const p2 = runWithLoadingGuard(
+      guard,
+      true,
+      (v) => {
+        loading = v;
+      },
+      async () => second.promise,
+      (err) => errors.push(err)
+    );
+
+    first.resolve("stale");
+    await p1;
+    assert.equal(loading, true);
+
+    second.reject(new Error("silent refresh failed"));
+    await p2;
+    assert.equal(loading, false);
+    assert.equal(errors.length, 1);
+  });
+
+  it("clears loading when fast silent reload finishes before slow non-silent load", async () => {
+    const guard = createSeqGuard();
+    let loading = false;
+    const errors: unknown[] = [];
+
+    const slowFirst = deferred<string>();
+    const fastSecond = deferred<string>();
+
+    const p1 = runWithLoadingGuard(
+      guard,
+      false,
+      (v) => {
+        loading = v;
+      },
+      async () => slowFirst.promise,
+      (err) => errors.push(err)
+    );
+    const p2 = runWithLoadingGuard(
+      guard,
+      true,
+      (v) => {
+        loading = v;
+      },
+      async () => fastSecond.promise,
+      (err) => errors.push(err)
+    );
+
+    fastSecond.resolve("latest");
+    await p2;
+    assert.equal(loading, false);
+
+    slowFirst.reject(new Error("stale failure"));
+    await p1;
+    assert.equal(loading, false);
+    assert.equal(errors.length, 0);
   });
 });

@@ -1,7 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Settings, SettingsView } from "../src/lib/api.js";
-import { executeSettingsSave } from "../src/lib/settingsSave.js";
+import {
+  executeSettingsSave,
+  getVideoSecondsMax,
+  isValidIntInRange,
+  validateVideoSeconds,
+} from "../src/lib/settingsSave.js";
 
 function makeSettings(): Settings {
   return {
@@ -169,5 +174,27 @@ describe("executeSettingsSave", () => {
       "setApiKey:video:vid-secret",
       "getSettings",
     ]);
+  });
+});
+
+describe("video_seconds bounds validation", () => {
+  it("caps internal Muse video_seconds at 1..60 while keeping gateway at 1..120", () => {
+    assert.equal(getVideoSecondsMax("internal"), 60);
+    assert.equal(getVideoSecondsMax("gateway"), 120);
+    assert.equal(getVideoSecondsMax(undefined), 120);
+
+    assert.equal(validateVideoSeconds(1, "internal"), null);
+    assert.equal(validateVideoSeconds(60, "internal"), null);
+    assert.match(validateVideoSeconds(61, "internal") ?? "", /1 đến 60/);
+    assert.match(validateVideoSeconds(120, "internal") ?? "", /1 đến 60/);
+    assert.match(validateVideoSeconds(0, "internal") ?? "", /1 đến 60/);
+
+    assert.equal(validateVideoSeconds(61, "gateway"), null);
+    assert.equal(validateVideoSeconds(120, "gateway"), null);
+    assert.match(validateVideoSeconds(121, "gateway") ?? "", /1 đến 120/);
+
+    assert.equal(isValidIntInRange("", 1, 60), false);
+    assert.equal(isValidIntInRange(15.5, 1, 60), false);
+    assert.equal(isValidIntInRange("30", 1, 60), true);
   });
 });

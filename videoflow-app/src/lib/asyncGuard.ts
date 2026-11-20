@@ -15,6 +15,35 @@ export function createSeqGuard(): SeqGuard {
 }
 
 /**
+ * Runs an async reload guarded by `guard` and clears `loading` whenever the latest
+ * request settles, even if a silent reload superseded an earlier non-silent load.
+ */
+export async function runWithLoadingGuard<T>(
+  guard: SeqGuard,
+  silent: boolean,
+  setLoading: (loading: boolean) => void,
+  fn: (seq: number) => Promise<T>,
+  onError?: (err: unknown) => void
+): Promise<T | undefined> {
+  const seq = guard.next();
+  if (!silent) {
+    setLoading(true);
+  }
+  try {
+    return await fn(seq);
+  } catch (err) {
+    if (guard.isCurrent(seq)) {
+      onError?.(err);
+    }
+    return undefined;
+  } finally {
+    if (guard.isCurrent(seq)) {
+      setLoading(false);
+    }
+  }
+}
+
+/**
  * Determines whether AccountCard should sync `selectedProxyId` from an updated `account.proxy_id` prop.
  * Prevents snapping back while a proxy assignment request is still saving.
  */

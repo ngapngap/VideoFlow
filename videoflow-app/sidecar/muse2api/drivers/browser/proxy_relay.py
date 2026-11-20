@@ -103,8 +103,9 @@ def needs_proxy_relay(proxy: str | None) -> bool:
     return False
 
 
-async def _read_http_head(reader: asyncio.StreamReader) -> bytes:
+async def _read_http_head(reader: asyncio.StreamReader, *, is_request: bool = True) -> bytes:
     """Read until ``\\r\\n\\r\\n`` (HTTP header terminator), bounded to ``_HEADER_LIMIT``."""
+    err_cls = _HttpValidationError if is_request else _UpstreamProxyError
     buf = bytearray()
     leading_empty = 0
     while True:
@@ -114,14 +115,19 @@ async def _read_http_head(reader: asyncio.StreamReader) -> bytes:
             if not buf and not exc.partial:
                 return b""
             raise
+        except asyncio.LimitOverrunError as exc:
+            raise err_cls("HTTP header line exceeds limit") from exc
+        line_body = chunk[:-2]
+        if b"\r" in line_body or b"\n" in line_body or b"\x00" in line_body:
+            raise err_cls("Invalid control character in HTTP header")
         if not buf and chunk == b"\r\n":
             leading_empty += 1
             if leading_empty > _MAX_LEADING_EMPTY_LINES:
-                raise _HttpValidationError("Too many leading empty lines before HTTP head")
+                raise err_cls("Too many leading empty lines before HTTP head")
             continue
         buf.extend(chunk)
         if len(buf) > _HEADER_LIMIT:
-            raise _HttpValidationError("HTTP header exceeds limit")
+            raise err_cls("HTTP header exceeds limit")
         if buf.endswith(b"\r\n\r\n"):
             return bytes(buf)
 
@@ -132,10 +138,12 @@ async def _pipe(
     *,
     idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
     last_activity: list[float] | None = None,
-) -> None:
+) -> bool:
+    """Copy ``reader`` to ``writer``. Returns True on clean EOF, False on error/timeout."""
     slice_timeout = max(0.05, min(5.0, idle_timeout))
     if last_activity is None:
         last_activity = [time.monotonic()]
+    clean_eof = False
     try:
         while True:
             try:
@@ -145,17 +153,20 @@ async def _pipe(
                     raise
                 continue
             if not data:
+                clean_eof = True
                 break
             last_activity[0] = time.monotonic()
             writer.write(data)
             await asyncio.wait_for(writer.drain(), timeout=idle_timeout)
             last_activity[0] = time.monotonic()
-    except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionError, OSError):
-        pass
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        clean_eof = False
     finally:
-        with contextlib.suppress(Exception):
-            if writer.can_write_eof():
-                writer.write_eof()
+        if clean_eof:
+            with contextlib.suppress(Exception):
+                if writer.can_write_eof():
+                    writer.write_eof()
+    return clean_eof
 
 
 async def _pipe_pair(
@@ -177,19 +188,31 @@ async def _pipe_pair(
     try:
         done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
         for finished in done:
-            if not tasks[finished].can_write_eof():
+            clean_eof = (
+                not finished.cancelled()
+                and finished.exception() is None
+                and bool(finished.result())
+            )
+            if not clean_eof or not tasks[finished].can_write_eof():
                 for p in pending:
                     p.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
     finally:
-        for t in (t1, t2):
-            if not t.done():
-                t.cancel()
+        remaining = [t for t in (t1, t2) if not t.done()]
+        for t in remaining:
+            t.cancel()
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
 
 
 def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
-    lines = head.split(b"\r\n")[1:-2]
+    err_cls = _HttpValidationError if is_request else _UpstreamProxyError
+    raw_lines = head.split(b"\r\n")
+    for raw_line in raw_lines[:-2]:
+        if b"\r" in raw_line or b"\n" in raw_line or b"\x00" in raw_line:
+            raise err_cls("Invalid control character in HTTP header")
+    lines = raw_lines[1:-2]
     content_lengths: list[int] = []
     te_values: list[str] = []
     host: str | None = None
@@ -210,7 +233,7 @@ def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
         if name == "content-length":
             parts = [p.strip() for p in val.split(",")]
             if not parts or any(not (p.isascii() and p.isdigit()) for p in parts):
-                raise _HttpValidationError("Invalid Content-Length header")
+                raise err_cls("Invalid Content-Length header")
             content_lengths.extend(int(p) for p in parts)
         elif name == "transfer-encoding":
             te_values.extend(t.strip().lower() for t in val.split(",") if t.strip())
@@ -228,10 +251,10 @@ def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
                 expect_100 = True
 
     if len(set(content_lengths)) > 1:
-        raise _HttpValidationError("Conflicting Content-Length headers")
+        raise err_cls("Conflicting Content-Length headers")
     cl = content_lengths[0] if content_lengths else None
     has_te = bool(te_values)
-    if is_request and has_te and te_values[-1] != "chunked":
+    if is_request and has_te and te_values != ["chunked"]:
         raise _HttpValidationError("Unsupported request Transfer-Encoding")
     is_chunked = has_te and te_values[-1] == "chunked"
     if is_request and cl is not None and has_te:
@@ -459,8 +482,11 @@ class LocalProxyRelay:
         ):
             raise ValueError("SOCKS5 username/password must not exceed 255 bytes")
 
-        token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
-        self._auth_header = f"Proxy-Authorization: Basic {token}\r\n".encode("ascii")
+        if self._has_auth:
+            token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+            self._auth_header = f"Proxy-Authorization: Basic {token}\r\n".encode("ascii")
+        else:
+            self._auth_header = b""
 
         self._server: asyncio.AbstractServer | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -639,6 +665,8 @@ class LocalProxyRelay:
 
     def _inject_auth(self, head: bytes) -> bytes:
         """Replace or append Proxy-Authorization header in raw HTTP request headers."""
+        if not self._has_auth:
+            return head
         lines = head.split(b"\r\n")
         if not lines:
             return head
@@ -678,7 +706,8 @@ class LocalProxyRelay:
                     upstream_writer.write(self._inject_auth(head))
                     await asyncio.wait_for(upstream_writer.drain(), timeout=self.connect_timeout)
                     resp_head = await asyncio.wait_for(
-                        _read_http_head(upstream_reader), timeout=self.connect_timeout
+                        _read_http_head(upstream_reader, is_request=False),
+                        timeout=self.connect_timeout,
                     )
                 except asyncio.TimeoutError as exc:
                     raise _UpstreamTimeoutError("Upstream HTTP CONNECT timed out") from exc
@@ -728,7 +757,7 @@ class LocalProxyRelay:
 
                 first_line = head.split(b"\r\n", 1)[0]
                 req_parts = first_line.split(b" ")
-                if len(req_parts) != 3:
+                if len(req_parts) != 3 or not all(req_parts):
                     raise _HttpValidationError("Malformed HTTP request line")
                 method_b, target_b, version_b = req_parts
                 method_u = method_b.upper()
@@ -803,7 +832,8 @@ class LocalProxyRelay:
                     while True:
                         try:
                             interim = await asyncio.wait_for(
-                                _read_http_head(upstream_reader), timeout=wait_100
+                                _read_http_head(upstream_reader, is_request=False),
+                                timeout=wait_100,
                             )
                         except asyncio.TimeoutError:
                             break
@@ -848,7 +878,7 @@ class LocalProxyRelay:
                         prefetched_resp = None
                     else:
                         resp_head = await asyncio.wait_for(
-                            _read_http_head(upstream_reader),
+                            _read_http_head(upstream_reader, is_request=False),
                             timeout=self.idle_timeout,
                         )
                     if not resp_head:
@@ -857,7 +887,7 @@ class LocalProxyRelay:
                     status_line = resp_head.split(b"\r\n", 1)[0]
                     s_parts = status_line.split(b" ", 2)
                     if len(s_parts) < 2 or not (s_parts[1].isascii() and s_parts[1].isdigit()):
-                        raise OSError("Invalid HTTP response status line from upstream")
+                        raise _UpstreamProxyError("Invalid HTTP response status line from upstream")
                     resp_ver = s_parts[0].upper()
                     status_code = int(s_parts[1])
 

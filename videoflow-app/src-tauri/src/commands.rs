@@ -1179,6 +1179,8 @@ pub fn set_current_file_version_at(
         ));
     }
 
+    prompts_csv::set_active_media_file(&csv_path, &actual_key, csv_kind, &file_name)?;
+
     let tx = conn
         .transaction()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
@@ -1202,7 +1204,6 @@ pub fn set_current_file_version_at(
     tx.commit()
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-    prompts_csv::set_active_media_file(&csv_path, &actual_key, csv_kind, &file_name)?;
     build_row_detail_at(p, &actual_key)
 }
 
@@ -1610,49 +1611,47 @@ fn ensure_seed_run_id(conn: &rusqlite::Connection) -> AppResult<i64> {
 }
 
 pub fn reset_row_status_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
-    let conn =
+    let csv_path = p.join("prompts.csv");
+    let rows = prompts_csv::read_all(&csv_path)?;
+    let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let mut updated = conn
-        .execute(
+    let target_job_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1",
+            rusqlite::params![row_key],
+            |r| r.get(0),
+        )
+        .ok()
+        .or_else(|| {
+            let row = prompts_csv::find_row_by_key(&rows, row_key)?;
+            let latest_map = engine::load_latest_jobs_map(&conn);
+            let img_counts = engine::image_counts(&rows);
+            engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts).map(|j| j.id)
+        });
+
+    prompts_csv::update_row(&csv_path, row_key, |r| {
+        r.trang_thai = "Đang chờ".into();
+        r.ghi_chu_loi.clear();
+    })?;
+
+    if let Some(jid) = target_job_id {
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+        tx.execute(
             "UPDATE jobs
              SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
                  image_prompt_hash = NULL, video_prompt_hash = NULL,
                  video_task_id = NULL, video_download_url = NULL,
                  attempts_count = 0, last_error = NULL
-             WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1)",
-            rusqlite::params![row_key],
+             WHERE id = ?1",
+            rusqlite::params![jid],
         )
         .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    if updated == 0 {
-        if let Ok(rows) = prompts_csv::read_all(&p.join("prompts.csv")) {
-            if let Some(row) = prompts_csv::find_row_by_key(&rows, row_key) {
-                let latest_map = engine::load_latest_jobs_map(&conn);
-                let img_counts = engine::image_counts(&rows);
-                if let Some(linked) =
-                    engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts)
-                {
-                    updated = conn
-                        .execute(
-                            "UPDATE jobs
-                             SET status = 'dang_cho', image_status = 'chua_chay', video_status = 'chua_chay',
-                                 image_prompt_hash = NULL, video_prompt_hash = NULL,
-                                 video_task_id = NULL, video_download_url = NULL,
-                                 attempts_count = 0, last_error = NULL
-                             WHERE id = ?1",
-                            rusqlite::params![linked.id],
-                        )
-                        .unwrap_or(0);
-                }
-            }
-        }
+        tx.commit()
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
     }
-    let _ = updated;
 
-    prompts_csv::update_row(&p.join("prompts.csv"), row_key, |r| {
-        r.trang_thai = "Đang chờ".into();
-        r.ghi_chu_loi.clear();
-    })?;
     build_row_detail_at(p, row_key)
 }
 
@@ -1677,38 +1676,60 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     let vid_hash = engine::sha2hex(row.promt_tao_video.trim());
     let row_no = row.row_no as i64;
 
-    let conn =
+    let mut conn =
         crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    let note = "Bị bỏ qua bởi người dùng";
-
-    let mut updated = conn
-        .execute(
-            "UPDATE jobs
-             SET status = 'bo_qua', last_error = ?1
-             WHERE id = (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?2) ORDER BY id DESC LIMIT 1)",
-            rusqlite::params![note, actual_key],
+    let direct_job_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1) ORDER BY id DESC LIMIT 1",
+            rusqlite::params![actual_key],
+            |r| r.get(0),
         )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    if updated == 0 {
+        .ok();
+    let linked_job_id: Option<i64> = if direct_job_id.is_none() {
         let latest_map = engine::load_latest_jobs_map(&conn);
         let img_counts = engine::image_counts(&rows);
-        if let Some(linked) = engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts) {
-            updated = conn
+        engine::latest_job_for_csv_row(&conn, row, &latest_map, &img_counts).map(|j| j.id)
+    } else {
+        None
+    };
+
+    prompts_csv::update_row(&csv_path, &actual_key, |r| {
+        r.trang_thai = "Đang chờ".into();
+        r.ghi_chu_loi = "Bị bỏ qua bởi người dùng (Bỏ qua dòng)".into();
+    })?;
+
+    let note = "Bị bỏ qua bởi người dùng";
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
+    let mut updated = if let Some(jid) = direct_job_id {
+        tx.execute(
+            "UPDATE jobs SET status = 'bo_qua', last_error = ?1 WHERE id = ?2",
+            rusqlite::params![note, jid],
+        )
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?
+    } else {
+        0
+    };
+
+    if updated == 0 {
+        if let Some(linked_id) = linked_job_id {
+            updated = tx
                 .execute(
                     "UPDATE OR IGNORE jobs
                      SET status = 'bo_qua', last_error = ?1, row_key = ?2
                      WHERE id = ?3",
-                    rusqlite::params![note, actual_key, linked.id],
+                    rusqlite::params![note, actual_key, linked_id],
                 )
                 .unwrap_or(0);
             if updated == 0 {
-                updated = conn
+                updated = tx
                     .execute(
                         "UPDATE jobs
                          SET status = 'bo_qua', last_error = ?1
                          WHERE id = ?2",
-                        rusqlite::params![note, linked.id],
+                        rusqlite::params![note, linked_id],
                     )
                     .unwrap_or(0);
             }
@@ -1716,9 +1737,9 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     }
 
     if updated == 0 {
-        let seed_run_id = ensure_seed_run_id(&conn)?;
+        let seed_run_id = ensure_seed_run_id(&tx)?;
         let ts = chrono::Local::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status,
                               image_prompt_hash, video_prompt_hash, attempts_count, last_error, started_at, finished_at)
              VALUES (?1, ?2, ?3, 'bo_qua', 'chua_chay', 'chua_chay', ?4, ?5, 0, ?6, ?7, ?7)
@@ -1728,10 +1749,8 @@ pub fn skip_row_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         .map_err(|e| AppError::new("DB_FAIL", format!("Không lưu được trạng thái bỏ qua: {e}")))?;
     }
 
-    prompts_csv::update_row(&csv_path, &actual_key, |r| {
-        r.trang_thai = "Đang chờ".into();
-        r.ghi_chu_loi = "Bị bỏ qua bởi người dùng (Bỏ qua dòng)".into();
-    })?;
+    tx.commit()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     build_row_detail_at(p, &actual_key)
 }
@@ -1784,76 +1803,88 @@ pub fn remap_reference_image_at(
         &old_row.promt_tao_image,
         &old_row.promt_tao_video,
     );
+    let old_img_low = old_row.anh_tham_chieu.trim().to_lowercase();
+    let img_counts = engine::image_counts(&before_rows);
+    let same_image = img_counts.get(&old_img_low).copied().unwrap_or(0);
+
+    let mut conn =
+        crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+    let latest_map = engine::load_latest_jobs_map(&conn);
+    let prev_job = engine::latest_job_for_csv_row(&conn, &old_row, &latest_map, &img_counts);
+
+    let mut migrate_keys: Vec<String> = vec![old_key.clone()];
+    let req_trimmed = row_key.trim();
+    if !req_trimmed.is_empty()
+        && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(req_trimmed))
+    {
+        migrate_keys.push(req_trimmed.to_string());
+    }
+    if let Some(ref pj) = prev_job {
+        if !pj.row_key.trim().is_empty()
+            && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&pj.row_key))
+        {
+            migrate_keys.push(pj.row_key.clone());
+        }
+    }
+    if same_image == 1
+        && !old_img_low.is_empty()
+        && !migrate_keys.iter().any(|k| k.eq_ignore_ascii_case(&old_img_low))
+    {
+        migrate_keys.push(old_img_low.clone());
+    }
 
     prompts_csv::remap_key(&csv_path, row_key, trimmed_new)?;
 
+    let tx = conn
+        .transaction()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
+
     if !old_key.eq_ignore_ascii_case(&new_key) {
-        let mut conn =
-            crate::state_db::open(p).map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-        let tx = conn
-            .transaction()
+        let keep_existing_new_key = prev_job
+            .as_ref()
+            .is_some_and(|pj| pj.row_key.eq_ignore_ascii_case(&new_key));
+        if !keep_existing_new_key {
+            // Chỉ cập nhật từ các key của chính dòng cũ -> new_key (không xóa bản ghi của dòng anh em dùng chung ảnh mới).
+            // Dọn bản ghi cũ trùng đúng new_key nếu có để tránh đụng UNIQUE(run_id, row_key).
+            tx.execute(
+                "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
+                rusqlite::params![new_key],
+            )
             .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
-        // Chỉ cập nhật từ old_key -> new_key (không xóa bản ghi của dòng anh em dùng chung ảnh mới).
-        // Dọn bản ghi cũ trùng đúng new_key nếu có để tránh đụng UNIQUE(run_id, row_key).
-        tx.execute(
-            "DELETE FROM attempts WHERE job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-        tx.execute(
-            "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)
-                OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-        tx.execute(
-            "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
-            rusqlite::params![new_key],
-        )
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-        crate::state_db::migrate_jobs_row_key(&tx, &old_key, &new_key)
-            .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
-        if !row_key.trim().is_empty() && !row_key.eq_ignore_ascii_case(&old_key) {
-            crate::state_db::migrate_jobs_row_key(&tx, row_key, &new_key)
-                .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
-        }
-
-        crate::state_db::migrate_file_refs_row_key(&tx, &old_key, &new_key, None)
-            .map_err(|e| {
-                AppError::new(
-                    "DB_FAIL",
-                    format!("Không đổi được row_key trong file_refs: {e}"),
-                )
-            })?;
-        if !row_key.trim().is_empty() && !row_key.eq_ignore_ascii_case(&old_key) {
-            crate::state_db::migrate_file_refs_row_key(&tx, row_key, &new_key, None)
-                .map_err(|e| {
-                    AppError::new(
-                        "DB_FAIL",
-                        format!("Không đổi được row_key trong file_refs: {e}"),
-                    )
-                })?;
-        }
-
-        tx.execute(
-            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) OR LOWER(row_key) = LOWER(?3)",
-            rusqlite::params![new_key, old_key, row_key],
-        )
-        .ok();
-
-        tx.commit()
+            tx.execute(
+                "DELETE FROM file_refs WHERE LOWER(row_key) = LOWER(?1)
+                    OR job_id IN (SELECT id FROM jobs WHERE LOWER(row_key) = LOWER(?1))",
+                rusqlite::params![new_key],
+            )
             .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-    } else if let Ok(mut conn) = crate::state_db::open(p) {
-        if let Ok(tx) = conn.transaction() {
-            let _ = crate::state_db::migrate_jobs_row_key(&tx, &old_key, &new_key);
-            let _ = crate::state_db::migrate_file_refs_row_key(&tx, &old_key, &new_key, None);
-            let _ = tx.commit();
+
+            tx.execute(
+                "DELETE FROM jobs WHERE LOWER(row_key) = LOWER(?1)",
+                rusqlite::params![new_key],
+            )
+            .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
         }
     }
+
+    for mk in &migrate_keys {
+        crate::state_db::migrate_jobs_row_key(&tx, mk, &new_key)
+            .map_err(|e| AppError::new("DB_FAIL", format!("Không đổi được row_key trong jobs: {e}")))?;
+        crate::state_db::migrate_file_refs_row_key(&tx, mk, &new_key, None).map_err(|e| {
+            AppError::new(
+                "DB_FAIL",
+                format!("Không đổi được row_key trong file_refs: {e}"),
+            )
+        })?;
+        tx.execute(
+            "UPDATE logs SET row_key = ?1 WHERE LOWER(row_key) = LOWER(?2) AND row_key != ?1",
+            rusqlite::params![new_key, mk],
+        )
+        .ok();
+    }
+
+    tx.commit()
+        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
 
     build_row_detail_at(p, &new_key)
 }
@@ -2271,24 +2302,56 @@ pub fn hide_to_tray(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn force_quit_app(
+const SHUTDOWN_ENGINE_WAIT_TIMEOUT: Duration = Duration::from_millis(2500);
+
+pub(crate) fn shutdown_app_state_with<FQuit>(
+    state: &AppState,
     stop_first: bool,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> AppResult<()> {
+    wait_timeout: Duration,
+    quit_sidecar: FQuit,
+) where
+    FQuit: FnOnce(),
+{
     state.exit_requested.store(true, Ordering::SeqCst);
     if stop_first {
         if let Some(flag) = state.stop_flag.read().clone() {
             flag.store(true, Ordering::SeqCst);
         }
     }
-    if let Ok(p) = project_path(&state) {
+    let handle_opt = state.engine_thread.lock().take();
+    if let Some(handle) = handle_opt {
+        let deadline = Instant::now() + wait_timeout;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+    if let Ok(p) = project_path(state) {
         if let Ok(conn) = crate::state_db::open(&p) {
             let _ = crate::state_db::recover_interrupted_runs(&conn);
         }
     }
-    crate::muse_sidecar::stop_for_quit();
+    quit_sidecar();
+}
+
+pub(crate) fn shutdown_app_state(state: &AppState, stop_first: bool) {
+    shutdown_app_state_with(
+        state,
+        stop_first,
+        SHUTDOWN_ENGINE_WAIT_TIMEOUT,
+        crate::muse_sidecar::stop_for_quit,
+    );
+}
+
+#[tauri::command]
+pub fn force_quit_app(
+    stop_first: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    shutdown_app_state(&state, stop_first);
     app.exit(0);
     Ok(())
 }
@@ -2559,6 +2622,28 @@ fn enrich_accounts_slice_from_db(
     }
 }
 
+fn muse_list_accounts_with_session_and_db<FOpen>(
+    session: &crate::muse_sidecar::SidecarSession,
+    open_db: FOpen,
+) -> AppResult<serde_json::Value>
+where
+    FOpen: FnOnce() -> AppResult<rusqlite::Connection>,
+{
+    let _mut_guard = proxy_mutation_lock().lock();
+    let mut res =
+        crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
+    if let Ok(conn) = open_db() {
+        if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
+            enrich_accounts_slice_from_db(
+                &conn,
+                arr,
+                Some((session.port, &session.api_key)),
+            );
+        }
+    }
+    Ok(res)
+}
+
 #[tauri::command]
 pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2568,18 +2653,7 @@ pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
                 "Engine VideoFlow Muse đang dừng — hãy khởi động engine trước khi tải danh sách tài khoản.",
             )
         })?;
-        let mut res =
-            crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
-        if let Ok(conn) = crate::proxies::open_db() {
-            if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
-                enrich_accounts_slice_from_db(
-                    &conn,
-                    arr,
-                    Some((session.port, &session.api_key)),
-                );
-            }
-        }
-        Ok(res)
+        muse_list_accounts_with_session_and_db(&session, crate::proxies::open_db)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2660,6 +2734,125 @@ pub async fn muse_add_cookie(
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
 }
 
+#[allow(clippy::too_many_arguments)]
+fn muse_update_account_with_session_and_db<FGetSess, FOpenDb>(
+    account_id: String,
+    enabled: Option<bool>,
+    label: Option<String>,
+    proxy: Option<String>,
+    proxy_id: Option<String>,
+    get_session: FGetSess,
+    mut open_db: FOpenDb,
+) -> AppResult<serde_json::Value>
+where
+    FGetSess: FnOnce() -> AppResult<(u16, String)>,
+    FOpenDb: FnMut() -> AppResult<rusqlite::Connection>,
+{
+    let _mut_guard = proxy_mutation_lock().lock();
+    let (port, key) = get_session()?;
+    let safe_id = muse_sanitize_id(&account_id)?;
+    let mut body = serde_json::Map::new();
+    if let Some(e) = enabled {
+        body.insert("enabled".into(), serde_json::Value::Bool(e));
+    }
+    if let Some(l) = label {
+        body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
+    }
+
+    let mut target_proxy_id: Option<Option<String>> = None;
+    let has_raw_proxy =
+        proxy_id.is_none() && proxy.as_deref().is_some_and(|p| !p.trim().is_empty());
+    let mut prev_proxy_url_for_rb: Option<String> = None;
+
+    if let Some(pid_raw) = proxy_id {
+        let conn = open_db()?;
+        if let Ok(map) = crate::proxies::load_account_to_proxy_map(&conn) {
+            prev_proxy_url_for_rb = Some(
+                map.get(&safe_id)
+                    .and_then(|old_pid| crate::proxies::resolve_proxy_url_in(&conn, old_pid).ok())
+                    .unwrap_or_default(),
+            );
+        }
+        let trimmed = pid_raw.trim();
+        if trimmed.is_empty() {
+            body.insert("proxy".into(), serde_json::Value::String(String::new()));
+            target_proxy_id = Some(None);
+        } else {
+            let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
+            let url = crate::proxies::resolve_proxy_url_in(&conn, &px.id)?;
+            body.insert("proxy".into(), serde_json::Value::String(url));
+            target_proxy_id = Some(Some(px.id));
+        }
+    } else if let Some(p) = proxy {
+        let trimmed = p.trim();
+        body.insert("proxy".into(), serde_json::Value::String(trimmed.to_string()));
+        if trimmed.is_empty() {
+            target_proxy_id = Some(None);
+        }
+    }
+
+    let path = format!("/admin/accounts/{safe_id}");
+    let mut res = crate::muse_sidecar::admin_send(
+        port,
+        &key,
+        "PATCH",
+        &path,
+        Some(&serde_json::Value::Object(body)),
+    )?;
+
+    if let Some(ref pid_opt) = target_proxy_id {
+        let conn = match open_db() {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(ref old_u) = prev_proxy_url_for_rb {
+                    let rb_body = serde_json::json!({ "proxy": old_u });
+                    let _ = crate::muse_sidecar::admin_send(
+                        port,
+                        &key,
+                        "PATCH",
+                        &path,
+                        Some(&rb_body),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref()) {
+            if let Some(ref old_u) = prev_proxy_url_for_rb {
+                let rb_body = serde_json::json!({ "proxy": old_u });
+                let _ = crate::muse_sidecar::admin_send(
+                    port,
+                    &key,
+                    "PATCH",
+                    &path,
+                    Some(&rb_body),
+                );
+            }
+            return Err(e);
+        }
+        if !has_raw_proxy {
+            if let Some(acc_obj) = res.get_mut("account") {
+                enrich_accounts_slice_from_db(
+                    &conn,
+                    std::slice::from_mut(acc_obj),
+                    Some((port, &key)),
+                );
+            }
+        }
+    } else if !has_raw_proxy {
+        if let Ok(conn) = open_db() {
+            if let Some(acc_obj) = res.get_mut("account") {
+                enrich_accounts_slice_from_db(
+                    &conn,
+                    std::slice::from_mut(acc_obj),
+                    Some((port, &key)),
+                );
+            }
+        }
+    }
+    Ok(res)
+}
+
 #[tauri::command]
 pub async fn muse_update_account(
     account_id: String,
@@ -2674,110 +2867,15 @@ pub async fn muse_update_account(
     }
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _mut_guard = proxy_mutation_lock().lock();
-        let (port, key) = muse_session_or_err(&cfg)?;
-        let safe_id = muse_sanitize_id(&account_id)?;
-        let mut body = serde_json::Map::new();
-        if let Some(e) = enabled {
-            body.insert("enabled".into(), serde_json::Value::Bool(e));
-        }
-        if let Some(l) = label {
-            body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
-        }
-
-        let mut target_proxy_id: Option<Option<String>> = None;
-        let has_raw_proxy = proxy_id.is_none()
-            && proxy.as_deref().is_some_and(|p| !p.trim().is_empty());
-        let mut prev_proxy_url_for_rb: Option<String> = None;
-
-        if let Some(pid_raw) = proxy_id {
-            let conn = crate::proxies::open_db()?;
-            if let Ok(map) = crate::proxies::load_account_to_proxy_map(&conn) {
-                prev_proxy_url_for_rb = Some(
-                    map.get(&safe_id)
-                        .and_then(|old_pid| crate::proxies::resolve_proxy_url_in(&conn, old_pid).ok())
-                        .unwrap_or_default(),
-                );
-            }
-            let trimmed = pid_raw.trim();
-            if trimmed.is_empty() {
-                body.insert("proxy".into(), serde_json::Value::String(String::new()));
-                target_proxy_id = Some(None);
-            } else {
-                let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
-                let url = crate::proxies::resolve_proxy_url_in(&conn, &px.id)?;
-                body.insert("proxy".into(), serde_json::Value::String(url));
-                target_proxy_id = Some(Some(px.id));
-            }
-        } else if let Some(p) = proxy {
-            let trimmed = p.trim();
-            body.insert("proxy".into(), serde_json::Value::String(trimmed.to_string()));
-            if trimmed.is_empty() {
-                target_proxy_id = Some(None);
-            }
-        }
-
-        let path = format!("/admin/accounts/{safe_id}");
-        let mut res = crate::muse_sidecar::admin_send(
-            port,
-            &key,
-            "PATCH",
-            &path,
-            Some(&serde_json::Value::Object(body)),
-        )?;
-
-        if let Some(ref pid_opt) = target_proxy_id {
-            let conn = match crate::proxies::open_db() {
-                Ok(c) => c,
-                Err(e) => {
-                    if let Some(ref old_u) = prev_proxy_url_for_rb {
-                        let rb_body = serde_json::json!({ "proxy": old_u });
-                        let _ = crate::muse_sidecar::admin_send(
-                            port,
-                            &key,
-                            "PATCH",
-                            &path,
-                            Some(&rb_body),
-                        );
-                    }
-                    return Err(e);
-                }
-            };
-            if let Err(e) = crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref())
-            {
-                if let Some(ref old_u) = prev_proxy_url_for_rb {
-                    let rb_body = serde_json::json!({ "proxy": old_u });
-                    let _ = crate::muse_sidecar::admin_send(
-                        port,
-                        &key,
-                        "PATCH",
-                        &path,
-                        Some(&rb_body),
-                    );
-                }
-                return Err(e);
-            }
-            if !has_raw_proxy {
-                if let Some(acc_obj) = res.get_mut("account") {
-                    enrich_accounts_slice_from_db(
-                        &conn,
-                        std::slice::from_mut(acc_obj),
-                        Some((port, &key)),
-                    );
-                }
-            }
-        } else if !has_raw_proxy {
-            if let Ok(conn) = crate::proxies::open_db() {
-                if let Some(acc_obj) = res.get_mut("account") {
-                    enrich_accounts_slice_from_db(
-                        &conn,
-                        std::slice::from_mut(acc_obj),
-                        Some((port, &key)),
-                    );
-                }
-            }
-        }
-        Ok(res)
+        muse_update_account_with_session_and_db(
+            account_id,
+            enabled,
+            label,
+            proxy,
+            proxy_id,
+            || muse_session_or_err(&cfg),
+            crate::proxies::open_db,
+        )
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -5274,5 +5372,542 @@ mod tests {
         assert_eq!(metadata_updated.note.as_deref(), Some("updated note"));
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_muse_list_accounts_serializes_with_proxy_mutation_lock() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_list_proxy_lock_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let conn = crate::proxies::open_db_at(&db_path).unwrap();
+        let px_a = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "ProxyA".into(),
+                kind: "http".into(),
+                host: "198.51.100.1".into(),
+                port: 8001,
+                username: Some("ua".into()),
+                password: Some("pa".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let px_b = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "ProxyB".into(),
+                kind: "http".into(),
+                host: "198.51.100.2".into(),
+                port: 8002,
+                username: Some("ub".into()),
+                password: Some("pb".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_1", Some(&px_a.id)).unwrap();
+        drop(conn);
+
+        let sidecar_proxy = Arc::new(parking_lot::Mutex::new(px_a.to_masked_url()));
+        let patch_history = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+        srv.set_nonblocking(true).unwrap();
+        let stop_srv = Arc::new(AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let sidecar_proxy_bg = Arc::clone(&sidecar_proxy);
+        let patch_history_bg = Arc::clone(&patch_history);
+        let px_a_masked_srv = px_a.to_masked_url();
+        let px_b_masked_srv = px_b.to_masked_url();
+
+        let server = std::thread::spawn(move || {
+            while !stop_srv_bg.load(Ordering::SeqCst) {
+                match srv.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let (head, body) = read_http_req_test(&mut stream);
+                        let first_line = head.lines().next().unwrap_or("");
+                        if first_line.starts_with("GET /admin/accounts ") {
+                            let cur_px = sidecar_proxy_bg.lock().clone();
+                            let resp = serde_json::json!({
+                                "data": [{ "id": "acc_1", "busy": false, "proxy": cur_px }]
+                            })
+                            .to_string();
+                            write_http_json_test(&mut stream, "200 OK", &resp);
+                        } else if first_line.starts_with("PATCH /admin/accounts/acc_1 ") {
+                            let v: serde_json::Value =
+                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                            let raw_url = v
+                                .get("proxy")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let masked = if raw_url.contains("198.51.100.2:8002") {
+                                px_b_masked_srv.clone()
+                            } else if raw_url.contains("198.51.100.1:8001") {
+                                px_a_masked_srv.clone()
+                            } else {
+                                raw_url.clone()
+                            };
+                            *sidecar_proxy_bg.lock() = masked.clone();
+                            patch_history_bg.lock().push(raw_url);
+                            let resp = serde_json::json!({
+                                "account": { "id": "acc_1", "busy": false, "proxy": masked }
+                            })
+                            .to_string();
+                            write_http_json_test(&mut stream, "200 OK", &resp);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let session = crate::muse_sidecar::SidecarSession {
+            port: srv_port,
+            api_key: "k".into(),
+        };
+        let (tx_midflight, rx_midflight) = std::sync::mpsc::channel::<()>();
+        let db_calls = std::sync::atomic::AtomicUsize::new(0);
+        let db_path_upd = db_path.clone();
+        let px_b_id = px_b.id.clone();
+
+        let list_handle = std::thread::spawn({
+            let session_list = session.clone();
+            let db_path_list = db_path.clone();
+            move || {
+                rx_midflight.recv_timeout(Duration::from_secs(3)).unwrap();
+                muse_list_accounts_with_session_and_db(&session_list, || {
+                    crate::proxies::open_db_at(&db_path_list)
+                })
+            }
+        });
+
+        let upd_res = muse_update_account_with_session_and_db(
+            "acc_1".into(),
+            None,
+            None,
+            None,
+            Some(px_b_id.clone()),
+            || Ok((session.port, session.api_key.clone())),
+            || {
+                let n = db_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 1 {
+                    // Right after sidecar PATCH to ProxyB and BEFORE DB commit to ProxyB:
+                    // trigger concurrent muse_list_accounts; it must wait for proxy_mutation_lock.
+                    let _ = tx_midflight.send(());
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+                crate::proxies::open_db_at(&db_path_upd)
+            },
+        )
+        .expect("muse_update_account succeeds");
+        assert_eq!(
+            upd_res["account"]["proxy_id"].as_str(),
+            Some(px_b_id.as_str())
+        );
+
+        let list_res = list_handle.join().unwrap().expect("muse_list_accounts succeeds");
+        assert_eq!(
+            list_res["data"][0]["proxy_id"].as_str(),
+            Some(px_b_id.as_str())
+        );
+        assert_eq!(
+            list_res["data"][0]["proxy"].as_str(),
+            Some(px_b.to_masked_url().as_str())
+        );
+
+        let patches = patch_history.lock().clone();
+        assert_eq!(
+            patches.len(),
+            1,
+            "muse_list_accounts must NOT send a revert PATCH during in-flight update: {patches:?}"
+        );
+        assert_eq!(*sidecar_proxy.lock(), px_b.to_masked_url());
+
+        stop_srv.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_remap_reference_image_migrates_legacy_bare_key_and_logs() {
+        let dir = temp_proj("remap_legacy_bare");
+        std::fs::write(dir.join("input").join("old.png"), b"png1").unwrap();
+        std::fs::write(dir.join("input").join("new.png"), b"png2").unwrap();
+        std::fs::write(dir.join("image_out").join("old_gen.png"), b"gen_img").unwrap();
+        std::fs::write(dir.join("video_out").join("old_gen.mp4"), b"gen_vid").unwrap();
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[Row {
+                row_no: 2,
+                anh_tham_chieu: "old.png".into(),
+                promt_tao_image: "prompt img".into(),
+                promt_tao_video: "prompt vid".into(),
+                anh_da_tao: "old_gen.png".into(),
+                video_da_tao: "old_gen.mp4".into(),
+                trang_thai: "Đã tạo video".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        let expected_old_key = prompts_csv::row_key_of("old.png", "prompt img", "prompt vid");
+        {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, finished_at, total_rows, done_count, error_count)
+                 VALUES ('chung', 'hoan_tat', '2026-11-18T01:00:00Z', '2026-11-18T01:02:00Z', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            // Seed v1.4.0 bare-image job, file_refs, and logs (even though CSV row has prompts -> expected_old_key has #hash)
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash)
+                 VALUES (?1, 'old.png', 2, 'da_tao_video', 'xong', 'xong', ?2, ?3)",
+                rusqlite::params![rid, engine::sha2hex("prompt img"), engine::sha2hex("prompt vid")],
+            )
+            .unwrap();
+            let jid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, 'old.png', 'anh', 'old_gen.png', 'image_out/old_gen.png', 1, 1, '2026-11-18T01:00:30Z')",
+                rusqlite::params![jid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, 'old.png', 'video', 'old_gen.mp4', 'video_out/old_gen.mp4', 1, 1, '2026-11-18T01:01:30Z')",
+                rusqlite::params![jid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO logs(ts, level, run_id, row_key, step, message)
+                 VALUES ('2026-11-18T01:01:00Z', 'info', ?1, 'old.png', 'B2', 'legacy log')",
+                rusqlite::params![rid],
+            )
+            .unwrap();
+        }
+
+        // Caller passes the hashed row_key (as UI does) when remapping to new.png
+        let remapped = remap_reference_image_at(&dir, &expected_old_key, "new.png").unwrap();
+        let new_key = prompts_csv::row_key_of("new.png", "prompt img", "prompt vid");
+        assert_eq!(remapped.row.row_key, new_key);
+        assert_eq!(remapped.row.status, "Đã tạo video");
+        assert_eq!(remapped.row.image_file, "old_gen.png");
+        assert_eq!(remapped.row.video_file, "old_gen.mp4");
+        assert_eq!(remapped.files.len(), 2);
+
+        let conn = crate::state_db::open(&dir).unwrap();
+        let old_jobs_cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE LOWER(row_key) = 'old.png'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_jobs_cnt, 0);
+        let new_job_status: String = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_job_status, "da_tao_video");
+        let new_refs_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_refs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_refs_cnt, 2);
+        let new_logs_cnt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_logs_cnt, 1);
+
+        // Same-key remap branch (e.g. legacy 'new.png' bare row_key migrated on same-image remap)
+        conn.execute(
+            "INSERT INTO logs(ts, level, row_key, step, message) VALUES ('2026-11-18T01:02:00Z', 'info', 'new.png', 'B3', 'bare log')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let same_remapped = remap_reference_image_at(&dir, &new_key, "new.png").unwrap();
+        assert_eq!(same_remapped.row.row_key, new_key);
+        let conn2 = crate::state_db::open(&dir).unwrap();
+        let migrated_logs: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE row_key = ?1",
+                rusqlite::params![new_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_logs, 2);
+
+        drop(conn2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_csv_locked_aborts_before_state_db_commit_in_version_reset_and_skip() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = temp_proj("csv_lock_no_db_split_brain");
+        std::fs::write(dir.join("input").join("item.png"), b"png").unwrap();
+        std::fs::write(dir.join("image_out").join("item_gen.png"), b"v1").unwrap();
+        std::fs::write(dir.join("image_out").join("item_gen_v2.png"), b"v2").unwrap();
+
+        let csv_path = dir.join("prompts.csv");
+        prompts_csv::write_all(
+            &csv_path,
+            &[
+                Row {
+                    row_no: 2,
+                    anh_tham_chieu: "item.png".into(),
+                    promt_tao_image: "p_img".into(),
+                    promt_tao_video: "p_vid".into(),
+                    anh_da_tao: "item_gen_v2.png".into(),
+                    trang_thai: "Lỗi tạo video".into(),
+                    ghi_chu_loi: "old error".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 3,
+                    anh_tham_chieu: "fresh.png".into(),
+                    promt_tao_image: "f_img".into(),
+                    promt_tao_video: "f_vid".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let item_key = prompts_csv::row_key_of("item.png", "p_img", "p_vid");
+        let fresh_key = prompts_csv::row_key_of("fresh.png", "f_img", "f_vid");
+        let item_job_id = {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-20T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash, video_task_id, attempts_count, last_error)
+                 VALUES (?1, ?2, 2, 'loi_tao_video', 'xong', 'loi', 'h_img', 'h_vid', 'task_abc', 2, 'boom')",
+                rusqlite::params![rid, item_key],
+            )
+            .unwrap();
+            let jid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, ?2, 'anh', 'item_gen.png', 'image_out/item_gen.png', 1, 0, '2026-11-20T00:00:01Z')",
+                rusqlite::params![jid, item_key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                 VALUES (?1, ?2, 'anh', 'item_gen_v2.png', 'image_out/item_gen_v2.png', 2, 1, '2026-11-20T00:00:02Z')",
+                rusqlite::params![jid, item_key],
+            )
+            .unwrap();
+            jid
+        };
+
+        // Hold FILE_SHARE_READ-only Windows handle (no write/delete share, matching Excel lock):
+        // read_all succeeds, rename fails with CSV_LOCKED.
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&csv_path)
+            .expect("acquire exclusive write/delete lock on prompts.csv");
+
+        let e_ver = set_current_file_version_at(&dir, &item_key, "image", 1)
+            .err()
+            .expect("set_current_file_version_at must fail on locked csv");
+        assert_eq!(e_ver.code, "CSV_LOCKED");
+
+        let e_reset = reset_row_status_at(&dir, &item_key)
+            .err()
+            .expect("reset_row_status_at must fail on locked csv");
+        assert_eq!(e_reset.code, "CSV_LOCKED");
+
+        let e_skip_existing = skip_row_at(&dir, &item_key)
+            .err()
+            .expect("skip_row_at existing must fail on locked csv");
+        assert_eq!(e_skip_existing.code, "CSV_LOCKED");
+
+        let e_skip_fresh = skip_row_at(&dir, &fresh_key)
+            .err()
+            .expect("skip_row_at fresh must fail on locked csv");
+        assert_eq!(e_skip_fresh.code, "CSV_LOCKED");
+
+        drop(lock_file);
+
+        // Verify state.db is completely untouched across file_refs, jobs, and runs
+        let conn = crate::state_db::open(&dir).unwrap();
+        let cur_ver: i64 = conn
+            .query_row(
+                "SELECT version FROM file_refs WHERE row_key = ?1 AND kind = 'anh' AND is_current = 1",
+                rusqlite::params![item_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cur_ver, 2, "file_refs.is_current must stay at v2");
+
+        let (st, img_st, vid_st, task_id, attempts, err_msg): (
+            String,
+            String,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, image_status, video_status, video_task_id, attempts_count, last_error FROM jobs WHERE id = ?1",
+                rusqlite::params![item_job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(st, "loi_tao_video");
+        assert_eq!(img_st, "xong");
+        assert_eq!(vid_st, "loi");
+        assert_eq!(task_id.as_deref(), Some("task_abc"));
+        assert_eq!(attempts, 2);
+        assert_eq!(err_msg.as_deref(), Some("boom"));
+
+        let fresh_jobs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE row_key = ?1",
+                rusqlite::params![fresh_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_jobs, 0, "skip_row_at must not insert job on CSV_LOCKED");
+        let runs_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs_count, 1, "skip_row_at must not insert seed run on CSV_LOCKED");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shutdown_app_state_orders_stop_join_and_recover_with_bounded_wait() {
+        let dir = temp_proj("shutdown_order");
+        let run_id = {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'dang_chay', '2026-11-20T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status)
+                 VALUES (?1, 'k.png', 2, 'dang_cho', 'dang_chay', 'chua_chay')",
+                rusqlite::params![rid],
+            )
+            .unwrap();
+            rid
+        };
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let state = AppState {
+            settings: SettingsStore::with_path(dir.join("settings.json")),
+            settings_cache: parking_lot::RwLock::new(Settings::default()),
+            project: parking_lot::RwLock::new(Some(dir.clone())),
+            last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
+            running: AtomicBool::new(true),
+            exit_requested: AtomicBool::new(false),
+            active_run_id: AtomicI64::new(run_id),
+            stop_flag: parking_lot::RwLock::new(Some(Arc::clone(&stop_flag))),
+            engine_thread: parking_lot::Mutex::new(None),
+        };
+
+        let worker_stop = Arc::clone(&stop_flag);
+        let worker_events = Arc::clone(&events);
+        let worker_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worker_events.lock().push("worker_saw_stop".into());
+            std::thread::sleep(Duration::from_millis(25));
+            // Must still be 'dang_chay' until worker finishes and shutdown runs recover_interrupted_runs
+            let conn = crate::state_db::open(&worker_dir).unwrap();
+            let st: String = conn
+                .query_row(
+                    "SELECT status FROM runs WHERE id = ?1",
+                    rusqlite::params![run_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(st, "dang_chay", "recover_interrupted_runs must wait for engine_thread");
+            worker_events.lock().push("worker_finished".into());
+        });
+        *state.engine_thread.lock() = Some(handle);
+
+        let quit_events = Arc::clone(&events);
+        shutdown_app_state_with(&state, true, Duration::from_secs(2), move || {
+            quit_events.lock().push("quit_sidecar".into());
+        });
+
+        assert!(state.exit_requested.load(Ordering::SeqCst));
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert!(state.engine_thread.lock().is_none());
+        assert_eq!(
+            *events.lock(),
+            vec![
+                "worker_saw_stop".to_string(),
+                "worker_finished".to_string(),
+                "quit_sidecar".to_string()
+            ]
+        );
+        let conn = crate::state_db::open(&dir).unwrap();
+        let recovered_status: String = conn
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered_status, "gian_doan");
+
+        // Bounded wait: hung thread must not block shutdown beyond wait_timeout
+        let (tx_release, rx_release) = std::sync::mpsc::channel::<()>();
+        let hung = std::thread::spawn(move || {
+            let _ = rx_release.recv_timeout(Duration::from_secs(2));
+        });
+        *state.engine_thread.lock() = Some(hung);
+        let t0 = Instant::now();
+        shutdown_app_state_with(&state, true, Duration::from_millis(50), || {});
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "shutdown wait on hung engine_thread must be bounded"
+        );
+        let _ = tx_release.send(());
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

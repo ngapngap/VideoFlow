@@ -8,7 +8,7 @@ import {
   type MuseStatusView,
   type ProjectInfo,
   type RunSummary,
-} from "./api";
+} from "./api.js";
 
 export const project = writable<ProjectInfo | null>(null);
 export const running = writable(false);

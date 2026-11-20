@@ -134,12 +134,14 @@ def _account_public(acc: Account, svc: Services) -> dict:
 @router.post("/prewarm")
 async def prewarm_accounts(svc: Services = Depends(get_services)) -> dict:
     count = 0
+    interactive = getattr(svc, "interactive", None)
     for acc in svc.pool.all():
         if (
             acc.enabled
             and acc.status == AccountStatus.ACTIVE
             and not acc.quota_exhausted()
             and not missing_session_cookies(acc.cookies)
+            and not (interactive is not None and interactive.is_session_active(acc.id))
         ):
             svc.driver.prewarm(acc)
             count += 1
@@ -255,13 +257,16 @@ async def update_account(account_id: str, body: AccountUpdate,
                     name: exp for name, exp in (acc.cookie_expires or {}).items()
                     if name not in body.cookies
                 }
-                if acc.cookies and not missing_session_cookies(acc.cookies):
+                if acc.cookies and not (missing := missing_session_cookies(acc.cookies)):
                     # Fresh complete cookies give an invalid account another chance.
                     acc.status = AccountStatus.ACTIVE
                     acc.last_error = None
                 elif not acc.cookies:
                     acc.status = AccountStatus.INVALID
                     acc.last_error = "cookies cleared"
+                else:
+                    acc.status = AccountStatus.INVALID
+                    acc.last_error = f"missing session cookies: {', '.join(missing)}"
             if body.cookie_expires is not None:
                 if acc.cookie_expires is None:
                     acc.cookie_expires = {}

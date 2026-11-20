@@ -33,6 +33,8 @@ def _content_to_text(content: Any, images: list[str]) -> str:
         return ""
     if isinstance(content, str):
         return content
+    if not isinstance(content, list):
+        raise InvalidRequest("message content must be a string or a list of parts")
     parts: list[str] = []
     for part in content:
         if not isinstance(part, dict):
@@ -40,7 +42,12 @@ def _content_to_text(content: Any, images: list[str]) -> str:
             continue
         ptype = part.get("type")
         if ptype in ("text", "input_text", "output_text"):
-            parts.append(part.get("text", ""))
+            text_val = part.get("text")
+            if text_val is None:
+                continue
+            if not isinstance(text_val, str):
+                raise InvalidRequest("text content part must have a string 'text' field")
+            parts.append(text_val)
         elif ptype in ("image_url", "input_image"):
             ref = part.get("image_url")
             if isinstance(ref, dict):

@@ -58,16 +58,7 @@ pub fn init_tray_and_services(app: &AppHandle) -> Result<(), Box<dyn std::error:
             }
             "tray_quit" => {
                 let st = app_handle.state::<AppState>();
-                st.exit_requested.store(true, Ordering::SeqCst);
-                if let Some(flag) = st.stop_flag.read().clone() {
-                    flag.store(true, Ordering::SeqCst);
-                }
-                if let Ok(p) = commands::project_path(&st) {
-                    if let Ok(conn) = crate::state_db::open(&p) {
-                        let _ = crate::state_db::recover_interrupted_runs(&conn);
-                    }
-                }
-                crate::muse_sidecar::stop_for_quit();
+                commands::shutdown_app_state(&st, true);
                 app_handle.exit(0);
             }
             _ => {}

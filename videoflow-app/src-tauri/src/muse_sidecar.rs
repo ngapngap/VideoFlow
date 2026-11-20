@@ -37,7 +37,23 @@ struct SidecarHandle {
 }
 
 static SIDECAR: OnceLock<parking_lot::RwLock<Option<SidecarHandle>>> = OnceLock::new();
-static START_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static QUIT_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn start_cancelled_error() -> AppError {
+    AppError::new("MUSE_START_CANCELLED", "Đã hủy khởi động engine.")
+}
+
+fn is_start_cancelled(start_epoch: u64) -> bool {
+    STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != start_epoch
+}
+
+fn check_start_epoch(start_epoch: u64) -> AppResult<()> {
+    if is_start_cancelled(start_epoch) {
+        return Err(start_cancelled_error());
+    }
+    Ok(())
+}
 
 fn sidecar_cell() -> &'static parking_lot::RwLock<Option<SidecarHandle>> {
     SIDECAR.get_or_init(|| parking_lot::RwLock::new(None))
@@ -319,7 +335,7 @@ fn parse_admin_response(resp: reqwest::blocking::Response) -> AppResult<serde_js
 }
 
 /// Chờ `/healthz` sẵn sàng (onefile PyInstaller giải nén mất vài giây lần đầu).
-fn wait_health(port: u16, child: &mut Child, deadline_secs: u64) -> AppResult<()> {
+fn wait_health(port: u16, child: &mut Child, deadline_secs: u64, start_epoch: u64) -> AppResult<()> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -328,12 +344,7 @@ fn wait_health(port: u16, child: &mut Child, deadline_secs: u64) -> AppResult<()
     let url = format!("http://127.0.0.1:{port}/healthz");
     let deadline = Instant::now() + Duration::from_secs(deadline_secs);
     loop {
-        if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(AppError::new(
-                "MUSE_START_CANCELLED",
-                "Đã hủy khởi động engine.",
-            ));
-        }
+        check_start_epoch(start_epoch)?;
         if Instant::now() >= deadline {
             return Err(AppError::new(
                 "MUSE_SIDECAR_TIMEOUT",
@@ -350,6 +361,7 @@ fn wait_health(port: u16, child: &mut Child, deadline_secs: u64) -> AppResult<()
         }
         if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
+                check_start_epoch(start_epoch)?;
                 return Ok(());
             }
         }
@@ -542,127 +554,188 @@ pub(crate) fn sync_proxies_to_sidecar_with_conn(
 /// Cold start gồm PyInstaller onefile giải nén + khởi động Edge + CDP (~30-60s) nên
 /// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
 pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
+    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    start_with_hooks(
+        cfg,
+        &data_dir,
+        || {},
+        |dir| {
+            kill_orphan_sidecars();
+            kill_orphan_edges(dir);
+        },
+        sync_proxies_to_sidecar,
+        None,
+    )
+}
+
+type TestSpawnHook<'a> = &'a mut (dyn FnMut(&[u16]) -> AppResult<(u16, u16, Child, String, String)> + Send);
+
+fn start_with_hooks<FBeforeLock, FCleanup, FSync>(
+    cfg: &Settings,
+    data_dir: &std::path::Path,
+    before_lock: FBeforeLock,
+    cleanup_orphans: FCleanup,
+    sync_proxies: FSync,
+    mut test_spawner: Option<TestSpawnHook<'_>>,
+) -> AppResult<SidecarStatus>
+where
+    FBeforeLock: FnOnce(),
+    FCleanup: Fn(&std::path::Path),
+    FSync: Fn(u16, &str),
+{
+    let start_epoch = STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    before_lock();
     let _spawn_guard = start_lock().lock();
-    START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    check_start_epoch(start_epoch)?;
     if current_session().is_some() {
         return status(cfg);
     }
 
-    let exe = sidecar_exe_path()?;
-    let chromium = detect_chromium(&cfg.muse_chromium_path)?;
-    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
-    std::fs::create_dir_all(&data_dir).ok();
+    let (exe, chromium, api_key, stdout_path, stderr_path) = if test_spawner.is_some() {
+        (
+            PathBuf::new(),
+            PathBuf::new(),
+            String::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+        )
+    } else {
+        let exe = sidecar_exe_path()?;
+        let chromium = detect_chromium(&cfg.muse_chromium_path)?;
+        std::fs::create_dir_all(data_dir).ok();
 
-    // Dọn sidecar & Edge mồ côi (từ phiên app cũ đóng bất thường) TRƯỚC khi chọn port và mở log.
-    kill_orphan_sidecars();
-    kill_orphan_edges(&data_dir);
+        // Dọn sidecar & Edge mồ côi (từ phiên app cũ đóng bất thường) TRƯỚC khi chọn port và mở log.
+        cleanup_orphans(data_dir);
 
-    let api_key = generate_api_key();
-    crate::settings::register_secret_for_redaction(&api_key);
+        let api_key = generate_api_key();
+        crate::settings::register_secret_for_redaction(&api_key);
 
-    // Log stdout/stderr của sidecar ra file để chẩn đoán khi khởi động thất bại.
-    let stdout_path = data_dir.join("engine-stdout.log");
-    let stderr_path = data_dir.join("engine-stderr.log");
+        // Log stdout/stderr của sidecar ra file để chẩn đoán khi khởi động thất bại.
+        let stdout_path = data_dir.join("engine-stdout.log");
+        let stderr_path = data_dir.join("engine-stderr.log");
+        (exe, chromium, api_key, stdout_path, stderr_path)
+    };
 
     // Hai lần thử: engine chết ngay (exit code 3) hầu như luôn do Edge kẹt profile hoặc tranh port.
     // Lần 2 spawn mới với port mới sau khi dọn orphan, không cần user bấm lại.
     let mut last_err: Option<AppError> = None;
     let mut failed_ports: Vec<u16> = Vec::new();
     for attempt in 1..=2 {
-        if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(AppError::new(
-                "MUSE_START_CANCELLED",
-                "Đã hủy khởi động engine.",
-            ));
-        }
+        check_start_epoch(start_epoch)?;
         if attempt == 2 {
             log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
-            kill_orphan_sidecars();
-            kill_orphan_edges(&data_dir);
+            cleanup_orphans(data_dir);
             for _ in 0..15 {
-                if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(AppError::new(
-                        "MUSE_START_CANCELLED",
-                        "Đã hủy khởi động engine.",
-                    ));
-                }
+                check_start_epoch(start_epoch)?;
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
 
-        let port = find_free_port_excluding_any(cfg.muse_sidecar_port, &failed_ports)?;
-        let mut cdp_exclude = failed_ports.clone();
-        cdp_exclude.push(port);
-        let cdp_port = find_free_port_excluding_any(19210, &cdp_exclude)?;
+        let (port, cdp_port, mut child, run_api_key, chromium_label) =
+            if let Some(spawner) = test_spawner.as_mut() {
+                match spawner(&failed_ports) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+            } else {
+                let port = find_free_port_excluding_any(cfg.muse_sidecar_port, &failed_ports)?;
+                let mut cdp_exclude = failed_ports.clone();
+                cdp_exclude.push(port);
+                let cdp_port = find_free_port_excluding_any(19210, &cdp_exclude)?;
 
-        let stdout_file = open_sidecar_log_file(&stdout_path, "stdout")?;
-        let stderr_file = open_sidecar_log_file(&stderr_path, "stderr")?;
+                let stdout_file = open_sidecar_log_file(&stdout_path, "stdout")?;
+                let stderr_file = open_sidecar_log_file(&stderr_path, "stderr")?;
 
-        let mut cmd = Command::new(&exe);
-        cmd.env("MUSE2API_DRIVER", "browser")
-            .env("MUSE2API_HOST", "127.0.0.1")
-            .env("MUSE2API_PORT", port.to_string())
-            .env("MUSE2API_CDP_PORT", cdp_port.to_string())
-            .env("MUSE2API_API_KEY", &api_key)
-            .env("MUSE2API_ADMIN_KEY", &api_key)
-            .env("MUSE2API_DATA_DIR", &data_dir)
-            .env("MUSE2API_CHROMIUM_PATH", &chromium)
-            .env("MUSE2API_HEADLESS", if cfg.muse_headless { "true" } else { "false" })
-            .env("MUSE2API_DEFER_PREWARM", "true")
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+                let mut cmd = Command::new(&exe);
+                cmd.env("MUSE2API_DRIVER", "browser")
+                    .env("MUSE2API_HOST", "127.0.0.1")
+                    .env("MUSE2API_PORT", port.to_string())
+                    .env("MUSE2API_CDP_PORT", cdp_port.to_string())
+                    .env("MUSE2API_API_KEY", &api_key)
+                    .env("MUSE2API_ADMIN_KEY", &api_key)
+                    .env("MUSE2API_DATA_DIR", data_dir)
+                    .env("MUSE2API_CHROMIUM_PATH", &chromium)
+                    .env("MUSE2API_HEADLESS", if cfg.muse_headless { "true" } else { "false" })
+                    .env("MUSE2API_DEFER_PREWARM", "true")
+                    .stdout(Stdio::from(stdout_file))
+                    .stderr(Stdio::from(stderr_file));
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    cmd.creation_flags(CREATE_NO_WINDOW);
+                }
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                failed_ports.push(port);
-                failed_ports.push(cdp_port);
-                last_err = Some(AppError::new(
-                    "MUSE_SIDECAR_FAIL",
-                    format!("Không chạy được engine: {e}"),
-                ));
-                continue;
-            }
-        };
-        match wait_health(port, &mut child, 90) {
+                let child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        failed_ports.push(port);
+                        failed_ports.push(cdp_port);
+                        last_err = Some(AppError::new(
+                            "MUSE_SIDECAR_FAIL",
+                            format!("Không chạy được engine: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                (
+                    port,
+                    cdp_port,
+                    child,
+                    api_key.clone(),
+                    chromium.display().to_string(),
+                )
+            };
+
+        match wait_health(port, &mut child, 90, start_epoch) {
             Ok(()) => {
+                if is_start_cancelled(start_epoch) {
+                    kill_child_tree(&mut child);
+                    return Err(start_cancelled_error());
+                }
                 // Đồng bộ proxy TRƯỚC khi kích hoạt prewarm và công bố SidecarHandle.
-                sync_proxies_to_sidecar(port, &api_key);
-                if let Err(e) = admin_send(port, &api_key, "POST", "/admin/prewarm", None) {
+                sync_proxies(port, &run_api_key);
+                if is_start_cancelled(start_epoch) {
+                    kill_child_tree(&mut child);
+                    return Err(start_cancelled_error());
+                }
+                if let Err(e) = admin_send(port, &run_api_key, "POST", "/admin/prewarm", None) {
                     log_info(&format!("Bỏ qua /admin/prewarm sau khởi động: {}", e.message));
+                }
+                if is_start_cancelled(start_epoch) {
+                    kill_child_tree(&mut child);
+                    return Err(start_cancelled_error());
                 }
                 *sidecar_cell().write() = Some(SidecarHandle {
                     child,
                     port,
-                    api_key: api_key.clone(),
+                    api_key: run_api_key,
                     cfg_port: cfg.muse_sidecar_port,
                     cfg_chromium: cfg.muse_chromium_path.trim().to_string(),
                     cfg_headless: cfg.muse_headless,
                 });
                 let st = status(cfg)?;
                 log_info(&format!(
-                    "VideoFlow Muse engine đã chạy: port={port}, cdp={cdp_port}, chromium={}",
-                    chromium.display()
+                    "VideoFlow Muse engine đã chạy: port={port}, cdp={cdp_port}, chromium={chromium_label}",
                 ));
                 return Ok(st);
             }
             Err(e) => {
                 // Engine không lên được: kill cây process để không để lại engine mồ côi.
                 kill_child_tree(&mut child);
-                if e.code == "MUSE_START_CANCELLED"
-                    || START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Err(e);
+                if e.code == "MUSE_START_CANCELLED" || is_start_cancelled(start_epoch) {
+                    return Err(if e.code == "MUSE_START_CANCELLED" {
+                        e
+                    } else {
+                        start_cancelled_error()
+                    });
                 }
                 failed_ports.push(port);
                 failed_ports.push(cdp_port);
-                last_err = Some(e.with_engine_hint(&data_dir));
+                last_err = Some(e.with_engine_hint(data_dir));
             }
         }
     }
@@ -886,7 +959,7 @@ where
     F1: FnOnce(),
     F2: FnOnce(&std::path::Path),
 {
-    START_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    STOP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _spawn_guard = start_lock().lock();
     let handle = sidecar_cell().write().take();
     if let Some(mut h) = handle {
@@ -899,13 +972,31 @@ where
         kill_edges(data_dir);
         log_info("VideoFlow Muse engine không có handle — đã dọn tiến trình mồ côi");
     }
-    START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
-/// Dừng sidecar khi app thoát — bỏ qua lỗi (không được cản việc quit).
+fn stop_for_quit_with<F: FnOnce()>(flag: &std::sync::atomic::AtomicBool, do_stop: F) -> bool {
+    if flag
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        do_stop();
+        true
+    } else {
+        false
+    }
+}
+
+/// Dừng sidecar khi app thoát — bỏ qua lỗi (không được cản việc quit) và chỉ thực thi 1 lần.
 pub fn stop_for_quit() {
-    let _ = stop();
+    stop_for_quit_with(&QUIT_STOPPED, || {
+        let _ = stop();
+    });
 }
 
 /// Đọc trạng thái sidecar: process còn sống + snapshot /admin/status khi gọi được.
@@ -1390,14 +1481,14 @@ mod tests {
         assert!(!line.contains("u:p@"), "secret before truncate leaked: {line}");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        // 2. START_CANCELLED aborts wait_health immediately with MUSE_START_CANCELLED
+        // 2. STOP_EPOCH increment aborts wait_health immediately with MUSE_START_CANCELLED
         let mut child = Command::new(windows_system32_exe("cmd.exe"))
             .args(["/C", "timeout /T 1 /NOBREAK >NUL"])
             .spawn()
             .unwrap();
-        START_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
-        let cancel_err = wait_health(1, &mut child, 30).expect_err("must cancel");
-        START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let epoch = STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        STOP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cancel_err = wait_health(1, &mut child, 30, epoch).expect_err("must cancel");
         kill_child_tree(&mut child);
         assert_eq!(cancel_err.code, "MUSE_START_CANCELLED");
 
@@ -1460,5 +1551,254 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].contains("/admin/accounts/acc_ok"));
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn stop_epoch_cancels_start_racing_before_lock_and_after_healthz_without_prewarm_or_handle() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _serial = test_sidecar_guard();
+        if let Some(mut h) = sidecar_cell().write().take() {
+            kill_child_tree(&mut h.child);
+        }
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_stop_epoch_test_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg = Settings::default();
+
+        // Case 1: stop_with races start() AFTER start() captured STOP_EPOCH and BEFORE it enters start_lock.
+        let (tx_captured, rx_captured) = std::sync::mpsc::channel::<()>();
+        let spawner_calls = Arc::new(AtomicUsize::new(0));
+        let spawner_calls_1 = Arc::clone(&spawner_calls);
+        let hold_guard = start_lock().lock();
+        let cfg_1 = cfg.clone();
+        let dir_1 = tmp_dir.clone();
+        let start_thread = std::thread::spawn(move || {
+            let mut spawner = |_failed: &[u16]| -> AppResult<(u16, u16, Child, String, String)> {
+                spawner_calls_1.fetch_add(1, Ordering::SeqCst);
+                unreachable!("spawner must not run when start is cancelled before lock entry")
+            };
+            start_with_hooks(
+                &cfg_1,
+                &dir_1,
+                move || {
+                    let _ = tx_captured.send(());
+                },
+                |_| {},
+                |_, _| {},
+                Some(&mut spawner),
+            )
+        });
+        rx_captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        let epoch_before_stop = STOP_EPOCH.load(Ordering::SeqCst);
+        let dir_stop = tmp_dir.clone();
+        let stop_thread = std::thread::spawn(move || stop_with(&dir_stop, || {}, |_| {}));
+        while STOP_EPOCH.load(Ordering::SeqCst) == epoch_before_stop {
+            std::thread::yield_now();
+        }
+        drop(hold_guard);
+
+        let start_err = start_thread.join().unwrap().unwrap_err();
+        stop_thread.join().unwrap().unwrap();
+        assert_eq!(start_err.code, "MUSE_START_CANCELLED");
+        assert_eq!(spawner_calls.load(Ordering::SeqCst), 0);
+        assert!(sidecar_cell().read().is_none(), "SidecarHandle must not be published");
+
+        // Case 2: /healthz returns 200, stop_with triggers concurrently right before /admin/prewarm.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop_srv = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv_bg = Arc::clone(&stop_srv);
+        let prewarm_hits = Arc::new(AtomicUsize::new(0));
+        let prewarm_hits_bg = Arc::clone(&prewarm_hits);
+
+        let server = std::thread::spawn(move || {
+            while !stop_srv_bg.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 4096];
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let first = req.lines().next().unwrap_or("");
+                        if first.starts_with("POST /admin/prewarm") {
+                            prewarm_hits_bg.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let stop_join_cell = Arc::new(parking_lot::Mutex::new(None));
+        let stop_join_bg = Arc::clone(&stop_join_cell);
+        let dir_stop2 = tmp_dir.clone();
+        let mut spawner2 = move |_failed: &[u16]| -> AppResult<(u16, u16, Child, String, String)> {
+            #[cfg(target_os = "windows")]
+            let child = Command::new(windows_system32_exe("ping.exe"))
+                .args(["-n", "6", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            #[cfg(not(target_os = "windows"))]
+            let child = Command::new("sleep").arg("5").spawn().unwrap();
+            Ok((port, port + 1, child, "vf_test_epoch".into(), "test".into()))
+        };
+        let err_after_health = start_with_hooks(
+            &cfg,
+            &tmp_dir,
+            || {},
+            |_| {},
+            move |_p, _k| {
+                // Simulate stop_with invoked right after /healthz 200 before /admin/prewarm.
+                let epoch_now = STOP_EPOCH.load(Ordering::SeqCst);
+                let dir_inner = dir_stop2.clone();
+                let j = std::thread::spawn(move || stop_with(&dir_inner, || {}, |_| {}));
+                while STOP_EPOCH.load(Ordering::SeqCst) == epoch_now {
+                    std::thread::yield_now();
+                }
+                *stop_join_bg.lock() = Some(j);
+            },
+            Some(&mut spawner2),
+        )
+        .unwrap_err();
+
+        if let Some(j) = stop_join_cell.lock().take() {
+            j.join().unwrap().unwrap();
+        }
+        stop_srv.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert_eq!(err_after_health.code, "MUSE_START_CANCELLED");
+        assert_eq!(
+            prewarm_hits.load(Ordering::SeqCst),
+            0,
+            "/admin/prewarm must NOT be called after cancellation"
+        );
+        assert!(
+            sidecar_cell().read().is_none(),
+            "SidecarHandle must NOT be published after cancellation"
+        );
+
+        // Case 3: /healthz 200 triggers stop_with directly inside /healthz before sync_proxies runs.
+        let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port3 = listener3.local_addr().unwrap().port();
+        listener3.set_nonblocking(true).unwrap();
+        let stop_srv3 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_srv3_bg = Arc::clone(&stop_srv3);
+        let prewarm_hits3 = Arc::new(AtomicUsize::new(0));
+        let prewarm_hits3_bg = Arc::clone(&prewarm_hits3);
+        let stop_join3 = Arc::new(parking_lot::Mutex::new(None));
+        let stop_join3_bg = Arc::clone(&stop_join3);
+        let dir_stop3 = tmp_dir.clone();
+
+        let server3 = std::thread::spawn(move || {
+            while !stop_srv3_bg.load(Ordering::SeqCst) {
+                match listener3.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 4096];
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let first = req.lines().next().unwrap_or("");
+                        if first.starts_with("POST /admin/prewarm") {
+                            prewarm_hits3_bg.fetch_add(1, Ordering::SeqCst);
+                        } else if first.starts_with("GET /healthz") {
+                            let epoch_now = STOP_EPOCH.load(Ordering::SeqCst);
+                            let dir_inner = dir_stop3.clone();
+                            let j = std::thread::spawn(move || stop_with(&dir_inner, || {}, |_| {}));
+                            while STOP_EPOCH.load(Ordering::SeqCst) == epoch_now {
+                                std::thread::yield_now();
+                            }
+                            *stop_join3_bg.lock() = Some(j);
+                        }
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let sync_hits3 = Arc::new(AtomicUsize::new(0));
+        let sync_hits3_bg = Arc::clone(&sync_hits3);
+        let mut spawner3 = move |_failed: &[u16]| -> AppResult<(u16, u16, Child, String, String)> {
+            #[cfg(target_os = "windows")]
+            let child = Command::new(windows_system32_exe("ping.exe"))
+                .args(["-n", "6", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            #[cfg(not(target_os = "windows"))]
+            let child = Command::new("sleep").arg("5").spawn().unwrap();
+            Ok((port3, port3 + 1, child, "vf_test_epoch3".into(), "test".into()))
+        };
+        let err_on_health = start_with_hooks(
+            &cfg,
+            &tmp_dir,
+            || {},
+            |_| {},
+            move |_p, _k| {
+                sync_hits3_bg.fetch_add(1, Ordering::SeqCst);
+            },
+            Some(&mut spawner3),
+        )
+        .unwrap_err();
+
+        if let Some(j) = stop_join3.lock().take() {
+            j.join().unwrap().unwrap();
+        }
+        stop_srv3.store(true, Ordering::SeqCst);
+        server3.join().unwrap();
+
+        assert_eq!(err_on_health.code, "MUSE_START_CANCELLED");
+        assert_eq!(sync_hits3.load(Ordering::SeqCst), 0);
+        assert_eq!(prewarm_hits3.load(Ordering::SeqCst), 0);
+        assert!(sidecar_cell().read().is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn stop_for_quit_with_is_idempotent() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(stop_for_quit_with(&flag, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(!stop_for_quit_with(&flag, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(!stop_for_quit_with(&flag, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

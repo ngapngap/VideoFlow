@@ -1,5 +1,33 @@
 import type { Settings, SettingsView } from "./api";
 
+/** Returns true when `val` is a finite integer within `[min, max]`. */
+export function isValidIntInRange(val: unknown, min: number, max: number): boolean {
+  if (val === null || val === undefined || (typeof val === "string" && val.trim() === "")) {
+    return false;
+  }
+  const n = Number(val);
+  return Number.isFinite(n) && Number.isInteger(n) && n >= min && n <= max;
+}
+
+/** Maximum `video_seconds` allowed by the selected video backend (`internal` Muse caps at 60s). */
+export function getVideoSecondsMax(videoSource?: string | null): number {
+  return videoSource === "internal" ? 60 : 120;
+}
+
+/** Validates `video_seconds` against the active video source, returning a Vietnamese error or null. */
+export function validateVideoSeconds(
+  videoSeconds: unknown,
+  videoSource?: string | null
+): string | null {
+  const max = getVideoSecondsMax(videoSource);
+  if (isValidIntInRange(videoSeconds, 1, max)) {
+    return null;
+  }
+  return videoSource === "internal"
+    ? "Thời lượng video (VideoFlow Muse nội bộ) phải là số nguyên từ 1 đến 60 giây."
+    : "Thời lượng video phải là số nguyên từ 1 đến 120 giây.";
+}
+
 export interface SettingsSaveDeps {
   saveSettings: (payload: Settings) => Promise<boolean>;
   setApiKey: (which: "anh" | "video", value: string) => Promise<boolean>;

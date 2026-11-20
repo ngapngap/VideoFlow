@@ -82,8 +82,10 @@ def _to_messages(body: ResponseRequest) -> list[dict]:
                     f"input item type '{itype}' is not supported: "
                     "muse.ai has no function calling")
             if "role" in item or itype in ("message", None):
-                messages.append({"role": item.get("role", "user"),
-                                 "content": item.get("content")})
+                role = item.get("role", "user")
+                if not isinstance(role, str) or not role.strip():
+                    raise InvalidRequest("input item role must be a non-empty string")
+                messages.append({"role": role, "content": item.get("content")})
             else:
                 raise InvalidRequest(f"unsupported input item type '{itype}'")
     else:

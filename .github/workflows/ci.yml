@@ -71,8 +71,11 @@ jobs:
         working-directory: videoflow-app/sidecar
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pyinstaller muse2api.spec --distpath ../src-tauri/binaries --workpath build --noconfirm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -124,6 +127,19 @@ jobs:
             "`n--- engine stdout ---`n$out`n--- engine stderr ---`n$err`n--- chromium ---`n$ce"
           }
           $p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+          function Stop-PidTree([int]$targetPid, [System.Diagnostics.Process]$proc = $null) {
+            $prevEap = $ErrorActionPreference
+            try {
+              $ErrorActionPreference = "Continue"
+              & taskkill /PID $targetPid /T /F 2>&1 | Out-Null
+              if ($proc) { $proc.Refresh() }
+              if ($LASTEXITCODE -in @(0, 128) -or ($proc -and $proc.HasExited)) {
+                $global:LASTEXITCODE = 0
+              }
+            } finally {
+              $ErrorActionPreference = $prevEap
+            }
+          }
           try {
             $ok = $false
             foreach ($i in 1..150) {
@@ -139,18 +155,25 @@ jobs:
             if (-not $ok) {
               throw ("engine browser driver không lên được trong 75s" + (& $dumpLogs))
             }
-            $h = @{ Authorization = "Bearer bkey" }
-            $st = Invoke-RestMethod -Uri "http://127.0.0.1:18703/admin/status" -Headers $h
-            if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
-            if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
-            Write-Host "browser driver OK: tabs=$($st.driver.tabs) busy=$($st.driver.busy_tabs)"
+            try {
+              $h = @{ Authorization = "Bearer bkey" }
+              $st = Invoke-RestMethod -Uri "http://127.0.0.1:18703/admin/status" -Headers $h
+              if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
+              if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
+              Write-Host "browser driver OK: tabs=$($st.driver.tabs) busy=$($st.driver.busy_tabs)"
+            } catch {
+              throw ($_.Exception.Message + (& $dumpLogs))
+            }
           } finally {
-            if ($p -and -not $p.HasExited) {
-              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            if ($p) {
+              $p.Refresh()
+              if (-not $p.HasExited) {
+                Stop-PidTree $p.Id $p
+              }
             }
             Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction SilentlyContinue |
               Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($dataDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
-              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+              ForEach-Object { Stop-PidTree $_.ProcessId }
           }
 
   sidecar:
@@ -169,7 +192,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pip install -r requirements.txt -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile all sources
         run: python -m compileall -q muse2api
@@ -215,7 +240,20 @@ jobs:
             } catch { $dupFailed = $true }
             if (-not $dupFailed) { throw "cookie trùng session KHÔNG bị chặn" }
           } finally {
-            if ($p -and -not $p.HasExited) {
-              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            if ($p) {
+              $p.Refresh()
+              if (-not $p.HasExited) {
+                $prevEap = $ErrorActionPreference
+                try {
+                  $ErrorActionPreference = "Continue"
+                  & taskkill /PID $($p.Id) /T /F 2>&1 | Out-Null
+                  $p.Refresh()
+                  if ($LASTEXITCODE -in @(0, 128) -or $p.HasExited) {
+                    $global:LASTEXITCODE = 0
+                  }
+                } finally {
+                  $ErrorActionPreference = $prevEap
+                }
+              }
             }
           }

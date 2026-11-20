@@ -338,29 +338,39 @@ class AccountPool:
     def _apply_result(self, acc: Account, error: BaseException | None) -> None:
         if error is None:
             acc.success_count += 1
-            acc.last_error = None
+            if acc.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
+                acc.last_error = None
             if acc.status == AccountStatus.COOLING and time.time() >= acc.cooldown_until:
                 acc.status = AccountStatus.ACTIVE
             return
         acc.fail_count += 1
-        acc.last_error = str(error)[:500]
         if isinstance(error, (UpstreamAuthError, UpstreamVmDisabled)):
+            acc.last_error = str(error)[:500]
             acc.status = AccountStatus.INVALID
             log.warning("account %s marked invalid: %s", acc.id, error)
         elif isinstance(error, UpstreamVideoLocked):
-            acc.status = AccountStatus.VIDEO_LOCKED
-            log.warning("account %s marked video_locked: %s", acc.id, error)
+            if acc.status != AccountStatus.INVALID:
+                acc.last_error = str(error)[:500]
+                acc.status = AccountStatus.VIDEO_LOCKED
+                log.warning("account %s marked video_locked: %s", acc.id, error)
+        elif acc.status in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
+            if not acc.last_error:
+                acc.last_error = str(error)[:500]
         elif isinstance(error, UpstreamQuotaError):
+            acc.last_error = str(error)[:500]
             acc.status = AccountStatus.COOLING
-            acc.cooldown_until = time.time() + max(self.cooldown, 3600)
+            acc.cooldown_until = max(acc.cooldown_until, time.time() + max(self.cooldown, 3600))
             log.warning("account %s out of quota, cooling down", acc.id)
         elif isinstance(error, UpstreamTimeout):
+            acc.last_error = str(error)[:500]
             # muse.ai being slow says nothing about the account; cooling it down
             # would only fail the other requests running on it in parallel.
-            pass
         elif getattr(error, "retryable", False):
+            acc.last_error = str(error)[:500]
             acc.status = AccountStatus.COOLING
-            acc.cooldown_until = time.time() + self.cooldown
+            acc.cooldown_until = max(acc.cooldown_until, time.time() + self.cooldown)
+        else:
+            acc.last_error = str(error)[:500]
 
     @asynccontextmanager
     async def lease(
