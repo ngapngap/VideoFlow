@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Kiểu trả về chuẩn của `latest_job_status`:
 /// `(status, image_status, video_status, last_error, attempts_count)`
@@ -117,7 +117,7 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             level TEXT NOT NULL CHECK (level IN ('info','warn','error')),
             run_id INTEGER REFERENCES runs(id),
             row_key TEXT,
-            step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet')),
+            step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet','auto_merge')),
             message TEXT NOT NULL,
             detail TEXT
         );
@@ -133,12 +133,65 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     // Migration idempotent v2 -> v3: cập nhật CHECK constraint bảng jobs cho phép 'loi_tam_thoi'
     migrate_jobs_v3_check_constraint(conn)?;
 
+    // Migration idempotent v3 -> v4: cập nhật CHECK constraint bảng logs cho phép 'auto_merge'
+    migrate_logs_v4_check_constraint(conn)?;
+
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![SCHEMA_VERSION.to_string()],
     )?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn migrate_logs_v4_check_constraint(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'logs'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let needs_migration = match table_sql {
+        Some(sql) => !sql.contains("'auto_merge'"),
+        None => false,
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        BEGIN TRANSACTION;
+
+        CREATE TABLE logs_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            level TEXT NOT NULL CHECK (level IN ('info','warn','error')),
+            run_id INTEGER REFERENCES runs(id),
+            row_key TEXT,
+            step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet','auto_merge')),
+            message TEXT NOT NULL,
+            detail TEXT
+        );
+
+        INSERT INTO logs_new (id, ts, level, run_id, row_key, step, message, detail)
+        SELECT id, ts, level, run_id, row_key, step, message, detail FROM logs;
+
+        DROP TABLE logs;
+        ALTER TABLE logs_new RENAME TO logs;
+
+        CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+        CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
     Ok(())
 }
 
@@ -494,7 +547,7 @@ mod tests {
         let user_ver: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(user_ver, 3);
+        assert_eq!(user_ver, SCHEMA_VERSION);
 
         conn.execute(
             "UPDATE jobs SET video_task_id = 'migrated_task', video_download_url = 'https://example.com/v.mp4' WHERE row_key = 'old.png'",
@@ -614,12 +667,12 @@ mod tests {
         let user_ver: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read user_version");
-        assert_eq!(user_ver, 3);
+        assert_eq!(user_ver, SCHEMA_VERSION);
 
         let schema_ver: String = conn
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
             .expect("read meta schema_version");
-        assert_eq!(schema_ver, "3");
+        assert_eq!(schema_ver, SCHEMA_VERSION.to_string());
 
         // 2. Kiểm tra dữ liệu cũ của jobs được bảo toàn nguyên vẹn
         let (row_key, video_task, attempts): (String, Option<String>, i64) = conn

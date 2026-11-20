@@ -1081,7 +1081,9 @@ pub fn download_video(
     let mut current_url = url.to_string();
     let mut refreshed_url_once = false;
     let mut retry_attempt: u32 = 0;
-    let part_path = dest.with_extension("mp4.part");
+    static PART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    let part_path = dest.with_extension(format!("mp4.{}.{seq}.part", std::process::id()));
 
     loop {
         if stop_flag.load(Ordering::SeqCst) {

@@ -551,14 +551,12 @@ pub fn versioned_file_name(stem: &str, ver: i64, ext: &str) -> String {
     }
 }
 
+static VERSION_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+
 pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str) -> i64 {
-    let db_max: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM file_refs WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2",
-            rusqlite::params![row_key, kind],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    let _guard = VERSION_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock();
 
     let ext = if kind == "anh" { "png" } else { "mp4" };
     // row_key là "<tên ảnh>#<hash prompt>" → stem phải lấy từ tên ảnh, nếu không tên
@@ -569,6 +567,17 @@ pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anh".into());
     let stem_low = stem.to_lowercase();
+    let stem_like = format!("{stem_low}_gen%");
+
+    let db_max: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM file_refs
+             WHERE (LOWER(row_key) = LOWER(?1) OR LOWER(file_name) LIKE LOWER(?2)) AND kind = ?3",
+            rusqlite::params![row_key, stem_like, kind],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let v1_name = format!("{stem_low}_gen.{ext}");
     let vn_prefix = format!("{stem_low}_gen_v");
     let vn_suffix = format!(".{ext}");
@@ -577,11 +586,19 @@ pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str
     if let Ok(entries) = std::fs::read_dir(out_dir) {
         for entry in entries.flatten() {
             let fname_low = entry.file_name().to_string_lossy().to_lowercase();
-            if fname_low == v1_name {
+            // Bỏ hậu tố tạm `.part`, `.mp4.<pid>.<seq>.part`, `.vf_tmp_<ns>` để không ghi đè file đang ghi dở.
+            let clean_low = if fname_low.contains(".vf_tmp_") {
+                fname_low.split(".vf_tmp_").next().unwrap_or(&fname_low)
+            } else if fname_low.ends_with(".part") {
+                fname_low.split(".mp4.").next().unwrap_or(&fname_low)
+            } else {
+                &fname_low
+            };
+            if clean_low == v1_name || clean_low == format!("{stem_low}_gen") {
                 disk_max = disk_max.max(1);
-            } else if let Some(mid) = fname_low
+            } else if let Some(mid) = clean_low
                 .strip_prefix(&vn_prefix)
-                .and_then(|s| s.strip_suffix(&vn_suffix))
+                .map(|s| s.strip_suffix(&vn_suffix).unwrap_or(s))
             {
                 if let Ok(v) = mid.parse::<i64>() {
                     disk_max = disk_max.max(v);
@@ -1392,7 +1409,14 @@ pub fn run_with_emitter_and_hook(
         },
     );
 
-    let worker_count = (cfg.concurrency.clamp(1, 3) as usize).min(total.max(1));
+    // Nếu batch có ít nhất 1 dòng `noi_canh = true`, ép tuần tự (`worker_count = 1`)
+    // để đảm bảo video cảnh trước luôn hoàn tất trước khi trích frame cuối cho cảnh sau.
+    let has_noi_canh = planned_rows.iter().any(|(r, _)| r.noi_canh);
+    let worker_count = if has_noi_canh {
+        1
+    } else {
+        (cfg.concurrency.clamp(1, 3) as usize).min(total.max(1))
+    };
     let queue = parking_lot::Mutex::new(planned_rows);
     let active_rows: parking_lot::Mutex<Vec<ActiveRowProgress>> = parking_lot::Mutex::new(Vec::new());
     let done_count = AtomicUsize::new(0);
@@ -2243,24 +2267,9 @@ pub fn find_previous_scene_video_impl(
         }
     }
 
-    // 2. Dự phòng: Tìm job liền trước trong cùng đợt chạy (run_id) trong SQLite
-    if let Ok(prev_key) = conn.query_row(
-        "SELECT row_key FROM jobs WHERE run_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT 1",
-        rusqlite::params![run_id, job_id],
-        |r| r.get::<_, String>(0),
-    ) {
-        if let Ok(file_name) = conn.query_row(
-            "SELECT file_name FROM file_refs WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video' ORDER BY is_current DESC, version DESC, id DESC LIMIT 1",
-            rusqlite::params![prev_key],
-            |r| r.get::<_, String>(0),
-        ) {
-            let vid_path = video_out.join(file_name.trim());
-            if vid_path.is_file() {
-                return Some(vid_path);
-            }
-        }
-    }
-
+    // Không fallback sang `WHERE run_id = ?1 AND id < ?2` vì có thể lấy nhầm video của dòng
+    // không liên quan khi chạy lẻ hoặc dòng trước bị bỏ qua.
+    let _ = (run_id, job_id);
     None
 }
 
@@ -2420,6 +2429,9 @@ pub fn build_normalize_clip_args(
     height: u32,
     fps: u32,
 ) -> Vec<String> {
+    let even_w = (width & !1).max(2);
+    let even_h = (height & !1).max(2);
+
     let mut args = vec![
         "-y".into(),
         "-hide_banner".into(),
@@ -2432,10 +2444,14 @@ pub fn build_normalize_clip_args(
         args.push("lavfi".into());
         args.push("-i".into());
         args.push("anullsrc=channel_layout=stereo:sample_rate=44100".into());
+        args.push("-map".into());
+        args.push("0:v:0".into());
+        args.push("-map".into());
+        args.push("1:a:0".into());
     }
 
     let vf = format!(
-        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+        "scale={even_w}:{even_h}:force_original_aspect_ratio=decrease,pad={even_w}:{even_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
     );
     args.push("-vf".into());
     args.push(vf);
@@ -2612,11 +2628,14 @@ pub fn auto_merge_batch(
         normalized_clips.push(norm_path);
     }
 
-    // Bước 2: Ghi file danh sách concat demuxer
+    // Bước 2: Ghi file danh sách concat demuxer (escape dấu nháy đơn cho FFmpeg)
     let list_file = cache_dir.join("concat_list.txt");
     let mut list_content = String::new();
     for norm_path in &normalized_clips {
-        let safe_path = norm_path.to_string_lossy().replace('\\', "/");
+        let safe_path = norm_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
         list_content.push_str(&format!("file '{safe_path}'\n"));
     }
     if let Err(e) = std::fs::write(&list_file, list_content.as_bytes()) {
@@ -2624,8 +2643,9 @@ pub fn auto_merge_batch(
         return Err(format!("Không thể ghi file concat_list.txt: {e}"));
     }
 
-    // Bước 3: Ghép nối bằng FFmpeg concat demuxer
-    let concat_args = build_concat_demuxer_args(&list_file, &final_output);
+    // Bước 3: Ghép nối ra file tạm rồi rename nguyên tử sang final_output
+    let tmp_output = cache_dir.join("merged_tmp.mp4");
+    let concat_args = build_concat_demuxer_args(&list_file, &tmp_output);
     let mut cmd = std::process::Command::new("ffmpeg");
     #[cfg(windows)]
     {
@@ -2642,19 +2662,29 @@ pub fn auto_merge_batch(
             format!("Không thể thực thi lệnh FFmpeg concat: {e}")
         })?;
 
-    let _ = std::fs::remove_dir_all(&cache_dir);
-
-    if !output.status.success() || !final_output.is_file() {
+    if !output.status.success() || !tmp_output.is_file() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&cache_dir);
         return Err(format!("FFmpeg ghép nối thất bại: {}", err_msg.trim()));
     }
 
-    let len = std::fs::metadata(&final_output)
+    let len = std::fs::metadata(&tmp_output)
         .map(|m| m.len())
         .unwrap_or(0);
     if len == 0 {
+        let _ = std::fs::remove_dir_all(&cache_dir);
         return Err("File video sau ghép rỗng (0 bytes)".into());
     }
+
+    if let Err(e) = std::fs::rename(&tmp_output, &final_output) {
+        // Fallback copy+remove nếu khác ổ đĩa
+        if let Err(copy_err) = std::fs::copy(&tmp_output, &final_output) {
+            let _ = std::fs::remove_file(&final_output);
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            return Err(format!("Không thể lưu file video sau ghép: {e} ({copy_err})"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&cache_dir);
 
     if let Some(c) = conn {
         crate::settings::log(
@@ -2699,10 +2729,25 @@ fn run_b3(
         return Ok(RowStatus::DaTaoVideo);
     }
 
-    // Xác định ảnh tham chiếu gốc (fallback)
-    let orig_img_path = if !row.anh_da_tao.is_empty() && ctx.image_out.join(&row.anh_da_tao).is_file() {
-        Some(ctx.image_out.join(&row.anh_da_tao))
-    } else {
+    // Xác định ảnh đầu vào cho B3: nếu có `anh_da_tao` thì bắt buộc file trong `image_out/`
+    // phải tồn tại (không âm thầm rơi về ảnh thô `input/` khi ảnh đã bị xóa). Chỉ dùng ảnh `input/`
+    // khi dòng không có prompt ảnh (`promt_tao_image` rỗng).
+    let orig_img_path = if !row.anh_da_tao.is_empty() {
+        let p = ctx.image_out.join(&row.anh_da_tao);
+        if p.is_file() {
+            Some(p)
+        } else {
+            return Err(ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "NO_IMAGE".into(),
+                message: format!(
+                    "Không tìm thấy ảnh sản phẩm '{}' trong image_out/ để tạo video.",
+                    row.anh_da_tao
+                ),
+            });
+        }
+    } else if row.promt_tao_image.trim().is_empty() {
         let in_ref = ctx
             .csv_path
             .parent()
@@ -2714,6 +2759,8 @@ fn run_b3(
         } else {
             None
         }
+    } else {
+        None
     };
 
     let mut chosen_img_path = orig_img_path.clone();

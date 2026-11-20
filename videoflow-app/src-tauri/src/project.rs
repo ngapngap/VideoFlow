@@ -257,12 +257,25 @@ pub fn probe_project(project: &Path) -> ProbeResult {
 }
 
 /// Mở `state.db`, nếu file `state.db` bị hỏng (corrupt) thì tự sao lưu sang `state.db.corrupt_<ts>` và khởi tạo lại sạch sẽ (6.9c).
+fn is_db_corrupt_error(err: &rusqlite::Error) -> bool {
+    if let rusqlite::Error::SqliteFailure(code, _) = err {
+        return matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        );
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("malformed") || msg.contains("not a database") || msg.contains("file is encrypted")
+}
+
 pub fn open_or_recover_db(project: &Path) -> AppResult<(rusqlite::Connection, bool)> {
     match crate::state_db::open(project) {
         Ok(conn) => Ok((conn, false)),
         Err(first_err) => {
+            // Chỉ đổi tên/tái tạo DB khi file thực sự hỏng (Corrupt / NotADatabase).
+            // Tuyệt đối không xóa DB/WAL khi gặp lỗi khóa tạm (SQLITE_BUSY / Locked).
             let db_file = project.join("state.db");
-            if db_file.exists() {
+            if db_file.exists() && is_db_corrupt_error(&first_err) {
                 let ts = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
                 let corrupt_backup = project.join(format!("state.db.corrupt_{ts}"));
                 let _ = std::fs::rename(&db_file, &corrupt_backup);

@@ -341,7 +341,13 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
     }
 
     let header_len = headers.len();
-    let noi_canh_col_idx: Option<usize> = headers.iter().position(is_noi_canh_header);
+    // Chỉ tìm cột `noi_canh` từ cột phụ (index >= 10) để không bao giờ trùng cột J (`ghi_chu_loi`).
+    let noi_canh_col_idx: Option<usize> = headers
+        .iter()
+        .enumerate()
+        .skip(10)
+        .find(|(_, h)| is_noi_canh_header(h))
+        .map(|(i, _)| i);
     let mut rows = Vec::new();
     for (idx, rec) in record_iter.records().enumerate() {
         let row_no = idx + 2;

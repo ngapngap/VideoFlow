@@ -16,13 +16,14 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-const STATUS_FILTER_KEYS: [&str; 7] = [
+const STATUS_FILTER_KEYS: [&str; 8] = [
     "Tất cả",
     "Đang chờ",
     "Đã tạo image",
     "Đã tạo video",
     "Lỗi tạo image",
     "Lỗi tạo video",
+    "Lỗi tạm thời",
     "Bỏ qua",
 ];
 
@@ -150,6 +151,7 @@ pub struct RowSummary {
     pub last_error: Option<String>,
     pub row_no: usize,
     pub prompt_modified: bool,
+    pub ref_exists: bool,
     pub noi_canh: bool,
 }
 
@@ -678,6 +680,7 @@ pub fn get_rows(
         *status_counts.entry("Tất cả".into()).or_insert(0) += 1;
         *status_counts.entry(label.to_string()).or_insert(0) += 1;
 
+        let ref_exists = p.join("input").join(r.anh_tham_chieu.trim()).is_file();
         summaries.push(RowSummary {
             row_key,
             image_name: r.anh_tham_chieu.clone(),
@@ -688,6 +691,7 @@ pub fn get_rows(
             last_error,
             row_no: r.row_no,
             prompt_modified,
+            ref_exists,
             noi_canh: r.noi_canh,
         });
     }
@@ -695,8 +699,11 @@ pub fn get_rows(
     if let Some(st) = status.as_deref().map(str::trim) {
         if !st.is_empty() && st != "Tất cả" {
             if st == "Lỗi" {
-                summaries
-                    .retain(|r| r.status == "Lỗi tạo image" || r.status == "Lỗi tạo video");
+                summaries.retain(|r| {
+                    r.status == "Lỗi tạo image"
+                        || r.status == "Lỗi tạo video"
+                        || r.status == "Lỗi tạm thời"
+                });
             } else {
                 summaries.retain(|r| r.status == st);
             }
@@ -762,8 +769,11 @@ pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
         if depth > 5 {
             return;
         }
+        let Some(end_offset) = start_offset.checked_add(max_len) else {
+            return;
+        };
         let mut cur = start_offset;
-        while cur + 8 <= start_offset + max_len {
+        while cur.checked_add(8).is_some_and(|next8| next8 <= end_offset) {
             if reader.seek(SeekFrom::Start(cur)).is_err() {
                 break;
             }
@@ -781,16 +791,21 @@ pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
                 }
                 (u64::from_be_bytes(ext), 16u64)
             } else if size32 == 0 {
-                (max_len.saturating_sub(cur - start_offset), 8u64)
+                (end_offset.saturating_sub(cur), 8u64)
             } else {
                 (size32, 8u64)
             };
 
-            if box_size < header_size || cur + box_size > start_offset + max_len {
+            let Some(next_cur) = cur.checked_add(box_size) else {
+                break;
+            };
+            if box_size < header_size || next_cur > end_offset {
                 break;
             }
 
-            let payload_offset = cur + header_size;
+            let Some(payload_offset) = cur.checked_add(header_size) else {
+                break;
+            };
             let payload_len = box_size - header_size;
 
             if tag == b"moov" || tag == b"trak" {
@@ -807,9 +822,11 @@ pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
                             if timescale > 0.0 {
                                 *duration_out = Some(duration / timescale);
                             }
-                        } else if version == 1 && read_len >= 28 {
+                        } else if version == 1 && read_len >= 32 {
                             let timescale = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as f64;
-                            let duration = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]) as f64;
+                            let duration = u64::from_be_bytes([
+                                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+                            ]) as f64;
                             if timescale > 0.0 {
                                 *duration_out = Some(duration / timescale);
                             }
@@ -840,7 +857,7 @@ pub fn probe_mp4_metadata(path: &Path) -> (Option<f64>, Option<String>) {
                 break;
             }
 
-            cur += box_size;
+            cur = next_cur;
         }
     }
 
@@ -1080,6 +1097,7 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
             last_error,
             row_no: row.row_no,
             prompt_modified,
+            ref_exists,
             noi_canh: row.noi_canh,
         },
         prompt_image: row.promt_tao_image.clone(),
@@ -1255,6 +1273,10 @@ pub(crate) fn spawn_engine_internal(
             )
         }));
 
+        // Dọn stop_flag & running = false TRƯỚC khi phát run_finished cho nhánh lỗi/panic
+        // để UI nhận sự kiện run_finished có thể khởi động lượt mới ngay mà không bị RUN_IN_PROGRESS.
+        let mut deferred_finish: Option<serde_json::Value> = None;
+
         match result {
             Ok(Ok(outcome)) => {
                 if notify_enabled {
@@ -1284,7 +1306,6 @@ pub(crate) fn spawn_engine_internal(
                 }
             }
             Ok(Err(e)) => {
-                // [P0-1]: Bảo đảm cập nhật DB + LUÔN phát `run_finished` để UI không bao giờ kẹt `$running = true`!
                 let rid = created_rid_bg.load(Ordering::SeqCst);
                 if rid > 0 {
                     if let Ok(conn) = crate::state_db::open(&p) {
@@ -1302,16 +1323,13 @@ pub(crate) fn spawn_engine_internal(
                         "code": e.code, "message": e.message
                     }),
                 );
-                let _ = app2.emit(
-                    "run_finished",
-                    serde_json::json!({
-                        "run_id": rid,
-                        "status": "gian_doan",
-                        "done_count": 0,
-                        "error_count": 0,
-                        "duration_ms": start_inst.elapsed().as_millis() as i64
-                    }),
-                );
+                deferred_finish = Some(serde_json::json!({
+                    "run_id": rid,
+                    "status": "gian_doan",
+                    "done_count": 0,
+                    "error_count": 0,
+                    "duration_ms": start_inst.elapsed().as_millis() as i64
+                }));
             }
             Err(panic_err) => {
                 let rid = created_rid_bg.load(Ordering::SeqCst);
@@ -1336,23 +1354,23 @@ pub(crate) fn spawn_engine_internal(
                         "code": "ENGINE_PANIC", "message": msg
                     }),
                 );
-                let _ = app2.emit(
-                    "run_finished",
-                    serde_json::json!({
-                        "run_id": rid,
-                        "status": "gian_doan",
-                        "done_count": 0,
-                        "error_count": 0,
-                        "duration_ms": start_inst.elapsed().as_millis() as i64
-                    }),
-                );
+                deferred_finish = Some(serde_json::json!({
+                    "run_id": rid,
+                    "status": "gian_doan",
+                    "done_count": 0,
+                    "error_count": 0,
+                    "duration_ms": start_inst.elapsed().as_millis() as i64
+                }));
             }
         }
 
         let st = app2.state::<AppState>();
+        *st.stop_flag.write() = None;
         st.active_run_id.store(0, Ordering::SeqCst);
         st.running.store(false, Ordering::SeqCst);
-        *st.stop_flag.write() = None;
+        if let Some(payload) = deferred_finish {
+            let _ = app2.emit("run_finished", payload);
+        }
     });
 
     *state.engine_thread.lock() = Some(handle);
@@ -2039,16 +2057,23 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsView {
 
 #[tauri::command]
 pub fn save_settings(settings: Settings, state: State<'_, AppState>) -> AppResult<bool> {
-    let mut cur = state.settings_cache.write();
-    let recent = cur.recent_projects.clone();
-    let current = cur.current_project.clone();
-    let mut s = settings;
-    s.recent_projects = recent;
-    s.current_project = current;
-    state.settings.save(&s)?;
-    let loaded = state.settings.load();
-    let _ = settings::apply_windows_autostart(loaded.start_with_windows);
-    *cur = loaded;
+    let start_with_windows = {
+        let mut cur = state.settings_cache.write();
+        let recent = cur.recent_projects.clone();
+        let current = cur.current_project.clone();
+        let mut s = settings;
+        s.recent_projects = recent;
+        s.current_project = current;
+        state.settings.save(&s)?;
+        let loaded = state.settings.load();
+        let autostart = loaded.start_with_windows;
+        *cur = loaded;
+        autostart
+    };
+    // Nhả lock settings_cache trước khi gọi reg.exe để không chặn các command khác.
+    if let Err(e) = settings::apply_windows_autostart(start_with_windows) {
+        log_info_app(&format!("Cảnh báo cập nhật autostart Windows: {e}"));
+    }
     Ok(true)
 }
 
@@ -2492,6 +2517,12 @@ pub async fn install_app_update(
             AppError::new("UPDATE_INSTALL_FAIL", format!("Cài bản cập nhật thất bại: {e}"))
         })?;
 
+    if state.running.load(Ordering::SeqCst) {
+        return Err(AppError::new(
+            "RUN_IN_PROGRESS",
+            "Pipeline vừa bắt đầu chạy trong lúc tải bản cập nhật — hãy dừng (STOP) rồi khởi động lại app.",
+        ));
+    }
     log_info_app("Đã cài bản cập nhật — khởi động lại ứng dụng");
     // Dừng engine trước khi thoát để không để lại Edge mồ côi giữ profile.
     crate::muse_sidecar::stop_for_quit();
@@ -2737,6 +2768,7 @@ pub fn get_run_detail_at(p: &Path, run_id: i64) -> AppResult<(RunSummary, Vec<Ro
                 image_file: r.get(5)?,
                 video_file: r.get(6)?,
                 prompt_modified: false,
+                ref_exists: true,
                 noi_canh: false,
             })
         }) {
