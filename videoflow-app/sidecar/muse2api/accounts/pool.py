@@ -14,7 +14,7 @@ import itertools
 import logging
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from typing import Protocol
 
@@ -133,15 +133,20 @@ class AccountPool:
         max_concurrency: int = 1,
         cooldown: float = 120.0,
         acquire_timeout: float = 60.0,
+        is_blocked_cb: Callable[[str], bool] | None = None,
     ) -> None:
         self.store = store
         self.strategy: Strategy = STRATEGIES[strategy]()
         self.max_concurrency = max(1, max_concurrency)
         self.cooldown = cooldown
         self.acquire_timeout = acquire_timeout
+        self.is_blocked_cb = is_blocked_cb
         self._accounts: dict[str, Account] = {}
         self._inflight: dict[str, int] = defaultdict(int)
         self._cond = asyncio.Condition()
+
+    def is_inflight(self, account_id: str) -> bool:
+        return self._inflight.get(account_id, 0) > 0
 
     # ---- lifecycle / CRUD ----
     async def load(self) -> None:
@@ -198,14 +203,15 @@ class AccountPool:
             and a.enabled
             and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)
             and not a.quota_exhausted(now)
+            and not (self.is_blocked_cb and self.is_blocked_cb(a.id))
         ]
         blocked = {a.id for a in usable if _kind_blocked_until(a, kind) > now}
         return set() if len(blocked) == len(usable) else blocked
 
     def _candidates(
         self, exclude: Iterable[str], kind: str | None = None
-    ) -> tuple[list[Account], bool, float | None, int]:
-        """Returns ``(free, busy, cooling_back_at, quota_blocked_count)``.
+    ) -> tuple[list[Account], bool, float | None, int, int]:
+        """Returns ``(free, busy, cooling_back_at, quota_blocked_count, interactive_blocked_count)``.
 
         Quota-blocked accounts are counted separately and deliberately **not** folded into
         ``cooling_back_at``: their ``cooldown_until`` stays 0.0 (they were never cooled
@@ -217,11 +223,15 @@ class AccountPool:
         excluded = set(exclude) | self._kind_blocked(kind, now, exclude)
         free, busy, back_at = [], False, None
         quota_blocked = 0
+        interactive_blocked = 0
         for acc in self._accounts.values():
             if acc.id in excluded or not acc.enabled or acc.status in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
                 continue
             if acc.quota_exhausted(now):
                 quota_blocked += 1
+                continue
+            if self.is_blocked_cb and self.is_blocked_cb(acc.id):
+                interactive_blocked += 1
                 continue
             if not acc.is_available(now):  # cooling down
                 back_at = acc.cooldown_until if back_at is None else min(back_at, acc.cooldown_until)
@@ -230,7 +240,7 @@ class AccountPool:
                 busy = True
                 continue
             free.append(acc)
-        return free, busy, back_at, quota_blocked
+        return free, busy, back_at, quota_blocked, interactive_blocked
 
     def has_alternative(self, exclude: Iterable[str], kind: str | None = None) -> bool:
         """Whether an enabled, valid, not-quota-exhausted account exists outside ``exclude``
@@ -247,6 +257,7 @@ class AccountPool:
             and a.enabled
             and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)
             and not a.quota_exhausted(now)
+            and not (self.is_blocked_cb and self.is_blocked_cb(a.id))
             for a in self._accounts.values()
         )
 
@@ -257,7 +268,7 @@ class AccountPool:
         deadline = time.monotonic() + self.acquire_timeout
         async with self._cond:
             while True:
-                free, busy, back_at, quota_blocked = self._candidates(exclude, kind)
+                free, busy, back_at, quota_blocked, interactive_blocked = self._candidates(exclude, kind)
                 if free:
                     acc = self.strategy.choose(free, hint)
                     self._inflight[acc.id] += 1
@@ -266,6 +277,8 @@ class AccountPool:
                 remaining = deadline - time.monotonic()
                 back_in = None if back_at is None else back_at - time.time()
                 if not busy and back_in is None:
+                    if interactive_blocked:
+                        raise NoAccountAvailable("all accounts are busy in interactive browser session")
                     raise NoAccountAvailable(
                         "all accounts are out of quota"
                         if quota_blocked

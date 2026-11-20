@@ -317,6 +317,7 @@ class BrowserDriver(MuseDriver):
         self._warming: dict[str, asyncio.Task] = {}
         self._recovery_lock = asyncio.Lock()
         self._coordinator_ready = False
+        self._closed = False
 
         # Multi-driver registry per account (when self.account is None)
         self._account_drivers: dict[str, BrowserDriver] = {}
@@ -427,7 +428,7 @@ class BrowserDriver(MuseDriver):
 
     async def _recover_browser(self) -> None:
         async with self._recovery_lock:
-            if self.browser_alive:
+            if self._closed or self.browser_alive:
                 return
             log.warning("CDP disconnect detected on driver (account=%s); recovering browser and restarting Chromium...",
                         self.account_id or "default")
@@ -495,6 +496,7 @@ class BrowserDriver(MuseDriver):
                  self.account_id or "default", self.profile_dir, mask_proxy(self.proxy), self.port)
 
     async def shutdown(self) -> None:
+        self._closed = True
         try:
             if self.account is None:
                 prewarms = list(self._prewarm_tasks.values())
@@ -1141,17 +1143,24 @@ class BrowserDriver(MuseDriver):
 
     def prewarm(self, account: Account) -> None:
         """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
-        if self.settings.warm_threads <= 0:
+        if self._closed or self.settings.warm_threads <= 0:
             return
         if self.account is None:
             existing = self._prewarm_tasks.get(account.id)
             if existing and not existing.done():
                 return
             async def _kick() -> None:
+                if self._closed:
+                    return
                 drv = await self._ensure_account_driver(account)
+                if drv._closed:
+                    return
                 if not drv.browser_alive:
-                    await drv.startup()
-                drv.prewarm(account)
+                    async with drv._recovery_lock:
+                        if not drv._closed and not drv.browser_alive:
+                            await drv.startup()
+                if not drv._closed:
+                    drv.prewarm(account)
             self._prewarm_tasks[account.id] = asyncio.create_task(_kick())
             return
         if self._browser is None:

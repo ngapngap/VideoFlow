@@ -50,6 +50,9 @@ class Services:
                                        (task.error or {}).get("message"),
                                        record.get("account_id") if record else None)
 
+        interactive = InteractiveBrowserManager(settings, pool, driver)
+        pool.is_blocked_cb = interactive.is_session_active
+
         return cls(
             settings=settings,
             driver=driver,
@@ -60,5 +63,5 @@ class Services:
             matting=Matting(settings.matting_model),
             keys=KeyStore(settings.keys_file),
             requests=requests,
-            interactive=InteractiveBrowserManager(settings, pool, driver),
+            interactive=interactive,
         )

@@ -259,6 +259,10 @@ async def account_quota(account_id: str, refresh: bool = False,
     implement ``MuseDriver.quota`` raise ``FeatureNotImplemented`` (HTTP 501).
     """
     acc = _get(svc, account_id)
+    if svc.interactive and svc.interactive.is_session_active(account_id):
+        raise AccountBusy(f"account '{account_id}' is busy in an interactive browser session")
+    if hasattr(svc.pool, "is_inflight") and svc.pool.is_inflight(account_id):
+        raise AccountBusy(f"account '{account_id}' is currently serving a request")
     if refresh and (forget := getattr(svc.driver, "forget_quota", None)):
         forget(acc.id)
     snapshot = await svc.driver.quota(acc)

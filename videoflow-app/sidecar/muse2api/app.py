@@ -82,6 +82,8 @@ def create_app(settings: Settings | None = None, driver: MuseDriver | None = Non
                     with contextlib.suppress(asyncio.CancelledError):
                         await bg
             await services.tasks.shutdown()
+            if services.interactive is not None:
+                await services.interactive.shutdown()
             await services.driver.shutdown()
             await services.keys.flush()
             await services.requests.close()

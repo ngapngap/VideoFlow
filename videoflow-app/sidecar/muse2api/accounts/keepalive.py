@@ -24,6 +24,8 @@ async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) 
     acc = pool.get(account_id)
     if acc is None:
         return {"ok": False, "error": "not found"}
+    if pool.is_blocked_cb and pool.is_blocked_cb(account_id):
+        return {"ok": False, "error": "account is busy in an interactive browser session"}
     try:
         info = await driver.renew_session(acc)
     except FeatureNotImplemented as exc:
@@ -53,7 +55,9 @@ async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float)
     while True:
         await asyncio.sleep(interval)
         for acc in pool.all():
-            if not acc.enabled or acc.status in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED):
+            if not acc.enabled or acc.status == AccountStatus.INVALID:
+                continue
+            if pool.is_blocked_cb and pool.is_blocked_cb(acc.id):
                 continue
             try:
                 result = await renew_account(pool, driver, acc.id)
