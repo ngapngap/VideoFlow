@@ -307,9 +307,9 @@ async def test_admin_api_account_proxy_save_and_update(tmp_path: Path):
         assert resp.status_code == 200, resp.text
         data = resp.json()["account"]
         acc_id = data["id"]
-        assert data["proxy"] == "http://user:pass@192.168.1.50:8080"
+        assert data["proxy"] == "http://***@192.168.1.50:8080"
 
-        # Verify persisted in accounts.json
+        # Verify persisted unmasked in accounts.json
         loaded = await store.load()
         matched = next(a for a in loaded if a.id == acc_id)
         assert matched.proxy == "http://user:pass@192.168.1.50:8080"
@@ -441,4 +441,23 @@ def test_forget_quota_evicts_cache_in_sub_driver(tmp_path: Path):
     # Must be evicted from BOTH root driver and sub-driver
     assert acc.id not in root_driver._quota_cache
     assert acc.id not in sub_drv._quota_cache
+
+
+def test_account_public_masks_proxy_credentials_and_strips_auth_tokens():
+    acc = Account(
+        id="acc_sec",
+        proxy="http://myuser:supersecret@198.51.100.7:8080",
+        meta={
+            "quota": {"plan": "Pro", "weekly_used_pct": 12},
+            "auth_headers": {"Authorization": "Bearer secret-jwt"},
+            "auth_tokens": {"jwt": "secret-token"},
+        },
+    )
+    pub = acc.public()
+    assert pub["proxy"] == "http://***@198.51.100.7:8080"
+    assert "supersecret" not in str(pub)
+    assert "auth_headers" not in pub["meta"]
+    assert "auth_tokens" not in pub["meta"]
+    assert pub["meta"]["quota"]["plan"] == "Pro"
+
 

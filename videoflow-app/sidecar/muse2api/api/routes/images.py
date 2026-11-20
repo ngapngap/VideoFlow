@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from ...core.media import load_image_ref
+from ...core.media import _MAX_FETCH_BYTES, load_image_ref
 from ...core.models import resolve_model
 from ...drivers.base import ImageRequest, InputImage, MediaResult
 from ...errors import InvalidRequest, NotFound
@@ -126,7 +126,10 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
         mime = f.content_type or ""
         if not mime.startswith("image/"):
             mime = mimetypes.guess_type(f.filename or "")[0] or "image/png"
-        refs.append(InputImage(data=await f.read(), mime=mime))
+        raw = await f.read(_MAX_FETCH_BYTES + 1)
+        if len(raw) > _MAX_FETCH_BYTES:
+            raise InvalidRequest("uploaded image exceeds 20 MiB")
+        refs.append(InputImage(data=raw, mime=mime))
     return await _generate(body, refs, request, svc)
 
 

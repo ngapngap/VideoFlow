@@ -110,7 +110,8 @@ async def _assert_public_host(hostname: str) -> None:
         if ip.version == 6 and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
         if (
-            ip.is_private
+            not ip.is_global
+            or ip.is_private
             or ip.is_loopback
             or ip.is_link_local
             or ip.is_multicast
@@ -124,25 +125,30 @@ async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
     """Fetch an image URL with manual redirect validation and a size cap."""
     url = _assert_public_url(url)
     await _assert_public_host(urllib.parse.urlparse(url).hostname or "")
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        for _ in range(_MAX_REDIRECTS + 1):
-            async with client.stream("GET", url) as resp:
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("location")
-                    if not location:
-                        raise InvalidRequest("image_url redirect missing location")
-                    url = _assert_public_url(urllib.parse.urljoin(url, location))
-                    await _assert_public_host(urllib.parse.urlparse(url).hostname or "")
-                    continue
-                resp.raise_for_status()
-                mime = resp.headers.get("content-type", "image/png").split(";")[0]
-                body = bytearray()
-                async for chunk in resp.aiter_bytes(65536):
-                    body.extend(chunk)
-                    if len(body) > _MAX_FETCH_BYTES:
-                        raise InvalidRequest("image_url response exceeds 20 MiB")
-                return bytes(body), mime
-        raise InvalidRequest("image_url exceeded redirect limit")
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            for _ in range(_MAX_REDIRECTS + 1):
+                async with client.stream("GET", url) as resp:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("location")
+                        if not location:
+                            raise InvalidRequest("image_url redirect missing location")
+                        url = _assert_public_url(urllib.parse.urljoin(url, location))
+                        await _assert_public_host(urllib.parse.urlparse(url).hostname or "")
+                        continue
+                    resp.raise_for_status()
+                    mime = resp.headers.get("content-type", "image/png").split(";")[0]
+                    body = bytearray()
+                    async for chunk in resp.aiter_bytes(65536):
+                        body.extend(chunk)
+                        if len(body) > _MAX_FETCH_BYTES:
+                            raise InvalidRequest("image_url response exceeds 20 MiB")
+                    return bytes(body), mime
+            raise InvalidRequest("image_url exceeded redirect limit")
+    except httpx.HTTPError as exc:
+        raise InvalidRequest(f"failed to fetch image_url: {exc}") from exc
 
 
 async def load_image_ref(ref: str, *, timeout: float = 20.0) -> tuple[bytes, str]:
@@ -152,12 +158,18 @@ async def load_image_ref(ref: str, *, timeout: float = 20.0) -> tuple[bytes, str
         header, _, payload = ref.partition(",")
         mime = header[5:].split(";")[0] or "image/png"
         try:
-            return base64.b64decode(payload), mime
+            raw = base64.b64decode(payload)
         except ValueError as exc:
             raise InvalidRequest("invalid base64 image data") from exc
+        if len(raw) > _MAX_FETCH_BYTES:
+            raise InvalidRequest("image exceeds 20 MiB")
+        return raw, mime
     if ref.startswith(("http://", "https://")):
         return await _fetch_public_image(ref, timeout=timeout)
     try:
-        return base64.b64decode(ref, validate=True), "image/png"
+        raw = base64.b64decode(ref, validate=True)
     except ValueError as exc:
         raise InvalidRequest("image must be a data URL, http(s) URL or base64 string") from exc
+    if len(raw) > _MAX_FETCH_BYTES:
+        raise InvalidRequest("image exceeds 20 MiB")
+    return raw, "image/png"

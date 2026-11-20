@@ -11,6 +11,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   frontend:
     name: Frontend (svelte-check + build)
@@ -23,7 +26,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: videoflow-app/package-lock.json
 
@@ -105,26 +108,31 @@ jobs:
           $env:MUSE2API_HEADLESS = "true"
           $env:MUSE2API_CHROMIUM_PATH = $browser
           $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
-          $ok = $false
-          foreach ($i in 1..150) {
-            Start-Sleep -Milliseconds 500
-            if ($p.HasExited) {
-              $err = Get-Content "$env:TEMP\m2a-ci-browser\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
-              $ce = Get-Content "$env:TEMP\m2a-ci-browser\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
-              throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
+          try {
+            $ok = $false
+            foreach ($i in 1..150) {
+              Start-Sleep -Milliseconds 500
+              if ($p.HasExited) {
+                $err = Get-Content "$env:TEMP\m2a-ci-browser\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
+                $ce = Get-Content "$env:TEMP\m2a-ci-browser\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
+                throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
+              }
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:18703/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch { }
             }
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18703/healthz" -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch { }
+            if (-not $ok) { throw "engine browser driver không lên được trong 75s" }
+            $h = @{ Authorization = "Bearer bkey" }
+            $st = Invoke-RestMethod -Uri "http://127.0.0.1:18703/admin/status" -Headers $h
+            if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
+            if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
+            Write-Host "browser driver OK: tabs=$($st.driver.tabs) busy=$($st.driver.busy_tabs)"
+          } finally {
+            if ($p -and -not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
           }
-          if (-not $ok) { throw "engine browser driver không lên được trong 75s" }
-          $h = @{ Authorization = "Bearer bkey" }
-          $st = Invoke-RestMethod -Uri "http://127.0.0.1:18703/admin/status" -Headers $h
-          if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
-          if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
-          Write-Host "browser driver OK: tabs=$($st.driver.tabs) busy=$($st.driver.busy_tabs)"
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 
   sidecar:
     name: Sidecar (python syntax + mock API smoke)
@@ -161,30 +169,34 @@ jobs:
           $env:MUSE2API_DATA_DIR = "$env:TEMP\m2a-ci"
           $env:MUSE2API_API_KEY = "cikey"
           $env:MUSE2API_ADMIN_KEY = "cikey"
-          Start-Process -FilePath python -ArgumentList "-m", "muse2api" -NoNewWindow
-          $ok = $false
-          foreach ($i in 1..40) {
-            Start-Sleep -Milliseconds 500
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18699/healthz" -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch { }
-          }
-          if (-not $ok) { throw "sidecar /healthz không sẵn sàng" }
-
-          $h = @{ Authorization = "Bearer cikey" }
-          $status = Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/status" -Headers $h
-          if ($status.driver.driver -ne "mock") { throw "driver sai: $($status.driver.driver)" }
-
-          # Fix 3: chặn import trùng session
-          $body = '{"label":"a1","cookies":{"hatch_sess":"dup123","hatch_native_auth_device":"dev1"}}'
-          $null = Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/accounts" -Method Post `
-            -Headers $h -ContentType "application/json" -Body $body
-          $dupFailed = $false
+          $p = Start-Process -FilePath python -ArgumentList "-m", "muse2api" -PassThru -NoNewWindow
           try {
-            Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/accounts" -Method Post `
-              -Headers $h -ContentType "application/json" -Body $body
-          } catch { $dupFailed = $true }
-          if (-not $dupFailed) { throw "cookie trùng session KHÔNG bị chặn" }
+            $ok = $false
+            foreach ($i in 1..40) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:18699/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) { throw "sidecar /healthz không sẵn sàng" }
 
-          Stop-Process -Name python -Force -ErrorAction SilentlyContinue
+            $h = @{ Authorization = "Bearer cikey" }
+            $status = Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/status" -Headers $h
+            if ($status.driver.driver -ne "mock") { throw "driver sai: $($status.driver.driver)" }
+
+            # Fix 3: chặn import trùng session
+            $body = '{"label":"a1","cookies":{"hatch_sess":"dup123","hatch_native_auth_device":"dev1"}}'
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/accounts" -Method Post `
+              -Headers $h -ContentType "application/json" -Body $body
+            $dupFailed = $false
+            try {
+              Invoke-RestMethod -Uri "http://127.0.0.1:18699/admin/accounts" -Method Post `
+                -Headers $h -ContentType "application/json" -Body $body
+            } catch { $dupFailed = $true }
+            if (-not $dupFailed) { throw "cookie trùng session KHÔNG bị chặn" }
+          } finally {
+            if ($p -and -not $p.HasExited) {
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
+          }

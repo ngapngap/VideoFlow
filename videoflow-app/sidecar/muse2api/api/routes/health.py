@@ -17,4 +17,9 @@ async def readyz(svc: Services = Depends(get_services)) -> dict:
     driver = await svc.driver.health()
     pool = svc.pool.stats()
     ready = driver.get("ok", False) and (pool["available"] > 0 or not svc.driver.requires_account)
-    return {"ready": ready, "driver": driver, "accounts": pool}
+    safe_driver = {
+        "ok": bool(driver.get("ok", False)),
+        "driver": driver.get("driver"),
+        "browser_alive": bool(driver.get("browser_alive", driver.get("ok", False))),
+    }
+    return {"ready": ready, "driver": safe_driver, "accounts": pool}

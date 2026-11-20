@@ -15,7 +15,7 @@ permissions:
 
 # Hai tag liên tiếp không được publish song song (latest.json sẽ là của job xong sau).
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-windows
   cancel-in-progress: false
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: videoflow-app/package-lock.json
 
@@ -87,12 +87,13 @@ jobs:
       - name: Resolve version
         id: ver
         shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             V="${GITHUB_REF#refs/tags/v}"
           else
-            V="${{ github.event.inputs.version }}"
-            V="${V#v}"
+            V="${INPUT_VERSION#v}"
           fi
           if [ -z "$V" ]; then echo "::error::Thiếu version"; exit 1; fi
           # Bắt tag sai định dạng TRƯỚC khi ghi vào Cargo.toml/tauri.conf.json.
@@ -122,9 +123,23 @@ jobs:
           $cj.version = $v
           $cj | ConvertTo-Json -Depth 20 | Set-Content $conf -Encoding utf8
 
+          $pyInit = "videoflow-app/sidecar/muse2api/__init__.py"
+          if (Test-Path $pyInit) {
+            $pi = Get-Content $pyInit -Raw
+            $pi = [regex]::Replace($pi, '(?m)^__version__\s*=\s*"[^"]+"', "__version__ = `"$v`"", 1)
+            Set-Content $pyInit $pi -Encoding utf8
+          }
+
+          $pyProj = "videoflow-app/sidecar/pyproject.toml"
+          if (Test-Path $pyProj) {
+            $pp = Get-Content $pyProj -Raw
+            $pp = [regex]::Replace($pp, '(?m)^version\s*=\s*"[^"]+"', "version = `"$v`"", 1)
+            Set-Content $pyProj $pp -Encoding utf8
+          }
+
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
           cache-dependency-path: videoflow-app/package-lock.json
 
@@ -286,6 +301,15 @@ jobs:
       - name: Install frontend deps
         working-directory: videoflow-app
         run: npm ci
+
+      - name: Verify updater signing key secret
+        shell: pwsh
+        env:
+          SIGN_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGN_KEY)) {
+            throw "Thiếu GitHub Secret TAURI_SIGNING_PRIVATE_KEY — bản phát hành bắt buộc phải ký updater (.sig)."
+          }
 
       - name: Build & publish (NSIS + updater artifacts + latest.json)
         uses: tauri-apps/tauri-action@v0

@@ -33,6 +33,7 @@ pub struct AppState {
     pub settings_cache: parking_lot::RwLock<Settings>,
     pub project: parking_lot::RwLock<Option<PathBuf>>,
     pub last_probed_dir: parking_lot::RwLock<Option<PathBuf>>,
+    pub approved_export_paths: parking_lot::RwLock<HashSet<String>>,
     pub running: AtomicBool,
     pub exit_requested: AtomicBool,
     pub active_run_id: AtomicI64,
@@ -49,6 +50,7 @@ impl Default for AppState {
             settings_cache: parking_lot::RwLock::new(cache),
             project: parking_lot::RwLock::new(None),
             last_probed_dir: parking_lot::RwLock::new(None),
+            approved_export_paths: parking_lot::RwLock::new(HashSet::new()),
             running: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
             active_run_id: AtomicI64::new(0),
@@ -2828,13 +2830,66 @@ pub fn get_run_detail(
     get_run_detail_at(&p, run_id)
 }
 
+fn validate_export_save_path(
+    state: &AppState,
+    project_dir: &Path,
+    save_path: &str,
+    allowed_exts: &[&str],
+) -> AppResult<()> {
+    let trimmed = save_path.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new("EMPTY_PATH", "Đường dẫn lưu file trống."));
+    }
+    let key = normalize_win_path_key(trimmed);
+    if state.approved_export_paths.read().contains(&key) {
+        return Ok(());
+    }
+    let pb = PathBuf::from(trimmed);
+    let ext_ok = pb
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| allowed_exts.iter().any(|a| ext.eq_ignore_ascii_case(a)));
+    if !ext_ok {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            format!(
+                "Đuôi file xuất không hợp lệ (chỉ hỗ trợ {}).",
+                allowed_exts.join(", ")
+            ),
+        ));
+    }
+    if pb
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Đường dẫn xuất file không được chứa '..'.",
+        ));
+    }
+    if let (Ok(proj_canon), Some(parent)) = (std::fs::canonicalize(project_dir), pb.parent()) {
+        if let Ok(parent_canon) = std::fs::canonicalize(parent) {
+            if parent_canon.starts_with(&proj_canon) {
+                return Ok(());
+            }
+        }
+    }
+    Err(AppError::new(
+        "FORBIDDEN_EXPORT_PATH",
+        "Đường dẫn lưu file chưa được chọn qua hộp thoại hệ thống hoặc nằm ngoài thư mục dự án.",
+    ))
+}
+
 #[tauri::command]
-pub async fn pick_save_csv(app: AppHandle) -> AppResult<Option<String>> {
+pub async fn pick_save_csv(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<String>> {
     let default_name = format!(
         "videoflow_history_{}.csv",
         chrono::Local::now().format("%Y%m%d_%H%M%S")
     );
-    tauri::async_runtime::spawn_blocking(move || {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         app.dialog()
             .file()
@@ -2857,16 +2912,26 @@ pub async fn pick_save_csv(app: AppHandle) -> AppResult<Option<String>> {
         rx.recv().ok().flatten()
     })
     .await
-    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?;
+    if let Some(ref p) = picked {
+        state
+            .approved_export_paths
+            .write()
+            .insert(normalize_win_path_key(p));
+    }
+    Ok(picked)
 }
 
 #[tauri::command]
-pub async fn pick_save_log(app: AppHandle) -> AppResult<Option<String>> {
+pub async fn pick_save_log(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<String>> {
     let default_name = format!(
         "videoflow_logs_{}.log",
         chrono::Local::now().format("%Y%m%d_%H%M%S")
     );
-    tauri::async_runtime::spawn_blocking(move || {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         app.dialog()
             .file()
@@ -2890,7 +2955,14 @@ pub async fn pick_save_log(app: AppHandle) -> AppResult<Option<String>> {
         rx.recv().ok().flatten()
     })
     .await
-    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?;
+    if let Some(ref p) = picked {
+        state
+            .approved_export_paths
+            .write()
+            .insert(normalize_win_path_key(p));
+    }
+    Ok(picked)
 }
 
 pub fn export_history_csv_at(
@@ -2990,6 +3062,7 @@ pub fn export_history_csv(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let p = project_path(&state)?;
+    validate_export_save_path(&state, &p, &save_path, &["csv"])?;
     export_history_csv_at(&p, filter, &save_path)
 }
 
@@ -3078,6 +3151,7 @@ pub fn export_logs_txt(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let p = project_path(&state)?;
+    validate_export_save_path(&state, &p, &save_path, &["log", "txt"])?;
     let items = query_logs_at(&p, run_id, level.as_deref(), 5000)?;
     let mut text = String::from("\u{FEFF}# VideoFlow Desktop — Nhật ký kỹ thuật\r\n");
     for item in items.iter().rev() {

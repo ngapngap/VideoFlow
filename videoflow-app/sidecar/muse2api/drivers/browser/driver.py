@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ...accounts.model import Account
+from ...accounts.model import Account, mask_proxy_url
 from ...config import Settings
 from ...core.prompt import followup_text
 from ...errors import (
@@ -550,7 +550,7 @@ class BrowserDriver(MuseDriver):
                 "busy_tabs": busy + sum(t.busy for ts in self._tabs.values() for t in ts),
                 "account_drivers": len(self._account_drivers),
                 "active_account_id": active_acc,
-                "active_proxy": active_prx,
+                "active_proxy": mask_proxy_url(active_prx),
             }
         ok = self.browser_alive or getattr(self, "_coordinator_ready", False)
         tabs = [t for ts in self._tabs.values() for t in ts]
@@ -561,7 +561,7 @@ class BrowserDriver(MuseDriver):
             "tabs": len(tabs),
             "busy_tabs": sum(t.busy for t in tabs),
             "active_account_id": self.account_id if any(t.busy for t in tabs) else None,
-            "active_proxy": self.proxy if any(t.busy for t in tabs) else None,
+            "active_proxy": mask_proxy_url(self.proxy) if any(t.busy for t in tabs) else None,
         }
 
     def is_account_busy(self, account_id: str) -> bool:

@@ -489,7 +489,10 @@ impl EngineErrorHint for AppError {
                 }
             }
         }
-        AppError::new(&self.code, parts.join(" — "))
+        AppError::new(
+            &self.code,
+            crate::settings::redact_secrets(&parts.join(" — ")),
+        )
     }
 }
 

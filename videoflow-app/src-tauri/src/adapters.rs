@@ -119,7 +119,13 @@ fn client_for_url(timeout_s: u64, url: &str) -> reqwest::blocking::Client {
     if no_proxy {
         builder = builder.no_proxy();
     }
-    let built = builder.build().expect("build http client");
+    let built = builder.build().unwrap_or_else(|_| {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(key.0))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    });
     map.insert(key, built.clone());
     built
 }
@@ -188,6 +194,7 @@ impl ApiFail {
                     .and_then(|m| m.as_str().map(|s| s.to_string()).or_else(|| Some(m.to_string())))
             })
             .unwrap_or_else(|| body.chars().take(300).collect::<String>().trim().to_string());
+        let msg = crate::settings::redact_secrets(&msg);
 
         let err_code_json = parsed
             .as_ref()
@@ -306,7 +313,7 @@ impl ApiFail {
             kind: ApiFailKind::TamThoi { retry_after_s: None },
             http_status: None,
             code: "NETWORK".into(),
-            message: format!("Lỗi mạng: {e}"),
+            message: crate::settings::redact_secrets(&format!("Lỗi mạng: {e}")),
         }
     }
 

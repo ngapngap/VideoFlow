@@ -149,7 +149,6 @@ class ChromiumProcess:
         args = [
             self.executable,
             f"--remote-debugging-port={self.port}",
-            "--remote-allow-origins=*",
             f"--user-data-dir={self.profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",

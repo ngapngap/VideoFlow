@@ -17,7 +17,7 @@ from fastapi.responses import Response
 
 from ... import __version__
 from ...accounts.keepalive import renew_account
-from ...accounts.model import Account, AccountStatus
+from ...accounts.model import Account, AccountStatus, mask_proxy_url
 from ...auth.keys import ApiKey
 from ...drivers.browser.driver import AccountBusy
 from ...errors import InvalidRequest, Muse2APIError, NotFound
@@ -190,7 +190,11 @@ async def update_account(account_id: str, body: AccountUpdate,
             acc.cookie_expires = {}
         acc.cookie_expires.update(body.cookie_expires)
     if body.proxy is not None:
-        acc.proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
+        new_proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
+        if new_proxy is not None and acc.proxy and new_proxy == mask_proxy_url(acc.proxy):
+            pass  # keep existing unmasked proxy when client echoes back masked value
+        else:
+            acc.proxy = new_proxy
     await svc.pool.upsert(acc)
     driver = getattr(svc, "driver", None)
     if body.cookies is not None and driver is not None and hasattr(driver, "mark_account_stale"):

@@ -84,10 +84,29 @@ class Account(BaseModel):
         return True
 
     def public(self) -> dict[str, Any]:
-        """Serialisable view with cookie values masked."""
+        """Serialisable view with cookie values, proxy credentials and internal auth tokens masked."""
         data = self.model_dump(mode="json")
         data["cookies"] = {k: _mask(v) for k, v in self.cookies.items()}
+        data["proxy"] = mask_proxy_url(self.proxy)
+        if isinstance(data.get("meta"), dict):
+            meta_copy = dict(data["meta"])
+            meta_copy.pop("auth_headers", None)
+            meta_copy.pop("auth_tokens", None)
+            data["meta"] = meta_copy
         return data
+
+
+_PROXY_CREDS_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]+@")
+
+
+def mask_proxy_url(proxy: str | None) -> str | None:
+    """Redact user:pass@ credentials from a proxy URL while keeping host:port intact."""
+    if proxy is None:
+        return None
+    raw = proxy.strip()
+    if not raw:
+        return None
+    return _PROXY_CREDS_RE.sub(r"\1***@", raw)
 
 
 def _mask(value: str) -> str:

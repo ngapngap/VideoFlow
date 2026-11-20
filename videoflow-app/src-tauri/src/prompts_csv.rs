@@ -157,6 +157,30 @@ pub fn validate_row_key(key: &str, row_no: Option<usize>) -> AppResult<()> {
     Ok(())
 }
 
+/// Kiểm tra tên file sản phẩm (cột D `anh_da_tao` hoặc cột E `video_da_tao`):
+/// Nếu không trống thì không được chứa ký tự path traversal (`..`, `/`, `\`, `:`, `\0`).
+pub fn validate_safe_filename(name: &str, col_label: &str, row_no: Option<usize>) -> AppResult<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let loc = row_no.map(|n| format!(" ở dòng {n}")).unwrap_or_default();
+    if trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains(':')
+        || trimmed.contains('\0')
+    {
+        return Err(AppError::new(
+            "PROMPTS_INVALID_PATH",
+            format!(
+                "Tên file ở {col_label} không hợp lệ{loc}: '{trimmed}'. Chỉ được chứa tên file đơn (không chứa '..', '/', '\\' hoặc ':')."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Khóa định danh một dòng CSV.
 ///
 /// Trước đây `row_key` **chính là** tên ảnh tham chiếu (cột A), nên thiết kế ngầm giả định
@@ -223,6 +247,8 @@ pub fn validate_rows(rows: &[Row]) -> AppResult<()> {
             continue;
         }
         validate_row_key(&r.anh_tham_chieu, Some(r.row_no))?;
+        validate_safe_filename(&r.anh_da_tao, "cột D (anh_da_tao)", Some(r.row_no))?;
+        validate_safe_filename(&r.video_da_tao, "cột E (video_da_tao)", Some(r.row_no))?;
 
         if r.is_example() {
             continue;
@@ -1094,5 +1120,30 @@ mod tests {
         assert!(!reread[4].noi_canh, "scene5 still false");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reject_path_traversal_on_generated_columns_d_and_e() {
+        let bad_img = Row {
+            row_no: 2,
+            anh_tham_chieu: "cat.png".into(),
+            promt_tao_image: "p1".into(),
+            promt_tao_video: "v1".into(),
+            anh_da_tao: "../secret.png".into(),
+            ..Default::default()
+        };
+        let err_d = validate_rows(&[bad_img]).unwrap_err();
+        assert_eq!(err_d.code, "PROMPTS_INVALID_PATH");
+
+        let bad_vid = Row {
+            row_no: 3,
+            anh_tham_chieu: "cat.png".into(),
+            promt_tao_image: "p1".into(),
+            promt_tao_video: "v1".into(),
+            video_da_tao: r"C:\Windows\system.ini".into(),
+            ..Default::default()
+        };
+        let err_e = validate_rows(&[bad_vid]).unwrap_err();
+        assert_eq!(err_e.code, "PROMPTS_INVALID_PATH");
     }
 }

@@ -746,6 +746,7 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); font-si
   const isQuota = (a) => /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(a.last_error || "");
   function accState(a, t) {
     if (!a.enabled) return {key: "disabled", label: "disabled", cls: "mute", badge: "b-mute"};
+    if (a.status === "video_locked") return {key: "video_locked", label: "video locked", cls: "err", badge: "b-err"};
     if (a.status === "invalid") return {key: "invalid", label: "session error", cls: "err", badge: "b-err"};
     if (a.status === "cooling" && a.cooldown_until > t) {
       return isQuota(a) ? {key: "quota", label: "out of quota", cls: "warn", badge: "b-warn"}
@@ -774,10 +775,10 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); font-si
     const resetStr = resetsAt
       ? (typeof resetsAt === "string" ? esc(resetsAt.slice(0, 10)) : esc(clock(resetsAt)))
       : "—";
-    const agoStr = q.checked_at ? " · " + ago(q.checked_at) : "";
-    const pctStr = pct != null ? ` · ${pct}%` : "";
-    return `<div class="quota-bar" title="Quota${plan ? ": " + plan : ""}${pct != null ? ", " + pct + "% used" : ""}${resetsAt ? ", reset: " + resetStr : ""}">
-      <div class="qrail"><b class="${barCls}" style="width:${barW}%"></b></div>
+    const agoStr = q.checked_at ? " · " + esc(ago(q.checked_at)) : "";
+    const pctStr = pct != null ? ` · ${esc(pct)}%` : "";
+    return `<div class="quota-bar" title="Quota${plan ? ": " + esc(plan) : ""}${pct != null ? ", " + esc(pct) + "% used" : ""}${resetsAt ? ", reset: " + resetStr : ""}">
+      <div class="qrail"><b class="${barCls}" style="width:${esc(barW)}%"></b></div>
       <div class="qmeta"><span>${planStr}${pctStr}</span><span>reset ${resetStr}${agoStr}</span></div>
     </div>`;
   }
@@ -841,15 +842,15 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); font-si
   }
 
   function renderAccounts() {
-    const t = now(), counts = {active: 0, quota: 0, cooling: 0, invalid: 0, disabled: 0};
+    const t = now(), counts = {active: 0, quota: 0, cooling: 0, video_locked: 0, invalid: 0, disabled: 0};
     for (const a of state.accounts) counts[accState(a, t).key] += 1;
     const chip = (k, label, badge) => counts[k] ? `<span class="badge ${badge}">${label} <b>${counts[k]}</b></span>` : "";
     $("#acc-summary").innerHTML = state.accounts.length ? [
       chip("active", "Active", "b-ok"), chip("quota", "Out of quota", "b-warn"), chip("cooling", "Cooling down", "b-info"),
-      chip("invalid", "Session error", "b-err"), chip("disabled", "Disabled", "b-mute"),
+      chip("video_locked", "Video locked", "b-err"), chip("invalid", "Session error", "b-err"), chip("disabled", "Disabled", "b-mute"),
     ].join("") : "";
     // Problems first, then by label.
-    const order = {quota: 0, invalid: 1, cooling: 2, active: 3, disabled: 4};
+    const order = {video_locked: 0, quota: 1, invalid: 2, cooling: 3, active: 4, disabled: 5};
     const list = [...state.accounts].sort((a, b) => (order[accState(a, t).key] - order[accState(b, t).key])
       || (a.label || a.id).localeCompare(b.label || b.id));
     $("#accounts").innerHTML = list.map(accountCard).join("")
