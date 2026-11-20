@@ -86,12 +86,15 @@ class RequestLog:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._conn: sqlite3.Connection | None = None
+        self._closed = False
         # One connection shared by worker threads; sqlite3 objects are not thread-safe.
         self._lock = threading.Lock()
         # Outcomes of tasks that finished before their submit row was written.
         self._early: dict[str, tuple] = {}
 
     def _db(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("request log is closed")
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
@@ -120,6 +123,7 @@ class RequestLog:
     async def close(self) -> None:
         def _close() -> None:
             with self._lock:
+                self._closed = True
                 if self._conn is not None:
                     self._conn.close()
                     self._conn = None

@@ -29,17 +29,22 @@ async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) 
     except FeatureNotImplemented as exc:
         return {"ok": False, "error": exc.message}
     except UpstreamAuthError as exc:
+        if pool.get(account_id) is None:
+            return {"ok": False, "error": "account deleted"}
         acc.status = AccountStatus.INVALID
         acc.last_error = exc.message
         await pool.upsert(acc)
         return {"ok": False, "error": exc.message}
 
-    acc.cookies.update(info.cookies)
-    acc.cookie_expires.update(info.cookie_expires)
-    acc.meta.update(info.meta)
-    acc.meta["renewed_at"] = time.time()
-    note_wake(acc, info.meta)
-    await pool.upsert(acc)
+    latest = pool.get(account_id)
+    if latest is None:
+        return {"ok": False, "error": "account deleted"}
+    latest.cookies.update(info.cookies)
+    latest.cookie_expires.update(info.cookie_expires)
+    latest.meta.update(info.meta)
+    latest.meta["renewed_at"] = time.time()
+    note_wake(latest, info.meta)
+    await pool.upsert(latest)
     return {"ok": info.ok, "meta": info.meta}
 
 

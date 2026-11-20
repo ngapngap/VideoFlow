@@ -65,7 +65,8 @@ class Account(BaseModel):
         extra = q.get("extra_left")
         if isinstance(extra, str) and extra.strip() and not _extra_is_zero(extra):
             return False
-        reset_in = _reset_deadline(q.get("resets_at"), now or _now())
+        checked_at = q.get("checked_at") or q.get("fetched_at")
+        reset_in = _reset_deadline(q.get("resets_at"), now or _now(), checked_at=checked_at)
         if reset_in is None:
             return False
         return reset_in > 0
@@ -139,26 +140,65 @@ _RESET_NO_YEAR_FORMATS = (
 )
 
 
-def _reset_deadline(resets_at: Any, now: float) -> float | None:
+_ISO_TIME_TAIL = re.compile(r"T\d{2}:\d{2}.*$")
+_ZH_DATE = re.compile(r"^(?:(\d{4})年)?\s*(\d{1,2})月(\d{1,2})日?$")
+
+
+def _safe_replace_year(dt: datetime, year: int) -> datetime:
+    try:
+        return dt.replace(year=year, hour=23, minute=59, second=59)
+    except ValueError:
+        return dt.replace(year=year, day=28, hour=23, minute=59, second=59)
+
+
+def _reset_deadline(
+    resets_at: Any, now: float, *, checked_at: float | None = None
+) -> float | None:
     """Seconds from ``now`` until the weekly quota resets, or None when unknown.
 
-    muse.ai renders the reset as a human date ("Oct 12, 2025", sometimes a time).
-    Unparseable values return None so callers fall back to "do not block".
+    muse.ai renders the reset as a human date ("Oct 12, 2025", "Sep 30", "11月25日").
+    When ``resets_at`` has no year and ``checked_at`` is provided, anchor the year
+    relative to ``checked_at`` so an expired snapshot stops blocking once its reset
+    date passes. Unparseable values return None so callers fall back to "do not block".
     """
     if not resets_at:
         return None
     if isinstance(resets_at, (int, float)):
         return float(resets_at) - now
     text = str(resets_at).strip()
+    # Chỉ cắt ISO timestamp dạng T12:34:56... (không cắt chữ 'T' trong "Tue" / "UTC").
+    text = _ISO_TIME_TAIL.sub("", text)
     # Bỏ phần giờ/timezone ở cuối: "Oct 12, 2025 at 10:00 (GMT+7)", "Oct 12, 2025 (GMT+7)".
     # Lưu ý KHÔNG cắt ở ", " vì dấu phẩy nằm trong chính định dạng ngày ("Oct 12, 2025").
-    for sep in (" at ", " (", " – ", " - ", "T"):
+    for sep in (" at ", " (", " – ", " - "):
         if sep in text:
             text = text.split(sep, 1)[0]
     text = text.strip().rstrip(",").strip()
     # Còn dạng "Oct 12, 2025, 10:00" → bỏ phần giờ sau dấu phẩy thứ hai.
     if text.count(",") == 2:
         text = text.rsplit(",", 1)[0].strip()
+
+    # Hỗ trợ ngày tiếng Trung: "2026年11月25日" hoặc "11月25日".
+    if zm := _ZH_DATE.match(text):
+        yr_s, mo_s, dy_s = zm.groups()
+        mo, dy = int(mo_s), int(dy_s)
+        if yr_s:
+            try:
+                when = datetime(int(yr_s), mo, dy, 23, 59, 59).timestamp()
+                return when - now
+            except ValueError:
+                return None
+        try:
+            dt = datetime(2024, mo, dy)
+        except ValueError:
+            return None
+        anchor_ts = float(checked_at) if isinstance(checked_at, (int, float)) and checked_at > 0 else now
+        anchor_dt = datetime.fromtimestamp(anchor_ts)
+        cand = _safe_replace_year(dt, anchor_dt.year)
+        if cand.timestamp() < anchor_ts:
+            cand = _safe_replace_year(dt, anchor_dt.year + 1)
+        return cand.timestamp() - now
+
     for fmt in _RESET_FORMATS:
         try:
             when = datetime.strptime(text, fmt).replace(
@@ -167,19 +207,16 @@ def _reset_deadline(resets_at: Any, now: float) -> float | None:
             return when - now
         except ValueError:
             continue
-    now_dt = datetime.fromtimestamp(now)
+
+    anchor_ts = float(checked_at) if isinstance(checked_at, (int, float)) and checked_at > 0 else now
+    anchor_dt = datetime.fromtimestamp(anchor_ts)
     for fmt in _RESET_NO_YEAR_FORMATS:
         try:
-            dt = datetime.strptime(text, fmt)
-            try:
-                cand = dt.replace(year=now_dt.year, hour=23, minute=59, second=59)
-            except ValueError:
-                cand = dt.replace(year=now_dt.year, day=28, hour=23, minute=59, second=59)
-            if cand.timestamp() < now:
-                try:
-                    cand = cand.replace(year=now_dt.year + 1)
-                except ValueError:
-                    cand = cand.replace(year=now_dt.year + 1, day=28)
+            # Parse kèm năm nhuận 2024 để hỗ trợ "Feb 29".
+            dt = datetime.strptime(f"{text} 2024", f"{fmt} %Y")
+            cand = _safe_replace_year(dt, anchor_dt.year)
+            if cand.timestamp() < anchor_ts:
+                cand = _safe_replace_year(dt, anchor_dt.year + 1)
             return cand.timestamp() - now
         except ValueError:
             continue

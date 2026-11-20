@@ -182,14 +182,23 @@ class AccountPool:
         }
 
     # ---- scheduling ----
-    def _kind_blocked(self, kind: str | None, now: float) -> set[str]:
+    def _kind_blocked(
+        self, kind: str | None, now: float, exclude: Iterable[str] = ()
+    ) -> set[str]:
         """Ids of accounts still blocked for ``kind`` (see ``note_wake``). Empty when
         every usable account is blocked: a block must never make the kind unusable
         altogether, so then everyone gets tried again."""
         if kind is None:
             return set()
-        usable = [a for a in self._accounts.values()
-                  if a.enabled and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)]
+        excl = set(exclude)
+        usable = [
+            a
+            for a in self._accounts.values()
+            if a.id not in excl
+            and a.enabled
+            and a.status not in (AccountStatus.INVALID, AccountStatus.VIDEO_LOCKED)
+            and not a.quota_exhausted(now)
+        ]
         blocked = {a.id for a in usable if _kind_blocked_until(a, kind) > now}
         return set() if len(blocked) == len(usable) else blocked
 
@@ -205,7 +214,7 @@ class AccountPool:
         "cooling down" for what was really an exhausted quota.
         """
         now = time.time()
-        excluded = set(exclude) | self._kind_blocked(kind, now)
+        excluded = set(exclude) | self._kind_blocked(kind, now, exclude)
         free, busy, back_at = [], False, None
         quota_blocked = 0
         for acc in self._accounts.values():
@@ -232,7 +241,7 @@ class AccountPool:
         answer 503, turning a fast failure into a 60 s wait.
         """
         now = time.time()
-        excluded = set(exclude) | self._kind_blocked(kind, now)
+        excluded = set(exclude) | self._kind_blocked(kind, now, exclude)
         return any(
             a.id not in excluded
             and a.enabled
@@ -284,7 +293,7 @@ class AccountPool:
         if error is None:
             acc.success_count += 1
             acc.last_error = None
-            if acc.status == AccountStatus.COOLING:
+            if acc.status == AccountStatus.COOLING and time.time() >= acc.cooldown_until:
                 acc.status = AccountStatus.ACTIVE
             return
         acc.fail_count += 1
@@ -322,4 +331,4 @@ class AccountPool:
             lease.error = lease.error or exc
             raise
         finally:
-            await self.release(acc, lease.error)
+            await asyncio.shield(self.release(acc, lease.error))

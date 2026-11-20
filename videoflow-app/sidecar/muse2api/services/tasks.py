@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -70,16 +72,39 @@ class TaskManager:
                 task.error = {"message": "interrupted by server restart", "code": "interrupted"}
             self._tasks[task.id] = task
 
-    def _persist(self) -> None:
-        tasks = sorted(self._tasks.values(), key=lambda t: t.created_at)[-self.max_kept :]
-        self._tasks = {t.id: t for t in tasks}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps([t.model_dump(mode="json") for t in tasks], ensure_ascii=False),
-            encoding="utf-8",
+    def _prune_and_snapshot(self) -> str:
+        active = [t for t in self._tasks.values() if not t.finished]
+        done = sorted(
+            (t for t in self._tasks.values() if t.finished),
+            key=lambda t: t.created_at,
         )
-        tmp.replace(self.path)
+        keep_done = max(0, self.max_kept - len(active))
+        kept = active + (done[-keep_done:] if keep_done > 0 else [])
+        kept.sort(key=lambda t: t.created_at)
+        self._tasks = {t.id: t for t in kept}
+        return json.dumps([t.model_dump(mode="json") for t in kept], ensure_ascii=False)
+
+    def _write_payload(self, payload: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".tasks.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _persist(self) -> None:
+        payload = self._prune_and_snapshot()
+        self._write_payload(payload)
+
+    async def _persist_async(self) -> None:
+        payload = self._prune_and_snapshot()
+        await asyncio.to_thread(self._write_payload, payload)
 
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
@@ -116,7 +141,10 @@ class TaskManager:
         finally:
             task.updated_at = time.time()
             self._running.pop(task.id, None)
-            self._persist()
+            try:
+                await self._persist_async()
+            except Exception:  # noqa: BLE001
+                log.exception("failed to persist task %s", task.id)
             if self.on_finish:
                 try:
                     await self.on_finish(task)

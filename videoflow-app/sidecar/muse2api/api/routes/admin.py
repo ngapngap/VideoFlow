@@ -258,9 +258,12 @@ async def account_quota(account_id: str, refresh: bool = False,
     if refresh and (forget := getattr(svc.driver, "forget_quota", None)):
         forget(acc.id)
     snapshot = await svc.driver.quota(acc)
-    acc.meta["quota"] = {"checked_at": time.time(), **snapshot}
-    await svc.pool.upsert(acc)
-    return {"account_id": acc.id, "quota": acc.meta["quota"]}
+    latest = svc.pool.get(account_id)
+    if latest is None:
+        raise NotFound(f"account '{account_id}' not found")
+    latest.meta["quota"] = {"checked_at": time.time(), **snapshot}
+    await svc.pool.upsert(latest)
+    return {"account_id": latest.id, "quota": latest.meta["quota"]}
 
 
 @router.get("/extension.zip")

@@ -40,7 +40,7 @@ dev = [
 muse2api = "muse2api.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/muse2api"]
+packages = ["muse2api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -50,7 +50,7 @@ asyncio_default_fixture_loop_scope = "function"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-src = ["src", "tests"]
+src = ["muse2api", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]

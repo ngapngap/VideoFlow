@@ -35,13 +35,18 @@ async def _housekeeping(services: Services) -> None:
     last_prune = time.monotonic()
     while True:
         await asyncio.sleep(_FLUSH_INTERVAL)
-        await services.keys.flush()
-        if time.monotonic() - last_prune >= _PRUNE_INTERVAL:
-            last_prune = time.monotonic()
-            await services.requests.prune(services.settings.request_log_retention_days)
-            removed = services.media.prune(services.settings.media_retention_days * 86400)
-            if removed:
-                log.info("media cleanup: removed %d expired file(s)", removed)
+        try:
+            await services.keys.flush()
+            if time.monotonic() - last_prune >= _PRUNE_INTERVAL:
+                last_prune = time.monotonic()
+                await services.requests.prune(services.settings.request_log_retention_days)
+                removed = await asyncio.to_thread(
+                    services.media.prune, services.settings.media_retention_days * 86400
+                )
+                if removed:
+                    log.info("media cleanup: removed %d expired file(s)", removed)
+        except Exception:  # noqa: BLE001
+            log.exception("housekeeping tick failed")
 
 
 def create_app(settings: Settings | None = None, driver: MuseDriver | None = None) -> FastAPI:

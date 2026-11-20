@@ -4,8 +4,27 @@ clients sending newer parameters keep working."""
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_ALLOWED_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+
+
+def _validate_proxy_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    parsed = urlsplit(cleaned)
+    if parsed.scheme.lower() not in _ALLOWED_PROXY_SCHEMES or not parsed.hostname:
+        raise ValueError(
+            "proxy must be a valid URL with scheme http/https/socks4/socks5 and a host"
+        )
+    # Validate port if present (raises ValueError on invalid port)
+    _ = parsed.port
+    return cleaned
 
 
 class _Lenient(BaseModel):
@@ -71,6 +90,11 @@ class AccountCreate(BaseModel):
     enabled: bool = True
     proxy: str | None = None
 
+    @field_validator("proxy")
+    @classmethod
+    def _check_proxy(cls, v: str | None) -> str | None:
+        return _validate_proxy_url(v)
+
 
 class AccountsImportRequest(BaseModel):
     """Bulk cookie import: every entry is validated like AccountCreate; entries that
@@ -84,6 +108,11 @@ class AccountUpdate(BaseModel):
     cookies: dict[str, str] | None = None
     cookie_expires: dict[str, int] | None = None
     proxy: str | None = None
+
+    @field_validator("proxy")
+    @classmethod
+    def _check_proxy(cls, v: str | None) -> str | None:
+        return _validate_proxy_url(v)
 
 
 class KeyCreate(BaseModel):

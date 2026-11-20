@@ -151,8 +151,8 @@ def verify_magic_bytes(data: bytes, kind: str) -> bool:
         # JPEG: FF D8 FF
         if data.startswith(b"\xff\xd8\xff"):
             return True
-        # WebP: 52 49 46 46 (RIFF)
-        if data.startswith(b"RIFF") and (len(data) < 12 or b"WEBP" in data[8:12]):
+        # WebP: 52 49 46 46 (RIFF) + WEBP at offset 8..12
+        if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
             return True
         return False
     elif kind == "video":
@@ -186,20 +186,26 @@ async def verify_and_save_download(data: bytes, kind: str) -> bytes:
     verified_path = temp_dir / f"download_{file_id}.{'mp4' if kind == 'video' else 'verified'}"
 
     try:
-        partial_path.write_bytes(data)
+        await asyncio.to_thread(partial_path.write_bytes, data)
 
-        if partial_path.stat().st_size == 0:
+        if (await asyncio.to_thread(partial_path.stat)).st_size == 0:
             raise UpstreamError(f"downloaded {kind} file on disk is 0 bytes")
 
         if not verify_magic_bytes(data, kind):
             raise UpstreamError(f"file integrity check failed: invalid magic bytes for {kind}")
 
         if kind == "video":
+            proc = None
             try:
+                sub_kwargs: dict[str, Any] = {
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.PIPE,
+                }
+                if os.name == "nt":
+                    sub_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
                 proc = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-v", "error", "-i", str(partial_path), "-f", "null", "-",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    **sub_kwargs,
                 )
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
                 if proc.returncode != 0:
@@ -210,11 +216,16 @@ async def verify_and_save_download(data: bytes, kind: str) -> bytes:
                 if len(data) < 16 or not verify_magic_bytes(data, "video"):
                     raise UpstreamError("video failed fallback integrity check: file too small or invalid magic bytes") from exc
             except asyncio.TimeoutError as exc:
+                if proc is not None and proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
                 raise UpstreamError("FFmpeg decode verification timed out") from exc
 
         # Atomic rename to official verified file
-        partial_path.replace(verified_path)
-        verified_data = verified_path.read_bytes()
+        await asyncio.to_thread(partial_path.replace, verified_path)
+        verified_data = await asyncio.to_thread(verified_path.read_bytes)
         return verified_data
     except Exception:
         if partial_path.is_file():
@@ -302,6 +313,7 @@ class BrowserDriver(MuseDriver):
         # Last quota snapshot per account (see ``quota``) and the lock serialising reads.
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_locks: dict[str, asyncio.Lock] = {}
+        self._video_locks: dict[str, asyncio.Lock] = {}
         self._warming: dict[str, asyncio.Task] = {}
         self._recovery_lock = asyncio.Lock()
         self._coordinator_ready = False
@@ -1241,10 +1253,16 @@ class BrowserDriver(MuseDriver):
     # a minute later, and the failover started the whole generation over.
     _OVERRUN_FACTOR = 2.5
 
-    async def _wait_video_mount(self, tab: _Tab, timeout: float = 6.0) -> bool:
-        """Poll every 100ms up to 6s for <video> to mount src or data-hatch-video-src (P1-2)."""
+    async def _wait_video_mount(
+        self, tab: _Tab, timeout: float = 6.0, existing_urls: set[str] | None = None
+    ) -> bool:
+        """Poll every 100ms up to 6s for a NEW <video> to mount src or data-hatch-video-src (P1-2)."""
         res = await tab.session.evaluate(
-            dom.wait_video_mount(timeout_ms=int(timeout * 1000), interval_ms=100),
+            dom.wait_video_mount(
+                timeout_ms=int(timeout * 1000),
+                interval_ms=100,
+                existing_urls=existing_urls,
+            ),
             await_promise=True,
             timeout=int(timeout + 2),
         )
@@ -1283,7 +1301,7 @@ class BrowserDriver(MuseDriver):
                     for a in new_atts
                 )
                 if unmounted:
-                    await self._wait_video_mount(tab, timeout=6.0)
+                    await self._wait_video_mount(tab, timeout=6.0, existing_urls=existing_urls)
                     st = await self._state(tab)
                     new_atts = st.get("attachments", [])[base_atts:]
 
@@ -1295,19 +1313,17 @@ class BrowserDriver(MuseDriver):
             if fresh:
                 return fresh[-1]
 
-            # P1-4: Detect Muse video lock response
-            # Only conclude when:
-            # 1. kind == "video"
-            # 2. No video was created (not fresh)
-            # 3. Generation is complete (not st.get("generating"))
-            # 4. Text matches video lock indicators
-            if kind == "video" and not st.get("generating") and not fresh:
+            # P1-4: Detect Muse video lock response ONLY on a new assistant reply bubble
+            if (
+                kind == "video"
+                and not st.get("generating")
+                and not fresh
+                and st.get("agentCount", 0) > base_count
+            ):
                 text_low = (st.get("lastText") or "").lower()
-                tail_low = (st.get("tail") or "").lower()
-                combined_text = f"{text_low} {tail_low}"
-                if any(h in combined_text for h in dom.VIDEO_LOCKED_HINTS):
-                    matched_hint = next(h for h in dom.VIDEO_LOCKED_HINTS if h in combined_text)
-                    raw_text = st.get("lastText") or st.get("tail") or matched_hint
+                if any(h in text_low for h in dom.VIDEO_LOCKED_HINTS):
+                    matched_hint = next(h for h in dom.VIDEO_LOCKED_HINTS if h in text_low)
+                    raw_text = st.get("lastText") or matched_hint
                     log.warning(
                         "video locked detected on account %s (matched %r): %.200s",
                         tab.account_id, matched_hint, raw_text,
@@ -1452,8 +1468,9 @@ class BrowserDriver(MuseDriver):
             return await drv.generate_video(account, req)
         prompt = self._media_prompt(req.prompt, "video", req.size, req.duration)
         images = [req.first_frame] if req.first_frame else []
-        return await self._generate(account, prompt, images, "video", req.timeout,
-                                    req.on_progress, req.cancel)
+        async with self._video_locks.setdefault(account.id, asyncio.Lock()):
+            return await self._generate(account, prompt, images, "video", req.timeout,
+                                        req.on_progress, req.cancel)
 
     # ------------------------------------------------------------ session
     async def renew_session(self, account: Account) -> SessionInfo:

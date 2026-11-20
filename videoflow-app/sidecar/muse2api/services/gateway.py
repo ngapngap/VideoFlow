@@ -11,8 +11,24 @@ from ..accounts.model import Account
 from ..accounts.pool import AccountPool, Lease
 from ..drivers.base import ChatRequest, ImageRequest, MediaResult, MuseDriver, VideoRequest
 from ..drivers.browser.cdp import CDPError
-from ..errors import UpstreamError
+from ..errors import (
+    UpstreamAuthError,
+    UpstreamError,
+    UpstreamQuotaError,
+    UpstreamRefused,
+    UpstreamTimeout,
+    UpstreamVideoLocked,
+    UpstreamVmDisabled,
+)
 from .request_log import note_account
+
+_NON_CDP_UPSTREAM = (
+    UpstreamAuthError,
+    UpstreamQuotaError,
+    UpstreamRefused,
+    UpstreamVideoLocked,
+    UpstreamVmDisabled,
+)
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -57,14 +73,19 @@ class Gateway:
                     return
                 except CDPError as exc:
                     log.warning("CDP error during chat on account %s (%s)", lease.account.id, exc)
-                    if not emitted and attempt < self.max_failover:
-                        continue
                     err = UpstreamError(f"browser CDP error: {exc}")
                     err.retryable = True
+                    if not emitted and attempt < self.max_failover:
+                        if self.pool.has_alternative([*tried, lease.account.id]):
+                            lease.fail(err)
+                            tried.append(lease.account.id)
+                        else:
+                            lease.fail(UpstreamTimeout(str(exc)))
+                        continue
                     lease.fail(err)
                     raise err from exc
                 except UpstreamError as exc:
-                    is_cdp = (
+                    is_cdp = not isinstance(exc, _NON_CDP_UPSTREAM) and (
                         isinstance(exc.__cause__, CDPError)
                         or "browser error" in str(exc).lower()
                         or "cdp" in str(exc).lower()
@@ -72,6 +93,11 @@ class Gateway:
                     if is_cdp and not emitted and attempt < self.max_failover:
                         log.warning("CDP UpstreamError during chat on account %s (%s), retrying",
                                     lease.account.id, exc)
+                        if self.pool.has_alternative([*tried, lease.account.id]):
+                            lease.fail(exc)
+                            tried.append(lease.account.id)
+                        else:
+                            lease.fail(UpstreamTimeout(str(exc)))
                         continue
                     lease.fail(exc)
                     tried.append(lease.account.id)
@@ -89,14 +115,19 @@ class Gateway:
                     return await fn(lease.account)
                 except CDPError as exc:
                     log.warning("CDP error on account %s (%s), attempting retry", lease.account.id, exc)
-                    if attempt < self.max_failover:
-                        continue
                     err = UpstreamError(f"browser CDP error: {exc}")
                     err.retryable = True
+                    if attempt < self.max_failover:
+                        if self.pool.has_alternative([*tried, lease.account.id], kind):
+                            lease.fail(err)
+                            tried.append(lease.account.id)
+                        else:
+                            lease.fail(UpstreamTimeout(str(exc)))
+                        continue
                     lease.fail(err)
                     raise err from exc
                 except UpstreamError as exc:
-                    is_cdp = (
+                    is_cdp = not isinstance(exc, _NON_CDP_UPSTREAM) and (
                         isinstance(exc.__cause__, CDPError)
                         or "browser error" in str(exc).lower()
                         or "cdp" in str(exc).lower()
@@ -104,6 +135,11 @@ class Gateway:
                     if is_cdp and attempt < self.max_failover:
                         log.warning("CDP UpstreamError on account %s (%s), attempting retry",
                                     lease.account.id, exc)
+                        if self.pool.has_alternative([*tried, lease.account.id], kind):
+                            lease.fail(exc)
+                            tried.append(lease.account.id)
+                        else:
+                            lease.fail(UpstreamTimeout(str(exc)))
                         continue
                     lease.fail(exc)
                     tried.append(lease.account.id)

@@ -17,13 +17,21 @@ hiddenimports = [
     # Driver lazy-import trong registry.create_driver — PyInstaller không thấy được
     "muse2api.drivers.mock",
     "muse2api.drivers.http",
+    "muse2api.drivers.http.driver",
     "muse2api.drivers.browser.driver",
     "muse2api.drivers.browser.dom",
     "muse2api.drivers.browser.chromium",
     "muse2api.drivers.browser.cdp",
+    "muse2api.drivers.browser.interactive",
+    "muse2api.drivers.browser.proxy_relay",
+    # SOCKS proxy support for httpx
+    "socksio",
+    "httpcore._async.socks_proxy",
+    "httpcore._sync.socks_proxy",
     # uvicorn server
     "uvicorn.logging",
     "uvicorn.loops",
+    "uvicorn.loops.auto",
     "uvicorn.loops.asyncio",
     "uvicorn.protocols",
     "uvicorn.protocols.http",
@@ -35,11 +43,11 @@ hiddenimports = [
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan",
     "uvicorn.lifespan.on",
-    "uvicorn.lifespan.asyncio",
+    "uvicorn.lifespan.off",
     # pydantic v2
     "pydantic_settings",
     "email.mime.multipart",
-    "multipart",
+    "python_multipart",
 ]
 
 a = Analysis(

@@ -191,8 +191,8 @@ async def test_wait_media_detects_video_locked_phrases(settings: Settings, locke
 
 
 @pytest.mark.asyncio
-async def test_wait_media_detects_video_locked_in_tail(settings: Settings):
-    """Detects video locked even if lastText is brief but tail contains the hint."""
+async def test_wait_media_ignores_video_locked_hint_outside_assistant_bubble(settings: Settings):
+    """Hints appearing only in body tail (e.g. user prompt) must NOT falsely lock the account."""
     driver = BrowserDriver(settings)
     mock_session = MagicMock()
     tab = _Tab("acc_1", "ctx_1", "t_1", mock_session)
@@ -203,12 +203,12 @@ async def test_wait_media_detects_video_locked_in_tail(settings: Settings):
         "agentCount": 1,
         "lastText": "Thông báo",
         "tail": "...tính năng tạo video không khả dụng...",
-        "attachments": [],
+        "attachments": [{"src": "https://cdn.muse.ai/v_ok.mp4", "kind": "video"}],
     }
 
     with patch.object(driver, "_state", AsyncMock(return_value=mock_state)):
-        with pytest.raises(UpstreamVideoLocked):
-            await driver._wait_media(tab, base, kind="video", timeout=5.0, on_progress=None, cancel=None)
+        att = await driver._wait_media(tab, base, kind="video", timeout=5.0, on_progress=None, cancel=None)
+        assert att["src"] == "https://cdn.muse.ai/v_ok.mp4"
 
 
 @pytest.mark.asyncio

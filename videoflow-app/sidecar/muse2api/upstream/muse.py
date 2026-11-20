@@ -105,15 +105,24 @@ async def renew_session(
     }
     jar = dict(cookies)
     expires: dict[str, int] = {}
-    client_kwargs: dict[str, object] = {"timeout": timeout, "headers": headers}
+    client_kwargs: dict[str, object] = {
+        "timeout": timeout,
+        "headers": headers,
+        "trust_env": False,
+        "follow_redirects": False,
+    }
     if proxy and proxy.strip():
         client_kwargs["proxy"] = proxy.strip()
-    async with httpx.AsyncClient(**client_kwargs) as client:
+    try:
+        client = httpx.AsyncClient(**client_kwargs)
+    except (ValueError, ImportError, httpx.HTTPError) as exc:
+        raise UpstreamError(f"invalid proxy configuration: {exc}") from exc
+    async with client:
         try:
             resp = await client.get(SESSION_API, headers={"Cookie": cookie_header(jar)})
         except httpx.HTTPError as exc:
             raise UpstreamError(f"session request failed: {exc}") from exc
-        if resp.status_code in (401, 403):
+        if resp.status_code in (301, 302, 303, 401, 403):
             raise UpstreamAuthError(f"session rejected by upstream (HTTP {resp.status_code})")
         if resp.status_code >= 400:
             raise UpstreamError(f"session endpoint returned HTTP {resp.status_code}")

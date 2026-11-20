@@ -79,7 +79,7 @@ CHAT_STATE = f"""(() => {{
   scrollers.forEach(e => {{ e.scrollTop = e.scrollHeight; }});
   const bubbles = [...document.querySelectorAll({q(AGENT_BUBBLE)})];
   const last = bubbles.length ? (bubbles[bubbles.length - 1].innerText || '').trim() : '';
-  const atts = [...document.querySelectorAll({q(ATTACHMENT)})].map(a => {{
+  const atts = bubbles.flatMap(b => [...b.querySelectorAll({q(ATTACHMENT)})]).map(a => {{
     const v = a.querySelector('video'), i = a.querySelector('img');
     const m = v || i;
     let src = '';
@@ -128,23 +128,33 @@ MEDIA_URLS_SNAPSHOT = f"""(() => {{
   return [...urls];
 }})()"""
 
-def wait_video_mount(timeout_ms: int = 6000, interval_ms: int = 100) -> str:
-    """Poll every interval_ms waiting for <video> to mount src or data-hatch-video-src (P1-2)."""
+def wait_video_mount(
+    timeout_ms: int = 6000,
+    interval_ms: int = 100,
+    existing_urls: list[str] | set[str] | None = None,
+) -> str:
+    """Poll every interval_ms waiting for a NEW <video> to mount src or data-hatch-video-src (P1-2)."""
+    existing_json = json.dumps(list(existing_urls or []))
     return f"""(async () => {{
+  const existing = new Set({existing_json});
   const scrollers = [...document.querySelectorAll('*')].filter(e => {{
     const s = getComputedStyle(e);
     return (s.overflowY === 'auto' || s.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 50;
   }});
   scrollers.forEach(e => {{ e.scrollTop = e.scrollHeight; }});
 
+  const isFresh = (url) => !!url && !existing.has(url);
   const check = () => {{
     for (const v of document.querySelectorAll('video')) {{
-      if (v.currentSrc || v.src || v.getAttribute('src')) return true;
+      const s = v.currentSrc || v.src || v.getAttribute('src') || '';
+      if (isFresh(s)) return true;
       const parent = v.closest('[data-hatch-video-src]');
-      if (parent && parent.getAttribute('data-hatch-video-src')) return true;
+      const ps = parent ? (parent.getAttribute('data-hatch-video-src') || '') : '';
+      if (isFresh(ps)) return true;
     }}
     for (const el of document.querySelectorAll('[data-hatch-video-src]')) {{
-      if (el.getAttribute('data-hatch-video-src')) return true;
+      const hs = el.getAttribute('data-hatch-video-src') || '';
+      if (isFresh(hs)) return true;
     }}
     return false;
   }};
