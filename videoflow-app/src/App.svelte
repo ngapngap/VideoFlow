@@ -1,5 +1,5 @@
 <script context="module" lang="ts">
-  export type Screen = "dash" | "rows" | "accounts" | "history" | "folder" | "settings";
+  export type Screen = "dash" | "rows" | "accounts" | "proxies" | "history" | "folder" | "settings";
 </script>
 
 <script lang="ts">
@@ -37,6 +37,7 @@
   import Dashboard from "./screens/Dashboard.svelte";
   import Rows from "./screens/Rows.svelte";
   import Accounts from "./screens/Accounts.svelte";
+  import Proxies from "./screens/Proxies.svelte";
   import History from "./screens/History.svelte";
   import LocalFolder from "./screens/LocalFolder.svelte";
   import Settings from "./screens/Settings.svelte";
@@ -50,6 +51,7 @@
     { key: "dash", label: "Tổng quan", icon: "dashboard" },
     { key: "rows", label: "Dòng việc", icon: "rows" },
     { key: "accounts", label: "Tài khoản", icon: "video-source" },
+    { key: "proxies", label: "Proxy", icon: "globe" },
     { key: "history", label: "Lịch sử", icon: "history" },
     { key: "folder", label: "Thư mục Local", icon: "folder" },
   ];
@@ -58,6 +60,7 @@
     dash: "Tổng quan vận hành",
     rows: "Quản lý dòng việc",
     accounts: "Quản lý tài khoản Muse",
+    proxies: "Quản lý Proxy (HTTP / SOCKS5)",
     history: "Lịch sử & Nhật ký",
     folder: "Thư mục dự án Local",
     settings: "Cài đặt hệ thống",
@@ -462,7 +465,9 @@
     null;
 
   $: activeProxyValue = activeExecutingAccount?.proxy || null;
-  $: statusbarIpText = formatProxyIp(activeProxyValue);
+  $: statusbarIpText = activeExecutingAccount?.proxy_exit_ip
+    ? `IP: ${activeExecutingAccount.proxy_exit_ip}${activeExecutingAccount.proxy_name ? ` (${activeExecutingAccount.proxy_name})` : ""}`
+    : formatProxyIp(activeProxyValue);
 
   async function handleSwitchLockedAccount(accountId: string) {
     if (accountId) {
@@ -702,7 +707,9 @@
       {:else if screen === "rows"}
         <Rows />
       {:else if screen === "accounts"}
-        <Accounts />
+        <Accounts on:navigate={handleDashboardNavigate} />
+      {:else if screen === "proxies"}
+        <Proxies />
       {:else if screen === "history"}
         <History />
       {:else if screen === "folder"}

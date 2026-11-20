@@ -1,11 +1,13 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { api, type MuseAccount, type MuseQuotaSnapshot } from "./api";
+  import { api, type MuseAccount, type MuseQuotaSnapshot, type ProxyItem } from "./api";
   import Icons from "./Icons.svelte";
   import Modal from "./Modal.svelte";
   import { formatApiError, showToast } from "./store";
 
   export let account: MuseAccount;
+  export let proxies: ProxyItem[] = [];
+  export let allAccounts: MuseAccount[] = [];
   export let running: boolean = false;
 
   const dispatch = createEventDispatcher<{
@@ -19,14 +21,52 @@
   let actionBusy = false;
   let quotaBusy = false;
   let quotaErr = "";
-  let proxyValue = account.proxy || "";
-  let proxyDirty = false;
+  let selectedProxyId = account.proxy_id || "";
   let proxySaving = false;
   let deleteConfirmOpen = false;
 
-  $: if (account.proxy !== undefined && !proxyDirty) {
-    proxyValue = account.proxy || "";
+  $: if (!proxySaving) {
+    selectedProxyId = account.proxy_id || "";
   }
+
+  function formatProxyOptionLabel(p: ProxyItem): string {
+    const dot =
+      p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
+    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const latPart =
+      p.latency_ms != null
+        ? `${p.latency_ms}ms`
+        : p.last_status === "dead"
+          ? "Lỗi"
+          : "Chưa test";
+    return `${dot} ${p.name} (${p.kind.toUpperCase()} · ${ipPart} · ${latPart})`;
+  }
+
+  $: currentProxyObj = proxies.find((p) => p.id === selectedProxyId) || null;
+
+  $: antiLinkConflicts = (() => {
+    if (!selectedProxyId) return [] as string[];
+    const curIp = (currentProxyObj?.exit_ip || account.proxy_exit_ip || "").trim();
+    const names: string[] = [];
+    for (const other of allAccounts) {
+      if (other.id === account.id) continue;
+      const sameProxy = Boolean(other.proxy_id && other.proxy_id === selectedProxyId);
+      const otherIp = (other.proxy_exit_ip || "").trim();
+      const sameIp = Boolean(curIp && otherIp && curIp === otherIp);
+      if (sameProxy || sameIp) {
+        names.push(other.label || other.id);
+      }
+    }
+    if (names.length === 0 && currentProxyObj) {
+      for (const assignedId of currentProxyObj.assigned_account_ids) {
+        if (assignedId !== account.id) {
+          const found = allAccounts.find((a) => a.id === assignedId);
+          names.push(found?.label || assignedId);
+        }
+      }
+    }
+    return Array.from(new Set(names));
+  })();
 
   function hasPositiveExtra(extra: string | null | undefined): boolean {
     if (!extra || !extra.trim()) return false;
@@ -127,16 +167,30 @@
     }
   }
 
-  async function handleSaveProxy() {
-    if (proxySaving || running) return;
+  async function handleProxySelectChange(e: Event) {
+    const selectEl = e.currentTarget as HTMLSelectElement;
+    const nextPid = selectEl.value;
+    if (proxySaving || running || actionBusy || quotaBusy || account.busy) {
+      selectEl.value = account.proxy_id || "";
+      return;
+    }
+    const prevPid = account.proxy_id || "";
+    selectedProxyId = nextPid;
     proxySaving = true;
     try {
-      await api.muse_update_account(account.id, undefined, undefined, proxyValue.trim());
-      proxyDirty = false;
-      showToast("success", "Đã lưu proxy riêng cho tài khoản.");
+      await api.muse_update_account(account.id, undefined, undefined, undefined, nextPid);
+      const pxName = proxies.find((p) => p.id === nextPid)?.name;
+      showToast(
+        "success",
+        nextPid
+          ? `Đã gán proxy "${pxName || nextPid}" và khởi động lại kết nối cho tài khoản.`
+          : "Đã chuyển tài khoản về kết nối Trực tiếp."
+      );
       dispatch("updated", { id: account.id });
-    } catch (e) {
-      showToast("error", `Lỗi lưu proxy: ${formatApiError(e)}`);
+    } catch (err) {
+      selectedProxyId = prevPid;
+      selectEl.value = prevPid;
+      showToast("error", `Lỗi đổi proxy: ${formatApiError(err)}`);
     } finally {
       proxySaving = false;
     }
@@ -302,34 +356,42 @@
     <div class="acc-error-line selectable">{quotaErr}</div>
   {/if}
 
-  <!-- Proxy settings row (P2-3 individual proxy) -->
-  <div class="acc-proxy-row">
-    <div class="proxy-icon-wrap" title="Proxy riêng của tài khoản">
+  <!-- Proxy dropdown row (#30 proxy_id assignment + lifecycle lock) -->
+  <div
+    class="acc-proxy-row"
+    title={account.busy
+      ? "Tài khoản đang bận xử lý hoặc đang mở trình duyệt — không thể đổi proxy lúc này"
+      : "Chọn proxy đã lưu cho tài khoản này"}
+  >
+    <div class="proxy-icon-wrap" title="Proxy của tài khoản">
       <Icons name="globe" size={14} />
     </div>
-    <input
-      type="text"
-      class="proxy-input"
-      placeholder="Proxy riêng: http://user:pass@ip:port hoặc socks5://..."
-      bind:value={proxyValue}
-      on:input={() => (proxyDirty = true)}
-      on:keydown={(e) => { if (e.key === 'Enter') handleSaveProxy(); }}
-      disabled={proxySaving || running}
-      spellcheck="false"
-      autocomplete="off"
-    />
-    {#if proxyDirty}
-      <button
-        type="button"
-        class="btn-save-proxy"
-        disabled={proxySaving || running}
-        on:click={handleSaveProxy}
-        title="Lưu cấu hình proxy"
-      >
-        <span>{proxySaving ? "Lưu..." : "Lưu"}</span>
-      </button>
+    <select
+      class="proxy-select"
+      value={selectedProxyId}
+      on:change={handleProxySelectChange}
+      disabled={proxySaving || running || actionBusy || quotaBusy || Boolean(account.busy)}
+    >
+      <option value="">Trực tiếp (không dùng proxy)</option>
+      {#each proxies as p (p.id)}
+        <option value={p.id}>{formatProxyOptionLabel(p)}</option>
+      {/each}
+    </select>
+    {#if proxySaving}
+      <span class="proxy-saving-tag">Đang áp dụng...</span>
+    {:else if account.busy}
+      <span class="proxy-busy-tag">Đang bận</span>
     {/if}
   </div>
+
+  {#if antiLinkConflicts.length > 0}
+    <div class="acc-anti-link-warn" role="alert">
+      <Icons name="alert-triangle" size={14} />
+      <span>
+        ⚠️ Proxy / IP đầu ra này đang được dùng bởi tài khoản <b>{antiLinkConflicts.join(", ")}</b>. Dùng chung IP giữa nhiều tài khoản có nguy cơ bị nối dấu vết với nhau.
+      </span>
+    </div>
+  {/if}
 
   <!-- Meta indicators -->
   <div class="acc-meta">
@@ -654,7 +716,7 @@
     word-break: break-all;
   }
 
-  /* Proxy input row */
+  /* Proxy dropdown row */
   .acc-proxy-row {
     display: flex;
     align-items: center;
@@ -662,7 +724,7 @@
     background: #fff;
     border: 1px solid var(--c-border);
     border-radius: 6px;
-    padding: 2px 8px;
+    padding: 3px 8px;
   }
   .acc-proxy-row:focus-within {
     border-color: var(--c-teal);
@@ -672,7 +734,7 @@
     display: flex;
     align-items: center;
   }
-  .proxy-input {
+  .proxy-select {
     border: none;
     outline: none;
     background: transparent;
@@ -681,23 +743,33 @@
     flex: 1;
     min-width: 0;
     padding: 4px 0;
-  }
-  .proxy-input::placeholder {
-    color: var(--c-muted);
-    font-size: 11px;
-  }
-  .btn-save-proxy {
-    background: var(--c-teal);
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 11px;
-    font-weight: 600;
     cursor: pointer;
   }
-  .btn-save-proxy:hover:not(:disabled) {
-    background: var(--c-teal-dark, #0a5f67);
+  .proxy-select:disabled {
+    cursor: not-allowed;
+    opacity: 0.65;
+  }
+  .proxy-saving-tag,
+  .proxy-busy-tag {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--c-surface-subtle, #f3f6f8);
+    color: var(--c-muted);
+    white-space: nowrap;
+  }
+  .acc-anti-link-warn {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    font-size: 11.5px;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: 6px;
+    padding: 6px 9px;
+    line-height: 1.4;
   }
 
   /* Meta items */

@@ -1,11 +1,20 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-  import { api, type MuseAccount, type MuseQuotaSnapshot, type MuseStatusView } from "../lib/api";
+  import { createEventDispatcher, onDestroy, onMount } from "svelte";
+  import {
+    api,
+    type MuseAccount,
+    type MuseQuotaSnapshot,
+    type MuseStatusView,
+    type ProxyItem,
+  } from "../lib/api";
   import AccountCard from "../lib/AccountCard.svelte";
   import Icons from "../lib/Icons.svelte";
   import { formatApiError, running, showToast } from "../lib/store";
 
+  const dispatch = createEventDispatcher<{ navigate: string }>();
+
   let accounts: MuseAccount[] = [];
+  let proxies: ProxyItem[] = [];
   let loading = false;
   let statusView: MuseStatusView | null = null;
   let startingEngine = false;
@@ -14,7 +23,7 @@
 
   // Form Thêm tài khoản
   let newLabel = "";
-  let newProxy = "";
+  let newProxyId = "";
   let showManualCookies = false;
   let cookieSess = "";
   let cookieDevice = "";
@@ -31,13 +40,52 @@
   let destroyed = false;
   let polling = false;
 
+  function formatProxyOptionLabel(p: ProxyItem): string {
+    const dot =
+      p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
+    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const latPart =
+      p.latency_ms != null
+        ? `${p.latency_ms}ms`
+        : p.last_status === "dead"
+          ? "Lỗi"
+          : "Chưa test";
+    return `${dot} ${p.name} (${p.kind.toUpperCase()} · ${ipPart} · ${latPart})`;
+  }
+
+  $: newProxyConflicts = (() => {
+    if (!newProxyId) return [] as string[];
+    const selectedPx = proxies.find((p) => p.id === newProxyId);
+    const selIp = (selectedPx?.exit_ip || "").trim();
+    const names: string[] = [];
+    for (const acc of accounts) {
+      const sameProxy = Boolean(acc.proxy_id && acc.proxy_id === newProxyId);
+      const accIp = (acc.proxy_exit_ip || "").trim();
+      const sameIp = Boolean(selIp && accIp && selIp === accIp);
+      if (sameProxy || sameIp) {
+        names.push(acc.label || acc.id);
+      }
+    }
+    if (names.length === 0 && selectedPx) {
+      for (const accId of selectedPx.assigned_account_ids) {
+        const found = accounts.find((a) => a.id === accId);
+        names.push(found?.label || accId);
+      }
+    }
+    return Array.from(new Set(names));
+  })();
+
   async function loadData() {
     const seq = ++loadSeq;
     loading = true;
     try {
-      const nextStatus = await api.muse_sidecar_status();
+      const [nextStatus, pxList] = await Promise.all([
+        api.muse_sidecar_status(),
+        api.proxy_list().catch(() => [] as ProxyItem[]),
+      ]);
       if (destroyed || seq !== loadSeq) return;
       statusView = nextStatus;
+      proxies = pxList;
       if (nextStatus.sidecar.running) {
         const res = await api.muse_list_accounts();
         if (destroyed || seq !== loadSeq) return;
@@ -59,9 +107,13 @@
     if (destroyed || polling || loading) return;
     polling = true;
     try {
-      const st = await api.muse_sidecar_status();
+      const [st, pxList] = await Promise.all([
+        api.muse_sidecar_status(),
+        api.proxy_list().catch(() => proxies),
+      ]);
       if (destroyed) return;
       statusView = st;
+      proxies = pxList;
       if (st.sidecar.running) {
         const res = await api.muse_list_accounts();
         if (destroyed) return;
@@ -124,23 +176,18 @@
         await api.muse_start_sidecar();
       }
 
-      // 2. Tạo tài khoản mới
+      // 2. Tạo tài khoản mới kèm proxy_id (nếu có)
       const label = newLabel.trim() || `Tài khoản Muse ${accounts.length + 1}`;
-      const proxyToSet = newProxy.trim();
-      const res = await api.muse_add_cookie(label, {}, allowDuplicate);
+      const proxyIdToSet = newProxyId.trim() || null;
+      const res = await api.muse_add_cookie(label, {}, allowDuplicate, proxyIdToSet);
       const acc = res.account;
       newLabel = "";
-      newProxy = "";
+      newProxyId = "";
       allowDuplicate = false;
-
-      // 3. Nếu có proxy, cập nhật proxy
-      if (proxyToSet) {
-        await api.muse_update_account(acc.id, undefined, undefined, proxyToSet);
-      }
 
       showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
 
-      // 4. Mở trình duyệt có giao diện để đăng nhập ngay
+      // 3. Mở trình duyệt có giao diện để đăng nhập ngay
       await api.muse_open_login(acc.id);
     } catch (e) {
       addErr = formatApiError(e);
@@ -172,15 +219,11 @@
 
     try {
       const label = newLabel.trim() || `Tài khoản Muse ${accounts.length + 1}`;
-      const res = await api.muse_add_cookie(label, cookies, allowDuplicate);
-      const acc = res.account;
-
-      if (newProxy.trim()) {
-        await api.muse_update_account(acc.id, undefined, undefined, newProxy.trim());
-      }
+      const proxyIdToSet = newProxyId.trim() || null;
+      await api.muse_add_cookie(label, cookies, allowDuplicate, proxyIdToSet);
 
       newLabel = "";
-      newProxy = "";
+      newProxyId = "";
       cookieSess = "";
       cookieDevice = "";
       cookieVml = "";
@@ -355,16 +398,35 @@
       </div>
 
       <div class="form-group">
-        <label class="form-label" for="acc-new-proxy">Proxy riêng (tùy chọn - P2-3)</label>
-        <input
+        <div class="form-label-row">
+          <label class="form-label" for="acc-new-proxy">Proxy kết nối (#30)</label>
+          <button
+            type="button"
+            class="link-manage-proxy"
+            on:click={() => dispatch("navigate", "proxies")}
+          >
+            Quản lý Proxy →
+          </button>
+        </div>
+        <select
           id="acc-new-proxy"
           class="form-input"
-          placeholder="http://user:pass@ip:port hoặc socks5://..."
-          bind:value={newProxy}
+          bind:value={newProxyId}
           disabled={addBusy || $running}
-          spellcheck="false"
-          autocomplete="off"
-        />
+        >
+          <option value="">Trực tiếp (không dùng proxy)</option>
+          {#each proxies as p (p.id)}
+            <option value={p.id}>{formatProxyOptionLabel(p)}</option>
+          {/each}
+        </select>
+        {#if newProxyConflicts.length > 0}
+          <div class="add-anti-link-warn" role="alert">
+            <Icons name="alert-triangle" size={14} />
+            <span>
+              ⚠️ Proxy / IP đầu ra này đang được dùng bởi tài khoản <b>{newProxyConflicts.join(", ")}</b>. Dùng chung IP giữa nhiều tài khoản có nguy cơ bị nối dấu vết với nhau.
+            </span>
+          </div>
+        {/if}
       </div>
     </div>
 
@@ -521,6 +583,8 @@
         {#each sortedAccounts as account (account.id)}
           <AccountCard
             {account}
+            {proxies}
+            allAccounts={accounts}
             running={$running}
             on:refresh={loadData}
             on:updated={loadData}
@@ -627,10 +691,40 @@
     flex-direction: column;
     gap: 6px;
   }
+  .form-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
   .form-label {
     font-size: 12px;
     font-weight: 600;
     color: var(--c-text);
+  }
+  .link-manage-proxy {
+    background: transparent;
+    border: none;
+    color: var(--c-teal);
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+  }
+  .link-manage-proxy:hover {
+    text-decoration: underline;
+  }
+  .add-anti-link-warn {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    font-size: 11.5px;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: 6px;
+    padding: 6px 9px;
+    line-height: 1.4;
   }
   .form-input {
     height: 36px;

@@ -109,6 +109,25 @@ def _get(svc: Services, account_id: str) -> Account:
     return acc
 
 
+def _is_account_busy(account_id: str, svc: Services) -> bool:
+    interactive = getattr(svc, "interactive", None)
+    if interactive is not None and interactive.is_session_active(account_id):
+        return True
+    pool = getattr(svc, "pool", None)
+    if pool is not None and hasattr(pool, "is_inflight") and pool.is_inflight(account_id):
+        return True
+    driver = getattr(svc, "driver", None)
+    if driver is not None and hasattr(driver, "is_account_busy") and driver.is_account_busy(account_id):
+        return True
+    return False
+
+
+def _account_public(acc: Account, svc: Services) -> dict:
+    pub = acc.public()
+    pub["busy"] = _is_account_busy(acc.id, svc)
+    return pub
+
+
 @router.get("/status")
 async def status(svc: Services = Depends(get_services)) -> dict:
     driver_health = await svc.driver.health()
@@ -124,7 +143,7 @@ async def status(svc: Services = Depends(get_services)) -> dict:
 
 @router.get("/accounts")
 async def list_accounts(svc: Services = Depends(get_services)) -> dict:
-    return {"data": [a.public() for a in svc.pool.all()]}
+    return {"data": [_account_public(a, svc) for a in svc.pool.all()]}
 
 
 @router.post("/accounts")
@@ -134,7 +153,7 @@ async def create_account(body: AccountCreate, svc: Services = Depends(get_servic
     if not allow_duplicate_session:
         _check_duplicate_session(acc, svc)
     await svc.pool.upsert(acc)
-    return {"account": acc.public(), "missing_cookies": missing_session_cookies(acc.cookies)}
+    return {"account": _account_public(acc, svc), "missing_cookies": missing_session_cookies(acc.cookies)}
 
 
 @router.post("/accounts/import")
@@ -151,7 +170,7 @@ async def import_accounts(body: AccountsImportRequest, svc: Services = Depends(g
             results.append({"index": i, "ok": False, "error": e.message, "code": e.code})
             continue
         await svc.pool.upsert(acc)
-        results.append({"index": i, "ok": True, "account": acc.public(),
+        results.append({"index": i, "ok": True, "account": _account_public(acc, svc),
                         "missing_cookies": missing_session_cookies(acc.cookies)})
     return {"data": results}
 
@@ -189,17 +208,27 @@ async def update_account(account_id: str, body: AccountUpdate,
         if acc.cookie_expires is None:
             acc.cookie_expires = {}
         acc.cookie_expires.update(body.cookie_expires)
+    proxy_changed = False
     if body.proxy is not None:
         new_proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
         if new_proxy is not None and acc.proxy and new_proxy == mask_proxy_url(acc.proxy):
             pass  # keep existing unmasked proxy when client echoes back masked value
-        else:
+        elif new_proxy != acc.proxy:
+            if _is_account_busy(account_id, svc):
+                raise AccountBusy(
+                    "Tài khoản đang bận xử lý hoặc đang mở trình duyệt, không thể đổi proxy lúc này"
+                )
             acc.proxy = new_proxy
+            proxy_changed = True
     await svc.pool.upsert(acc)
     driver = getattr(svc, "driver", None)
-    if body.cookies is not None and driver is not None and hasattr(driver, "mark_account_stale"):
-        await driver.mark_account_stale(account_id)
-    return {"account": acc.public()}
+    if proxy_changed and driver is not None and hasattr(driver, "release_account_driver"):
+        await driver.release_account_driver(account_id)
+    elif body.cookies is not None and driver is not None and hasattr(driver, "mark_account_stale"):
+        res = driver.mark_account_stale(account_id)
+        if hasattr(res, "__await__"):
+            await res
+    return {"account": _account_public(acc, svc)}
 
 
 @router.delete("/accounts/{account_id}")
@@ -219,7 +248,7 @@ async def reset_account(account_id: str, svc: Services = Depends(get_services)) 
     acc.meta.pop("kind_blocked_until", None)  # e.g. video after an unconfirmed VM wake
     acc.meta.pop("wake_blocked_until", None)
     await svc.pool.upsert(acc)
-    return {"account": acc.public()}
+    return {"account": _account_public(acc, svc)}
 
 
 @router.post("/accounts/{account_id}/renew")

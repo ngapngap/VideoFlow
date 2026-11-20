@@ -112,10 +112,20 @@ async def test_account_update_proxy(test_services, app):
         })
         assert res.status_code == 200
         assert res.json()["account"]["proxy"] == "socks5://127.0.0.1:1080"
+        assert res.json()["account"]["busy"] is False
 
-        # Verify persisted
+        # Verify persisted and driver released so new proxy takes effect
         refreshed = test_services.pool.get(acc.id)
         assert refreshed.proxy == "socks5://127.0.0.1:1080"
+        assert acc.id in test_services.driver.released_accounts
+
+        # When account is busy, changing proxy is blocked with 409 AccountBusy
+        test_services.driver._busy_accounts.add(acc.id)
+        res_busy = await client.patch(f"/admin/accounts/{acc.id}", json={
+            "proxy": "http://127.0.0.1:8080",
+        })
+        assert res_busy.status_code == 409
+        test_services.driver._busy_accounts.discard(acc.id)
 
 
 @pytest.mark.asyncio

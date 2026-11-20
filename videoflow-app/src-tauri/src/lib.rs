@@ -9,6 +9,7 @@ pub mod error;
 pub mod muse_sidecar;
 pub mod project;
 pub mod prompts_csv;
+pub mod proxies;
 pub mod runtime_services;
 pub mod settings;
 pub mod state_db;
@@ -85,6 +86,12 @@ pub fn run() {
             commands::muse_open_view,
             commands::muse_account_quota,
             commands::muse_download_extension,
+            commands::proxy_list,
+            commands::proxy_create,
+            commands::proxy_update,
+            commands::proxy_delete,
+            commands::proxy_test,
+            commands::proxy_test_all,
             commands::app_version,
             commands::check_app_update,
             commands::install_app_update,

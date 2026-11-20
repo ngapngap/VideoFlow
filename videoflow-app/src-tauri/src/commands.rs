@@ -2302,6 +2302,80 @@ pub fn muse_stop_sidecar() -> AppResult<bool> {
     Ok(true)
 }
 
+fn enrich_account_json_with_proxy(
+    acc: &mut serde_json::Value,
+    acc_to_proxy: &std::collections::HashMap<String, String>,
+    proxy_by_id: &std::collections::HashMap<String, crate::proxies::ProxyItem>,
+    sidecar_session: Option<(u16, &str)>,
+) {
+    let Some(obj) = acc.as_object_mut() else {
+        return;
+    };
+    let acc_id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if acc_id.is_empty() {
+        return;
+    }
+    let is_busy = obj.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+    let current_masked = obj
+        .get("proxy")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(pid) = acc_to_proxy.get(&acc_id) {
+        if let Some(px) = proxy_by_id.get(pid) {
+            obj.insert("proxy_id".into(), serde_json::Value::String(px.id.clone()));
+            obj.insert("proxy_name".into(), serde_json::Value::String(px.name.clone()));
+            obj.insert("proxy_kind".into(), serde_json::Value::String(px.kind.clone()));
+            obj.insert(
+                "proxy_exit_ip".into(),
+                px.exit_ip
+                    .as_ref()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "proxy_status".into(),
+                serde_json::Value::String(px.last_status.clone()),
+            );
+            obj.insert(
+                "proxy_latency_ms".into(),
+                px.latency_ms
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            let expected_masked = px.to_masked_url();
+            if current_masked.as_deref() != Some(expected_masked.as_str()) && !is_busy {
+                if let Some((port, key)) = sidecar_session {
+                    if let Ok(safe_id) = muse_sanitize_id(&acc_id) {
+                        let patch_body = serde_json::json!({ "proxy": px.to_proxy_url() });
+                        let _ = crate::muse_sidecar::admin_send(
+                            port,
+                            key,
+                            "PATCH",
+                            &format!("/admin/accounts/{safe_id}"),
+                            Some(&patch_body),
+                        );
+                    }
+                }
+            }
+            obj.insert("proxy".into(), serde_json::Value::String(expected_masked));
+            return;
+        }
+    }
+
+    obj.insert("proxy_id".into(), serde_json::Value::Null);
+    obj.insert("proxy_name".into(), serde_json::Value::Null);
+    obj.insert("proxy_kind".into(), serde_json::Value::Null);
+    obj.insert("proxy_exit_ip".into(), serde_json::Value::Null);
+    obj.insert("proxy_status".into(), serde_json::Value::Null);
+    obj.insert("proxy_latency_ms".into(), serde_json::Value::Null);
+}
+
 #[tauri::command]
 pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2311,7 +2385,25 @@ pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
                 "Engine VideoFlow Muse đang dừng — hãy khởi động engine trước khi tải danh sách tài khoản.",
             )
         })?;
-        crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")
+        let mut res =
+            crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
+        if let Ok(conn) = crate::proxies::open_db() {
+            let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
+            let acc_to_proxy = crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
+            let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
+                proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+            if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
+                for item in arr.iter_mut() {
+                    enrich_account_json_with_proxy(
+                        item,
+                        &acc_to_proxy,
+                        &proxy_by_id,
+                        Some((session.port, &session.api_key)),
+                    );
+                }
+            }
+        }
+        Ok(res)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2324,23 +2416,71 @@ pub async fn muse_add_cookie(
     label: String,
     cookies: serde_json::Value,
     allow_duplicate: bool,
+    proxy_id: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let clean_pid = proxy_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let resolved_proxy = if let Some(ref pid) = clean_pid {
+            let conn = crate::proxies::open_db()?;
+            let px = crate::proxies::get_proxy_in(&conn, pid)?;
+            Some(px)
+        } else {
+            None
+        };
+
         let (port, key) = muse_session_or_err(&cfg)?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "label": label.trim(),
             "cookies": cookies,
         });
+        if let Some(ref px) = resolved_proxy {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("proxy".into(), serde_json::Value::String(px.to_proxy_url()));
+            }
+        }
         let dup_flag = if allow_duplicate { "?allow_duplicate_session=true" } else { "" };
-        crate::muse_sidecar::admin_send(
+        let mut res = crate::muse_sidecar::admin_send(
             port,
             &key,
             "POST",
             &format!("/admin/accounts{dup_flag}"),
             Some(&body),
-        )
+        )?;
+
+        if let Some(acc_obj) = res.get_mut("account") {
+            let acc_id = acc_obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !acc_id.is_empty() {
+                if let Ok(conn) = crate::proxies::open_db() {
+                    let _ = crate::proxies::set_account_proxy_in(
+                        &conn,
+                        &acc_id,
+                        clean_pid.as_deref(),
+                    );
+                    let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
+                    let acc_to_proxy =
+                        crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
+                    let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
+                        proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+                    enrich_account_json_with_proxy(
+                        acc_obj,
+                        &acc_to_proxy,
+                        &proxy_by_id,
+                        Some((port, &key)),
+                    );
+                }
+            }
+        }
+        Ok(res)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2352,8 +2492,12 @@ pub async fn muse_update_account(
     enabled: Option<bool>,
     label: Option<String>,
     proxy: Option<String>,
+    proxy_id: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<serde_json::Value> {
+    if proxy_id.is_some() || proxy.is_some() {
+        ensure_not_running(&state)?;
+    }
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (port, key) = muse_session_or_err(&cfg)?;
@@ -2364,14 +2508,56 @@ pub async fn muse_update_account(
         if let Some(l) = label {
             body.insert("label".into(), serde_json::Value::String(l.trim().to_string()));
         }
-        if let Some(p) = proxy {
-            body.insert("proxy".into(), serde_json::Value::String(p.trim().to_string()));
+
+        let mut target_proxy_id: Option<Option<String>> = None;
+        if let Some(pid_raw) = proxy_id {
+            let trimmed = pid_raw.trim();
+            if trimmed.is_empty() {
+                body.insert("proxy".into(), serde_json::Value::String(String::new()));
+                target_proxy_id = Some(None);
+            } else {
+                let conn = crate::proxies::open_db()?;
+                let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
+                body.insert("proxy".into(), serde_json::Value::String(px.to_proxy_url()));
+                target_proxy_id = Some(Some(px.id));
+            }
+        } else if let Some(p) = proxy {
+            let trimmed = p.trim();
+            body.insert("proxy".into(), serde_json::Value::String(trimmed.to_string()));
+            if trimmed.is_empty() {
+                target_proxy_id = Some(None);
+            }
         }
-        let path = format!(
-            "/admin/accounts/{}",
-            muse_sanitize_id(&account_id)?
-        );
-        crate::muse_sidecar::admin_send(port, &key, "PATCH", &path, Some(&serde_json::Value::Object(body)))
+
+        let safe_id = muse_sanitize_id(&account_id)?;
+        let path = format!("/admin/accounts/{safe_id}");
+        let mut res = crate::muse_sidecar::admin_send(
+            port,
+            &key,
+            "PATCH",
+            &path,
+            Some(&serde_json::Value::Object(body)),
+        )?;
+
+        if let Ok(conn) = crate::proxies::open_db() {
+            if let Some(ref pid_opt) = target_proxy_id {
+                crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref())?;
+            }
+            if let Some(acc_obj) = res.get_mut("account") {
+                let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
+                let acc_to_proxy =
+                    crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
+                let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
+                    proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+                enrich_account_json_with_proxy(
+                    acc_obj,
+                    &acc_to_proxy,
+                    &proxy_by_id,
+                    Some((port, &key)),
+                );
+            }
+        }
+        Ok(res)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2415,11 +2601,13 @@ pub async fn muse_delete_account(
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (port, key) = muse_session_or_err(&cfg)?;
-        let path = format!(
-            "/admin/accounts/{}",
-            muse_sanitize_id(&account_id)?
-        );
-        crate::muse_sidecar::admin_send(port, &key, "DELETE", &path, None)
+        let safe_id = muse_sanitize_id(&account_id)?;
+        let path = format!("/admin/accounts/{safe_id}");
+        let res = crate::muse_sidecar::admin_send(port, &key, "DELETE", &path, None)?;
+        if let Ok(conn) = crate::proxies::open_db() {
+            let _ = crate::proxies::remove_account_link_in(&conn, &safe_id);
+        }
+        Ok(res)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2527,6 +2715,157 @@ pub async fn muse_download_extension(state: State<'_, AppState>) -> AppResult<St
                 .spawn();
         }
         Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+// ━━ Commands: Quản lý Proxy toàn cục (proxies.db — Single Source of Truth) ━━
+
+fn check_sidecar_accounts_not_busy(
+    session: &crate::muse_sidecar::SidecarSession,
+    account_ids: &[String],
+) -> AppResult<()> {
+    if account_ids.is_empty() {
+        return Ok(());
+    }
+    if let Ok(res) = crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")
+    {
+        if let Some(arr) = res.get("data").and_then(|d| d.as_array()) {
+            for acc in arr {
+                let id = acc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let busy = acc.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+                if busy && account_ids.iter().any(|a| a == id) {
+                    let label = acc
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(id);
+                    return Err(AppError::new(
+                        "ACCOUNT_BUSY",
+                        format!(
+                            "Tài khoản '{label}' đang bận thực thi hoặc đang mở trình duyệt đăng nhập, không thể sửa/xoá proxy lúc này."
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn proxy_list() -> AppResult<Vec<crate::proxies::ProxyItem>> {
+    let conn = crate::proxies::open_db()?;
+    crate::proxies::list_proxies_in(&conn)
+}
+
+#[tauri::command]
+pub fn proxy_create(input: crate::proxies::ProxyInput) -> AppResult<crate::proxies::ProxyItem> {
+    let conn = crate::proxies::open_db()?;
+    crate::proxies::create_proxy_in(&conn, &input)
+}
+
+#[tauri::command]
+pub async fn proxy_update(
+    proxy_id: String,
+    input: crate::proxies::ProxyInput,
+    state: State<'_, AppState>,
+) -> AppResult<crate::proxies::ProxyItem> {
+    ensure_not_running(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::proxies::open_db()?;
+        let existing = crate::proxies::get_proxy_in(&conn, &proxy_id)?;
+        let session_opt = crate::muse_sidecar::current_session();
+
+        if let Some(ref session) = session_opt {
+            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+        }
+
+        let updated = crate::proxies::update_proxy_in(&conn, &proxy_id, &input)?;
+
+        if let Some(ref session) = session_opt {
+            let new_url = updated.to_proxy_url();
+            for acc_id in &updated.assigned_account_ids {
+                if let Ok(safe_id) = muse_sanitize_id(acc_id) {
+                    let body = serde_json::json!({ "proxy": new_url });
+                    let _ = crate::muse_sidecar::admin_send(
+                        session.port,
+                        &session.api_key,
+                        "PATCH",
+                        &format!("/admin/accounts/{safe_id}"),
+                        Some(&body),
+                    );
+                }
+            }
+        }
+
+        Ok(updated)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn proxy_delete(
+    proxy_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    ensure_not_running(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::proxies::open_db()?;
+        let existing = crate::proxies::get_proxy_in(&conn, &proxy_id)?;
+        let session_opt = crate::muse_sidecar::current_session();
+
+        if let Some(ref session) = session_opt {
+            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+            for acc_id in &existing.assigned_account_ids {
+                if let Ok(safe_id) = muse_sanitize_id(acc_id) {
+                    let body = serde_json::json!({ "proxy": "" });
+                    let _ = crate::muse_sidecar::admin_send(
+                        session.port,
+                        &session.api_key,
+                        "PATCH",
+                        &format!("/admin/accounts/{safe_id}"),
+                        Some(&body),
+                    );
+                }
+            }
+        }
+
+        let affected = crate::proxies::delete_proxy_in(&conn, &proxy_id)?;
+        Ok(serde_json::json!({
+            "deleted": proxy_id,
+            "unassigned_accounts": affected,
+        }))
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn proxy_test(proxy_id: String) -> AppResult<crate::proxies::ProxyItem> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::proxies::open_db()?;
+        crate::proxies::test_proxy_connection(&conn, &proxy_id)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
+}
+
+#[tauri::command]
+pub async fn proxy_test_all() -> AppResult<Vec<crate::proxies::ProxyItem>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = crate::proxies::open_db()?;
+        let list = crate::proxies::list_proxies_in(&conn)?;
+        let mut results = Vec::with_capacity(list.len());
+        for p in list {
+            match crate::proxies::test_proxy_connection(&conn, &p.id) {
+                Ok(updated) => results.push(updated),
+                Err(_) => results.push(p),
+            }
+        }
+        Ok(results)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?

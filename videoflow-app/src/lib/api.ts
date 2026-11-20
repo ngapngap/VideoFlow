@@ -266,12 +266,49 @@ export interface MuseStatusView {
   headless: boolean;
 }
 
+export interface ProxyItem {
+  id: string;
+  name: string;
+  kind: "http" | "socks5" | string;
+  host: string;
+  port: number;
+  username?: string | null;
+  password?: string | null;
+  has_password: boolean;
+  note?: string | null;
+  last_status: "untested" | "alive" | "dead" | string;
+  exit_ip?: string | null;
+  latency_ms?: number | null;
+  tested_at?: string | null;
+  last_error?: string | null;
+  created_at: string;
+  updated_at: string;
+  assigned_account_ids: string[];
+}
+
+export interface ProxyInput {
+  name: string;
+  kind: "http" | "socks5";
+  host: string;
+  port: number;
+  username?: string | null;
+  password?: string | null;
+  note?: string | null;
+}
+
 export interface MuseAccount {
   id: string;
   label: string;
   enabled: boolean;
   status: "active" | "cooling" | "invalid" | "video_locked";
   proxy?: string | null;
+  proxy_id?: string | null;
+  proxy_name?: string | null;
+  proxy_kind?: string | null;
+  proxy_exit_ip?: string | null;
+  proxy_status?: string | null;
+  proxy_latency_ms?: number | null;
+  busy?: boolean;
   cookies: Record<string, string>;
   cookie_expires: Record<string, number>;
   created_at: number;
@@ -398,18 +435,31 @@ export const api = {
   muse_start_sidecar: () => invoke<SidecarStatus>("muse_start_sidecar"),
   muse_stop_sidecar: () => invoke<boolean>("muse_stop_sidecar"),
   muse_list_accounts: () => invoke<{ data: MuseAccount[] }>("muse_list_accounts"),
-  muse_add_cookie: (label: string, cookies: unknown, allowDuplicate = false) =>
+  muse_add_cookie: (
+    label: string,
+    cookies: unknown,
+    allowDuplicate = false,
+    proxyId?: string | null
+  ) =>
     invoke<{ account: MuseAccount; missing_cookies: string[] }>("muse_add_cookie", {
       label,
       cookies,
       allowDuplicate,
+      proxyId: proxyId ?? null,
     }),
-  muse_update_account: (accountId: string, enabled?: boolean, label?: string, proxy?: string | null) =>
+  muse_update_account: (
+    accountId: string,
+    enabled?: boolean,
+    label?: string,
+    proxy?: string | null,
+    proxyId?: string | null
+  ) =>
     invoke<{ account: MuseAccount }>("muse_update_account", {
       accountId,
       enabled: enabled ?? null,
       label: label ?? null,
       proxy: proxy ?? null,
+      proxyId: proxyId ?? null,
     }),
   muse_open_login: (accountId: string) =>
     invoke<{ ok: boolean; message?: string }>("muse_open_login", { accountId }),
@@ -435,6 +485,15 @@ export const api = {
       }
     ),
   muse_download_extension: () => invoke<string>("muse_download_extension"),
+  // ━━ Quản lý Proxy toàn cục (proxies.db) ━━
+  proxy_list: () => invoke<ProxyItem[]>("proxy_list"),
+  proxy_create: (input: ProxyInput) => invoke<ProxyItem>("proxy_create", { input }),
+  proxy_update: (proxyId: string, input: ProxyInput) =>
+    invoke<ProxyItem>("proxy_update", { proxyId, input }),
+  proxy_delete: (proxyId: string) =>
+    invoke<{ deleted: string; unassigned_accounts: string[] }>("proxy_delete", { proxyId }),
+  proxy_test: (proxyId: string) => invoke<ProxyItem>("proxy_test", { proxyId }),
+  proxy_test_all: () => invoke<ProxyItem[]>("proxy_test_all"),
   // ━━ Cập nhật ứng dụng ━━
   app_version: () => invoke<string>("app_version"),
   check_app_update: () => invoke<UpdateInfo>("check_app_update"),
