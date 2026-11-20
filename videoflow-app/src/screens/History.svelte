@@ -1,6 +1,6 @@
 <script lang="ts">
   // Màn hình Lịch sử (Wave 2 Full Option): lọc trạng thái/loại/ngày, Xuất CSV theo bộ lọc, Nhật ký + Xuất .log, Xem media trong app & phân trang chi tiết
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     project,
     running,
@@ -160,6 +160,12 @@
     }
   });
 
+  onDestroy(() => {
+    ++loadSeq;
+    ++runDetailSeq;
+    ++logsSeq;
+  });
+
   // Tự động nạp lại khi đổi dự án hoặc khi có sự kiện row_changed / run_finished
   $: if (mounted) {
     const curPath = $project?.path ?? null;
@@ -193,7 +199,7 @@
       lastTick = curTick;
       if (curPath) {
         void load({ silent: true });
-        if (selectedRun) {
+        if (selectedRun && !detailLoading) {
           void refreshSelectedRunSilently(selectedRun.id);
         }
       }

@@ -204,8 +204,11 @@ impl ApiFail {
                     .or_else(|| v.get("detail"))
                     .and_then(|m| m.as_str().map(|s| s.to_string()).or_else(|| Some(m.to_string())))
             })
-            .unwrap_or_else(|| body.chars().take(300).collect::<String>().trim().to_string());
-        let msg = crate::settings::redact_secrets(&msg);
+            .unwrap_or_else(|| body.trim().to_string());
+        let msg: String = crate::settings::redact_secrets(&msg)
+            .chars()
+            .take(300)
+            .collect();
 
         let err_code_json = parsed
             .as_ref()
@@ -509,10 +512,13 @@ pub fn create_image(cfg: &Settings, image_path: &Path, prompt: &str) -> Result<I
             kind: ApiFailKind::NghiepVu,
             http_status: Some(status),
             code: "BAD_RESPONSE".into(),
-            message: crate::settings::redact_secrets(&format!(
+            message: format!(
                 "Thiếu trường data[0].b64_json trong response: {}",
-                body.chars().take(200).collect::<String>()
-            )),
+                crate::settings::redact_secrets(&body)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ),
         })?;
 
     let b64_clean = b64_raw
@@ -698,10 +704,13 @@ where
             kind: ApiFailKind::NghiepVu,
             http_status: Some(status),
             code: "BAD_RESPONSE".into(),
-            message: crate::settings::redact_secrets(&format!(
+            message: format!(
                 "Không tìm thấy task_id trong response: {}",
-                body.chars().take(200).collect::<String>()
-            )),
+                crate::settings::redact_secrets(&body)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ),
         })?;
 
     let task_id = sanitize_url_segment(raw_task_id, false)?;
@@ -1187,7 +1196,7 @@ pub fn download_video(
                             ));
                         }
                     }
-                } else if st == 200 || st == 206 {
+                } else if st == 200 {
                     let expected_len = if resp.headers().contains_key(reqwest::header::CONTENT_ENCODING) {
                         None
                     } else {
@@ -1318,7 +1327,10 @@ pub fn resolve_endpoint_and_key(
     let resolved_key = api_key
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|k| {
+            crate::settings::register_secret_for_redaction(k);
+            k.to_owned()
+        })
         .unwrap_or_else(|| crate::settings::get_api_key(which).unwrap_or_default());
 
     (resolved_base, resolved_key)
@@ -2022,6 +2034,67 @@ mod tests {
         assert!(!dl_net_err.message.contains("secret_sk_999"));
         assert!(!dl_net_err.message.contains(known_secret));
         assert!(dl_net_err.message.contains("[REDACTED]"));
+
+        // 5. Redaction before 200-char truncation & download_video rejecting 206 Partial Content
+        crate::settings::register_secret_for_redaction("longtail_tok_777");
+        let pad = "a".repeat(190);
+        let long_body = format!("{pad} Bearer longtail_tok_777 suffix");
+        let classified = ApiFail::classify_http(502, None, &long_body);
+        assert!(
+            !classified.message.contains("longtail_tok_777"),
+            "secret crossing 300-char boundary must still be redacted: {}",
+            classified.message
+        );
+
+        let img_long_srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let img_long_port = img_long_srv.local_addr().unwrap().port();
+        let img_thread = std::thread::spawn(move || {
+            for i in 0..2 {
+                if let Ok((mut s, _)) = img_long_srv.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    if i == 0 {
+                        let json_body = serde_json::json!({
+                            "pad": pad,
+                            "token": "Bearer longtail_tok_777",
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            json_body.len(),
+                            json_body
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    } else {
+                        let resp = "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfake";
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+
+        let base_long = format!("http://127.0.0.1:{img_long_port}/v1");
+        let cfg_long = Settings {
+            endpoint_image_base_url: base_long.clone(),
+            endpoint_video_base_url: base_long.clone(),
+            ..Settings::default()
+        };
+        let long_err = create_image(&cfg_long, &img_path, "prompt").expect_err("missing b64");
+        assert!(
+            !long_err.message.contains("longtail_tok_777"),
+            "secret crossing 200-char truncation leaked: {}",
+            long_err.message
+        );
+        let err_206 = download_video(
+            &cfg_long,
+            &format!("{base_long}/partial.mp4"),
+            &tmp_dir.join("out206.mp4"),
+            "t206",
+            &stop,
+        )
+        .expect_err("206 Partial Content must be rejected");
+        assert_ne!(err_206.code, "OK");
+        img_thread.join().unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

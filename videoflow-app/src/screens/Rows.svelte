@@ -352,7 +352,7 @@
       brokenThumbs = {};
       if (curPath) {
         void load({ silent: true });
-        if (detail) {
+        if (detail && !detailLoading) {
           void refreshOpenDetailSilently(detail.row.row_key);
         }
       }
@@ -537,7 +537,7 @@
 
   // Mở / đóng Drawer có bảo vệ sequence & kiểm tra prompt chưa lưu
   function requestOpenDetail(rowKey: string, preferredTab?: PreviewTab): void {
-    if (detail && detail.row.row_key === rowKey && !promptsDirty) {
+    if (detail && detail.row.row_key === rowKey) {
       if (preferredTab) previewTab = preferredTab;
       return;
     }

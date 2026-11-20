@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ipaddress
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -72,6 +72,13 @@ def _validate_proxy_url(value: str | None) -> str | None:
 
     if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
         raise ValueError("proxy URL must not include a path, query string, or fragment")
+    if scheme in ("socks5", "socks5h") and (
+        parsed.username is not None or parsed.password is not None
+    ):
+        user_b = unquote(parsed.username or "").encode("utf-8")
+        pass_b = unquote(parsed.password or "").encode("utf-8")
+        if len(user_b) > 255 or len(pass_b) > 255:
+            raise ValueError("SOCKS5 username/password must not exceed 255 bytes")
     return cleaned
 
 

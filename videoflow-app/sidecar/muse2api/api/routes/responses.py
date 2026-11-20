@@ -31,6 +31,7 @@ from ...drivers.base import ChatRequest, InputImage
 from ...errors import InvalidRequest, Muse2APIError
 from ...services.container import Services
 from ..deps import conversation_key, get_services, require_api_key
+from .images import MAX_REFERENCE_IMAGES
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["responses"], dependencies=[Depends(require_api_key)])
@@ -121,6 +122,8 @@ async def create_response(body: ResponseRequest, request: Request,
     flat = flatten_messages(messages)
     if not flat.text and not flat.images:
         raise InvalidRequest("input contains no text or images")
+    if len(flat.images) > MAX_REFERENCE_IMAGES:
+        raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
 
     images = [InputImage(*(await load_image_ref(ref))) for ref in flat.images]
     cancel = asyncio.Event()

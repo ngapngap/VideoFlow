@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildProxyInput,
+  formatHostPort,
   isValidIpv6Address,
   parseProxyPaste,
   validateProxyHost,
@@ -187,5 +188,18 @@ describe("buildProxyInput", () => {
     });
     assert.equal(replaced.password, "   ");
     assert.equal(replaced.clear_password, false);
+  });
+});
+
+describe("formatHostPort", () => {
+  it("keeps IPv4 and domain hostnames unbracketed", () => {
+    assert.equal(formatHostPort("1.2.3.4", 8080), "1.2.3.4:8080");
+    assert.equal(formatHostPort(" proxy.corp.local ", 3128), "proxy.corp.local:3128");
+  });
+
+  it("brackets bare IPv6 literals and avoids double-bracketing", () => {
+    assert.equal(formatHostPort("::1", 1080), "[::1]:1080");
+    assert.equal(formatHostPort("2001:db8::1", 8080), "[2001:db8::1]:8080");
+    assert.equal(formatHostPort("[::1]", 1080), "[::1]:1080");
   });
 });

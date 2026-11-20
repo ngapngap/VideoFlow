@@ -3,12 +3,13 @@
   import {
     api,
     type MuseAccount,
-    type MuseQuotaSnapshot,
     type ProxyItem,
   } from "../lib/api";
   import { createSeqGuard } from "../lib/asyncGuard";
   import AccountCard from "../lib/AccountCard.svelte";
   import Icons from "../lib/Icons.svelte";
+  import { isQuotaExhausted } from "../lib/museStatus";
+  import { formatHostPort } from "../lib/proxyInput";
   import {
     formatApiError,
     museAccounts,
@@ -48,7 +49,7 @@
   function formatProxyOptionLabel(p: ProxyItem): string {
     const dot =
       p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
-    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const ipPart = p.exit_ip ? p.exit_ip : formatHostPort(p.host, p.port);
     const latPart =
       p.latency_ms != null
         ? `${p.latency_ms}ms`
@@ -147,6 +148,7 @@
       // 1. Tự khởi động engine nếu chưa chạy
       if (!$museSidecarStatus?.sidecar.running) {
         await api.muse_start_sidecar();
+        await refreshMuseState({ force: true });
       }
 
       // 2. Tạo tài khoản mới kèm proxy_id (nếu có)
@@ -154,14 +156,17 @@
       const proxyIdToSet = newProxyId.trim() || null;
       const res = await api.muse_add_cookie(label, {}, allowDuplicate, proxyIdToSet);
       const acc = res.account;
+      newLabel = "";
+      newProxyId = "";
+      allowDuplicate = false;
+      dupPending = false;
 
       // 3. Mở trình duyệt có giao diện để đăng nhập ngay
       try {
-        await api.muse_open_login(acc.id);
-        newLabel = "";
-        newProxyId = "";
-        allowDuplicate = false;
-        dupPending = false;
+        const loginRes = await api.muse_open_login(acc.id);
+        if (loginRes?.ok === false) {
+          throw new Error(loginRes.message || "Không thể mở trình duyệt đăng nhập.");
+        }
         showToast("success", `Đã thêm tài khoản "${label}". Đang mở trình duyệt đăng nhập...`);
       } catch (loginErr) {
         const detail = formatApiError(loginErr);
@@ -210,7 +215,6 @@
       dupPending = false;
       showManualCookies = false;
       showToast("success", `Đã thêm tài khoản "${label}".`);
-      await loadData();
     } catch (e) {
       const msg = formatApiError(e);
       if (/trùng|belongs to account/i.test(msg) && !allowDuplicate) {
@@ -222,6 +226,7 @@
       showToast("error", `Lỗi thêm cookie: ${addErr}`);
     } finally {
       manualSaveBusy = false;
+      await loadData();
     }
   }
 
@@ -238,23 +243,6 @@
     }
   }
 
-  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
-    if (!q) return false;
-    const pct =
-      q.weekly_used_pct != null
-        ? q.weekly_used_pct
-        : q.messages_used != null && q.messages_limit
-          ? Math.round((q.messages_used / q.messages_limit) * 100)
-          : null;
-    if (pct == null || pct < 100) return false;
-    if (q.extra_left && /[1-9]/.test(q.extra_left)) return false;
-    if (q.resets_at) {
-      const parsed = Date.parse(q.resets_at.trim());
-      if (!Number.isNaN(parsed) && parsed <= Date.now()) return false;
-    }
-    return true;
-  }
-
   function museAccStateKey(a: MuseAccount): string {
     const now = Date.now() / 1000;
     const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
@@ -266,7 +254,7 @@
     if (a.status === "cooling" && a.cooldown_until > now) {
       return isQuota ? "quota" : "cooling";
     }
-    if (isQuotaExhausted(a.meta?.quota)) return "quota";
+    if (isQuotaExhausted(a)) return "quota";
     return "active";
   }
 

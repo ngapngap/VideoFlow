@@ -1,5 +1,5 @@
 // Store toàn cục: dự án đang mở, trạng thái chạy, sự kiện từ lõi & hệ thống Toast (13.2)
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
@@ -62,6 +62,13 @@ export function clearEventLockedAccount(): void {
   eventLockedAccount.set(null);
 }
 
+function isSidecarStoppedError(err: unknown): boolean {
+  if (err && typeof err === "object" && (err as { code?: unknown }).code === "MUSE_SIDECAR_STOPPED") {
+    return true;
+  }
+  return formatApiError(err).includes("MUSE_SIDECAR_STOPPED");
+}
+
 export function refreshMuseState(opts?: { force?: boolean }): Promise<MuseRefreshResult> {
   if (!opts?.force && museRefreshInFlight) {
     return museRefreshInFlight;
@@ -77,7 +84,7 @@ export function refreshMuseState(opts?: { force?: boolean }): Promise<MuseRefres
     try {
       const st = await api.muse_sidecar_status();
       if (seq !== museRefreshSeq) {
-        return { status: st, accounts: [], error: null };
+        return { status: st, accounts: get(museAccounts), error: null };
       }
 
       museSidecarStatus.set(st);
@@ -92,30 +99,51 @@ export function refreshMuseState(opts?: { force?: boolean }): Promise<MuseRefres
         return { status: st, accounts: [], error: null };
       }
 
-      const accRes = await api.muse_list_accounts();
-      if (seq !== museRefreshSeq) {
-        return { status: st, accounts: accRes.data ?? [], error: null };
-      }
+      try {
+        const accRes = await api.muse_list_accounts();
+        if (seq !== museRefreshSeq) {
+          return { status: st, accounts: accRes.data ?? [], error: null };
+        }
 
-      const accounts = accRes.data ?? [];
-      museAccounts.set(accounts);
+        const accounts = accRes.data ?? [];
+        museAccounts.set(accounts);
 
-      if (lockSeqAtStart === museLockSeq) {
-        eventLockedAccount.update((cur) => {
-          if (!cur) return null;
-          const matched = accounts.find((a) => a.id === cur.id);
-          if (!matched || !matched.enabled || matched.status !== "video_locked") {
-            return null;
+        if (lockSeqAtStart === museLockSeq) {
+          eventLockedAccount.update((cur) => {
+            if (!cur) return null;
+            const matched = accounts.find((a) => a.id === cur.id);
+            if (!matched || !matched.enabled || matched.status !== "video_locked") {
+              return null;
+            }
+            return cur;
+          });
+        } else {
+          needsFollowUp = true;
+        }
+
+        return { status: st, accounts, error: null };
+      } catch (accErr) {
+        if (seq === museRefreshSeq && isSidecarStoppedError(accErr)) {
+          museSidecarStatus.set({
+            ...st,
+            sidecar: { ...st.sidecar, running: false },
+          });
+          museAccounts.set([]);
+          if (lockSeqAtStart === museLockSeq) {
+            eventLockedAccount.set(null);
+          } else {
+            needsFollowUp = true;
           }
-          return cur;
-        });
-      } else {
-        needsFollowUp = true;
+          return { status: get(museSidecarStatus), accounts: [], error: formatApiError(accErr) };
+        }
+        return {
+          status: st,
+          accounts: get(museAccounts),
+          error: formatApiError(accErr),
+        };
       }
-
-      return { status: st, accounts, error: null };
     } catch (err) {
-      if (seq === museRefreshSeq) {
+      if (seq === museRefreshSeq && isSidecarStoppedError(err)) {
         museSidecarStatus.set(null);
         museAccounts.set([]);
         if (lockSeqAtStart === museLockSeq) {
@@ -123,8 +151,13 @@ export function refreshMuseState(opts?: { force?: boolean }): Promise<MuseRefres
         } else {
           needsFollowUp = true;
         }
+        return { status: null, accounts: [], error: formatApiError(err) };
       }
-      return { status: null, accounts: [], error: formatApiError(err) };
+      return {
+        status: get(museSidecarStatus),
+        accounts: get(museAccounts),
+        error: formatApiError(err),
+      };
     } finally {
       if (seq === museRefreshSeq) {
         museLoading.set(false);

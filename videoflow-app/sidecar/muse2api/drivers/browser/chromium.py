@@ -56,14 +56,17 @@ def _find_free_port() -> int:
 def _build_wmi_filter(profile_dir: Path, port: int | None = None) -> str:
     """Build a boundary-aware case-insensitive PowerShell filter matching only processes of this profile/port."""
     full = str(profile_dir).replace("'", "''")
+    parent_esc = str(profile_dir.parent).replace("'", "''")
     # Match exact --user-data-dir=<full> followed by quote, whitespace, or end-of-line
     # so acc_1 never matches acc_10.
     cond_parts: list[str] = [
         f"($_.CommandLine -imatch ('--user-data-dir=\"?' + [regex]::Escape('{full}') + '(\"|\\s|$)'))"
     ]
     if port:
+        # Require this app's profile parent dir alongside --remote-debugging-port so
+        # unrelated user browsers using the same port are never matched.
         cond_parts.append(
-            f"($_.CommandLine -imatch '--remote-debugging-port={port}(\\s|$)')"
+            f"(($_.CommandLine -imatch [regex]::Escape('{parent_esc}')) -and ($_.CommandLine -imatch '--remote-debugging-port={port}(\\s|$)'))"
         )
     return " -or ".join(cond_parts)
 
@@ -77,6 +80,7 @@ def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:
     if os.name != "nt":
         return 0
     conditions = _build_wmi_filter(profile_dir, port)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
         script = (
             "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | "
@@ -86,6 +90,7 @@ def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True, text=True, timeout=25,
+            creationflags=creationflags,
         )
         pids = [int(x) for x in (out.stdout or "").split() if x.strip().isdigit()]
     except Exception as exc:  # noqa: BLE001 - best effort cleanup
@@ -93,8 +98,11 @@ def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:
         return 0
     for pid in pids:
         with contextlib.suppress(Exception):
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, timeout=15)
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=15,
+                creationflags=creationflags,
+            )
     if pids:
         log.warning("killed %d stale browser process(es) holding %s", len(pids), profile_dir)
     return len(pids)
@@ -116,6 +124,12 @@ class ChromiumProcess:
         return f"http://127.0.0.1:{self.port}"
 
     async def browser_ws_url(self) -> str | None:
+        dap = self.profile_dir / "DevToolsActivePort"
+        if dap.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                lines = [ln.strip() for ln in dap.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                if lines and lines[0].isdigit() and int(lines[0]) != self.port:
+                    return None
         try:
             # Local DevTools port must not follow http_proxy/https_proxy.
             async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
@@ -184,7 +198,7 @@ class ChromiumProcess:
                     self._proxy_relay = LocalProxyRelay(self.proxy)
                     effective_proxy = await self._proxy_relay.start()
                 else:
-                    effective_proxy = self.proxy
+                    effective_proxy = self.proxy.strip().rstrip("/")
                 args.insert(1, f"--proxy-server={effective_proxy}")
             if self.headless:
                 args[1:1] = ["--headless=new", "--disable-gpu"]
@@ -194,13 +208,13 @@ class ChromiumProcess:
             log.info("launching Chromium: %s (profile=%s)", self.executable, self.profile_dir)
             # Keep stderr isolated per profile so concurrent account launches never collide on Windows.
             self._stderr_path = self.profile_dir / "chromium-stderr.log"
-            stderr_sink = open(self._stderr_path, "wb")
+            stderr_sink = await asyncio.to_thread(self._stderr_path.open, "wb")
             try:
                 self.proc = await asyncio.create_subprocess_exec(
                     *args, stdout=asyncio.subprocess.DEVNULL, stderr=stderr_sink
                 )
             finally:
-                stderr_sink.close()
+                await asyncio.to_thread(stderr_sink.close)
 
             for _ in range(120):  # 60s: cold start on Windows + AV scanning can be slow
                 if self.proc.returncode is not None:
@@ -219,26 +233,30 @@ class ChromiumProcess:
             raise
 
     async def stop(self) -> None:
-        if self.proc and self.proc.returncode is None:
-            if os.name == "nt":
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(
-                        subprocess.run,
-                        ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                        capture_output=True,
-                        timeout=15,
-                    )
-            else:
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    self.proc.terminate()
-            try:
-                await asyncio.wait_for(self.proc.wait(), 10)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    self.proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.proc.wait(), 5)
-        self.proc = None
-        if self._proxy_relay is not None:
-            await self._proxy_relay.stop()
-            self._proxy_relay = None
+        try:
+            if self.proc and self.proc.returncode is None:
+                if os.name == "nt":
+                    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                            capture_output=True,
+                            timeout=15,
+                            creationflags=creationflags,
+                        )
+                else:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        self.proc.terminate()
+                try:
+                    await asyncio.wait_for(self.proc.wait(), 10)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        self.proc.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(self.proc.wait(), 5)
+            self.proc = None
+        finally:
+            if self._proxy_relay is not None:
+                await self._proxy_relay.stop()
+                self._proxy_relay = None

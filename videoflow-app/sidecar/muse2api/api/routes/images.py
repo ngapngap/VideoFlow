@@ -125,31 +125,48 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
     muse.ai has no inpainting, so the images act as references for a new image
     and ``mask`` is rejected rather than silently ignored.
     """
-    form = await request.form()
-    if form.get("mask") is not None:
-        raise InvalidRequest("mask is not supported; muse.ai cannot inpaint a region")
-    files = [f for key in ("image", "image[]") for f in form.getlist(key)
-             if isinstance(f, UploadFile)]
-    if not files:
-        raise InvalidRequest("at least one image file is required (field 'image' or 'image[]')")
-    if len(files) > MAX_REFERENCE_IMAGES:
-        raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
-    fields = {k: v for k, v in form.items() if isinstance(v, str) and k not in ("image", "image[]")}
+    max_body = (MAX_REFERENCE_IMAGES + 1) * _MAX_FETCH_BYTES
+    raw_cl = request.headers.get("content-length")
+    if raw_cl is not None:
+        try:
+            cl_val = int(raw_cl.strip())
+        except ValueError as exc:
+            raise InvalidRequest("invalid Content-Length header") from exc
+        if cl_val > max_body:
+            raise InvalidRequest("request body too large")
+
+    form = await request.form(max_files=MAX_REFERENCE_IMAGES + 2)
     try:
-        body = ImageGenerationRequest(**fields)
-    except ValidationError as exc:
-        raise InvalidRequest(exc.errors()[0].get("msg", "invalid request")) from exc
-    refs = []
-    for f in files:
-        if f.size is not None and f.size > _MAX_FETCH_BYTES:
-            raise InvalidRequest("uploaded image exceeds 20 MiB")
-        mime = f.content_type or ""
-        if not mime.startswith("image/"):
-            mime = mimetypes.guess_type(f.filename or "")[0] or "image/png"
-        raw = await f.read(_MAX_FETCH_BYTES + 1)
-        if len(raw) > _MAX_FETCH_BYTES:
-            raise InvalidRequest("uploaded image exceeds 20 MiB")
-        refs.append(InputImage(data=raw, mime=mime))
+        if form.get("mask") is not None:
+            raise InvalidRequest("mask is not supported; muse.ai cannot inpaint a region")
+        files = [f for key in ("image", "image[]") for f in form.getlist(key)
+                 if isinstance(f, UploadFile)]
+        if not files:
+            raise InvalidRequest("at least one image file is required (field 'image' or 'image[]')")
+        if len(files) > MAX_REFERENCE_IMAGES:
+            raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
+        fields = {
+            k: v for k, v in form.items() if isinstance(v, str) and k not in ("image", "image[]")
+        }
+        try:
+            body = ImageGenerationRequest(**fields)
+        except ValidationError as exc:
+            raise InvalidRequest(exc.errors()[0].get("msg", "invalid request")) from exc
+        refs = []
+        for f in files:
+            if f.size is not None and f.size > _MAX_FETCH_BYTES:
+                raise InvalidRequest("uploaded image exceeds 20 MiB")
+            mime = f.content_type or ""
+            if not mime.startswith("image/"):
+                mime = mimetypes.guess_type(f.filename or "")[0] or "image/png"
+            raw = await f.read(_MAX_FETCH_BYTES + 1)
+            if len(raw) > _MAX_FETCH_BYTES:
+                raise InvalidRequest("uploaded image exceeds 20 MiB")
+            if not raw:
+                raise InvalidRequest("uploaded image is empty")
+            refs.append(InputImage(data=raw, mime=mime))
+    finally:
+        await form.close()
     return await _generate(body, refs, request, svc)
 
 

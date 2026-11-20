@@ -145,6 +145,22 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn enable_and_check_foreign_keys(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let violation: Option<String> = conn
+        .query_row("PRAGMA foreign_key_check", [], |r| r.get::<_, String>(0))
+        .optional()?;
+    if let Some(tbl) = violation {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!(
+                "PRAGMA foreign_key_check phát hiện vi phạm khóa ngoại tại bảng '{tbl}'."
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn migrate_logs_v4_check_constraint(conn: &Connection) -> Result<(), rusqlite::Error> {
     let table_sql: Option<String> = conn
         .query_row(
@@ -194,7 +210,7 @@ fn migrate_logs_v4_check_constraint(conn: &Connection) -> Result<(), rusqlite::E
         Ok(())
     })();
 
-    let fk_on_res = conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA foreign_key_check;");
+    let fk_on_res = enable_and_check_foreign_keys(conn);
     migration_res?;
     fk_on_res?;
 
@@ -278,7 +294,7 @@ fn migrate_jobs_v3_check_constraint(conn: &Connection) -> Result<(), rusqlite::E
         Ok(())
     })();
 
-    let fk_on_res = conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA foreign_key_check;");
+    let fk_on_res = enable_and_check_foreign_keys(conn);
     migration_res?;
     fk_on_res?;
 
@@ -471,7 +487,12 @@ pub fn migrate_file_refs_row_key(
         collected
     };
 
+    let mut touched_kinds = std::collections::BTreeSet::<String>::new();
+    if let Some(k) = kind_filter {
+        touched_kinds.insert(k.to_string());
+    }
     for (id, cur_row_key, kind, file_name, version, is_current) in rows {
+        touched_kinds.insert(kind.clone());
         if cur_row_key == to_key {
             continue;
         }
@@ -518,6 +539,26 @@ pub fn migrate_file_refs_row_key(
                     rusqlite::params![to_key, id],
                 )?;
             }
+        }
+    }
+
+    for k in touched_kinds {
+        let winner_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM file_refs
+                 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2 AND is_current = 1
+                 ORDER BY version DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![to_key, k],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(keep_cur_id) = winner_id {
+            tx.execute(
+                "UPDATE file_refs SET is_current = 0
+                 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2 AND is_current = 1 AND id != ?3",
+                rusqlite::params![to_key, k, keep_cur_id],
+            )?;
         }
     }
 
@@ -569,19 +610,21 @@ pub fn migrate_jobs_row_key(
             .optional()?;
 
         match existing_job_id {
-            Some(survivor_id) => {
+            Some(existing_id) => {
+                let keep_id = job_id.max(existing_id);
+                let drop_id = job_id.min(existing_id);
                 tx.execute(
                     "UPDATE attempts SET job_id = ?1 WHERE job_id = ?2",
-                    rusqlite::params![survivor_id, job_id],
+                    rusqlite::params![keep_id, drop_id],
                 )?;
                 tx.execute(
                     "UPDATE file_refs SET job_id = ?1 WHERE job_id = ?2",
-                    rusqlite::params![survivor_id, job_id],
+                    rusqlite::params![keep_id, drop_id],
                 )?;
-                tx.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![job_id])?;
+                tx.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![drop_id])?;
                 tx.execute(
                     "UPDATE jobs SET row_key = ?1 WHERE id = ?2",
-                    rusqlite::params![to_key, survivor_id],
+                    rusqlite::params![to_key, keep_id],
                 )?;
             }
             None => {
@@ -1370,6 +1413,68 @@ mod tests {
         assert_eq!(dog_refs.len(), 2);
         assert_eq!(dog_refs[0], ("dog.png".to_string(), 1, "dog_gen.png".to_string(), 1));
         assert_eq!(dog_refs[1], ("dog.png".to_string(), 2, "dog_gen_v2.png".to_string(), 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pass2_file_refs_normalizes_is_current_and_jobs_keeps_newer_id() {
+        let dir = temp_project_dir("pass2_migrate");
+        let conn = open(&dir).unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-18T00:00:00Z', 1)",
+            [],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+
+        // Older job has row_key = to_key; newer job has row_key = from_key
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'new.png#h1', 'da_tao_image')",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+        let older_job = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'new.png', 'da_tao_video')",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+        let newer_job = conn.last_insert_rowid();
+        assert!(newer_job > older_job);
+
+        // Two distinct versions both marked is_current = 1 across from_key & to_key
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'new.png#h1', 'anh', 'v1.png', 'image_out/v1.png', 1, 1, '2026-11-18T00:01:00Z')",
+            rusqlite::params![older_job],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'new.png', 'anh', 'v2_other.png', 'image_out/v2_other.png', 2, 1, '2026-11-18T00:02:00Z')",
+            rusqlite::params![newer_job],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_jobs_row_key(&tx, "new.png", "new.png#h1").unwrap();
+        migrate_file_refs_row_key(&tx, "new.png", "new.png#h1", Some("anh")).unwrap();
+        tx.commit().unwrap();
+
+        let surviving_jobs: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM jobs WHERE row_key = 'new.png#h1'").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+        };
+        assert_eq!(surviving_jobs, vec![newer_job]);
+
+        let current_versions: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT version FROM file_refs WHERE row_key = 'new.png#h1' AND kind = 'anh' AND is_current = 1")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect()
+        };
+        assert_eq!(current_versions, vec![2]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

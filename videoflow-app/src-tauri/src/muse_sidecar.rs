@@ -37,9 +37,18 @@ struct SidecarHandle {
 }
 
 static SIDECAR: OnceLock<parking_lot::RwLock<Option<SidecarHandle>>> = OnceLock::new();
+static START_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sidecar_cell() -> &'static parking_lot::RwLock<Option<SidecarHandle>> {
     SIDECAR.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_system32_exe(rel: &str) -> PathBuf {
+    let sys_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    sys_root.join("System32").join(rel)
 }
 
 /// Trạng thái sidecar cho UI.
@@ -294,9 +303,15 @@ fn parse_admin_response(resp: reqwest::blocking::Response) -> AppResult<serde_js
             .get("error")
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_str())
-            .unwrap_or("MUSE_ADMIN_FAIL");
+            .unwrap_or("ADMIN_FAIL");
+        let upper_code = sidecar_code.to_ascii_uppercase();
+        let err_code = if upper_code.starts_with("MUSE_") {
+            upper_code
+        } else {
+            format!("MUSE_{upper_code}")
+        };
         return Err(AppError::new(
-            &format!("MUSE_{}", sidecar_code.to_uppercase()),
+            &err_code,
             crate::settings::redact_secrets(&format!("Sidecar trả lỗi {status}: {sidecar_msg}")),
         ));
     }
@@ -313,6 +328,12 @@ fn wait_health(port: u16, child: &mut Child, deadline_secs: u64) -> AppResult<()
     let url = format!("http://127.0.0.1:{port}/healthz");
     let deadline = Instant::now() + Duration::from_secs(deadline_secs);
     loop {
+        if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::new(
+                "MUSE_START_CANCELLED",
+                "Đã hủy khởi động engine.",
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(AppError::new(
                 "MUSE_SIDECAR_TIMEOUT",
@@ -409,16 +430,23 @@ pub(crate) fn sync_proxies_to_sidecar_with_conn(
             return;
         }
     };
-    let proxy_urls_map = match crate::proxies::resolve_proxy_urls_map_in(conn) {
-        Ok(m) => m,
-        Err(e) => {
-            log_info(&format!(
-                "Bỏ qua đồng bộ proxy khi khởi động sidecar (resolve proxy URL lỗi): {}",
-                e.message
-            ));
-            return;
-        }
-    };
+    let (proxy_urls_map, failed_proxy_ids) =
+        match crate::proxies::resolve_proxy_urls_map_best_effort_in(conn) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log_info(&format!(
+                    "Bỏ qua đồng bộ proxy khi khởi động sidecar (resolve proxy URL lỗi): {}",
+                    e.message
+                ));
+                return;
+            }
+        };
+    if !failed_proxy_ids.is_empty() {
+        log_info(&format!(
+            "Cảnh báo: một số proxy không giải mã được khi khởi động sidecar ({}); giữ nguyên các proxy khỏe mạnh còn lại.",
+            failed_proxy_ids.join(", ")
+        ));
+    }
 
     let res = match admin_get(port, api_key, "/admin/accounts") {
         Ok(v) => v,
@@ -462,11 +490,13 @@ pub(crate) fn sync_proxies_to_sidecar_with_conn(
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let desired_url = acc_to_proxy
-            .get(acc_id)
-            .and_then(|pid| proxy_urls_map.get(pid));
-
-        if let Some(full_url) = desired_url {
+        if let Some(pid) = acc_to_proxy.get(acc_id) {
+            let Some(full_url) = proxy_urls_map.get(pid) else {
+                log_info(&format!(
+                    "Cảnh báo: bỏ qua đồng bộ proxy '{pid}' cho account '{acc_id}' do không giải mã được."
+                ));
+                continue;
+            };
             if is_busy {
                 log_info(&format!(
                     "Cảnh báo: account '{acc_id}' đang bận khi khởi động sidecar — bỏ qua đồng bộ proxy."
@@ -513,6 +543,7 @@ pub(crate) fn sync_proxies_to_sidecar_with_conn(
 /// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
 pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let _spawn_guard = start_lock().lock();
+    START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
     if current_session().is_some() {
         return status(cfg);
     }
@@ -538,11 +569,25 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let mut last_err: Option<AppError> = None;
     let mut failed_ports: Vec<u16> = Vec::new();
     for attempt in 1..=2 {
+        if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppError::new(
+                "MUSE_START_CANCELLED",
+                "Đã hủy khởi động engine.",
+            ));
+        }
         if attempt == 2 {
             log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
             kill_orphan_sidecars();
             kill_orphan_edges(&data_dir);
-            std::thread::sleep(Duration::from_millis(1500));
+            for _ in 0..15 {
+                if START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(AppError::new(
+                        "MUSE_START_CANCELLED",
+                        "Đã hủy khởi động engine.",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
 
         let port = find_free_port_excluding_any(cfg.muse_sidecar_port, &failed_ports)?;
@@ -563,6 +608,7 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
             .env("MUSE2API_DATA_DIR", &data_dir)
             .env("MUSE2API_CHROMIUM_PATH", &chromium)
             .env("MUSE2API_HEADLESS", if cfg.muse_headless { "true" } else { "false" })
+            .env("MUSE2API_DEFER_PREWARM", "true")
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         #[cfg(target_os = "windows")]
@@ -586,8 +632,11 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
         };
         match wait_health(port, &mut child, 90) {
             Ok(()) => {
-                // Đồng bộ proxy TRƯỚC khi công bố SidecarHandle để ensure_running() không chạy trước proxy sync.
+                // Đồng bộ proxy TRƯỚC khi kích hoạt prewarm và công bố SidecarHandle.
                 sync_proxies_to_sidecar(port, &api_key);
+                if let Err(e) = admin_send(port, &api_key, "POST", "/admin/prewarm", None) {
+                    log_info(&format!("Bỏ qua /admin/prewarm sau khởi động: {}", e.message));
+                }
                 *sidecar_cell().write() = Some(SidecarHandle {
                     child,
                     port,
@@ -606,6 +655,11 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
             Err(e) => {
                 // Engine không lên được: kill cây process để không để lại engine mồ côi.
                 kill_child_tree(&mut child);
+                if e.code == "MUSE_START_CANCELLED"
+                    || START_CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(e);
+                }
                 failed_ports.push(port);
                 failed_ports.push(cdp_port);
                 last_err = Some(e.with_engine_hint(&data_dir));
@@ -654,7 +708,12 @@ fn extract_interesting_stderr_line(path: &std::path::Path) -> Option<String> {
                 || low.contains("devtools")
         })
         .rfind(|l| !l.trim().is_empty())
-        .map(|last| last.trim().chars().take(300).collect::<String>())
+        .map(|last| {
+            crate::settings::redact_secrets(last.trim())
+                .chars()
+                .take(300)
+                .collect::<String>()
+        })
 }
 
 fn read_engine_error_hint(data_dir: &std::path::Path) -> Vec<String> {
@@ -753,8 +812,9 @@ fn kill_orphan_sidecars() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let taskkill = windows_system32_exe("taskkill.exe");
         for img in [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV, SIDECAR_EXE_DEV_GNU] {
-            let _ = Command::new("taskkill")
+            let _ = Command::new(&taskkill)
                 .args(["/IM", img, "/T", "/F"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
@@ -771,14 +831,13 @@ fn kill_orphan_edges(data_dir: &std::path::Path) {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let needle = data_dir.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | \
-             Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{needle}') }} | \
-             ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-        );
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        let ps = windows_system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+        let script = "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | \
+             Where-Object { $_.CommandLine -and $env:VF_DATA_DIR -and $_.CommandLine.IndexOf($env:VF_DATA_DIR, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | \
+             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        let _ = Command::new(&ps)
+            .env("VF_DATA_DIR", data_dir)
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         // Cho Edge nhả file/profile trước khi engine mới khởi động nó lần nữa.
@@ -797,7 +856,8 @@ fn kill_child_tree(child: &mut Child) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let pid = child.id();
-        let _ = Command::new("taskkill")
+        let taskkill = windows_system32_exe("taskkill.exe");
+        let _ = Command::new(&taskkill)
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
@@ -826,6 +886,7 @@ where
     F1: FnOnce(),
     F2: FnOnce(&std::path::Path),
 {
+    START_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
     let _spawn_guard = start_lock().lock();
     let handle = sidecar_cell().write().take();
     if let Some(mut h) = handle {
@@ -838,6 +899,7 @@ where
         kill_edges(data_dir);
         log_info("VideoFlow Muse engine không có handle — đã dọn tiến trình mồ côi");
     }
+    START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -1309,5 +1371,94 @@ mod tests {
         assert!(chosen > 0);
         assert_ne!(chosen, p1);
         assert_ne!(chosen, p2);
+    }
+
+    #[test]
+    fn pass2_redact_before_truncate_wait_cancel_and_best_effort_sync() {
+        let _serial = test_sidecar_guard();
+        // 1. Long error with secret ending PAST char 300 must still be redacted cleanly
+        let tmp = std::env::temp_dir().join(format!("vf_redact_trunc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pad = "a".repeat(285);
+        std::fs::write(
+            tmp.join("stderr.log"),
+            format!("ERROR: {pad} http://u:p@1.2.3.4:8080/longpath\n"),
+        )
+        .unwrap();
+        let line = extract_interesting_stderr_line(&tmp.join("stderr.log")).unwrap();
+        assert!(!line.contains("u:p@"), "secret before truncate leaked: {line}");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // 2. START_CANCELLED aborts wait_health immediately with MUSE_START_CANCELLED
+        let mut child = Command::new(windows_system32_exe("cmd.exe"))
+            .args(["/C", "timeout /T 1 /NOBREAK >NUL"])
+            .spawn()
+            .unwrap();
+        START_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancel_err = wait_health(1, &mut child, 30).expect_err("must cancel");
+        START_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        kill_child_tree(&mut child);
+        assert_eq!(cancel_err.code, "MUSE_START_CANCELLED");
+
+        // 3. sync_proxies_to_sidecar_with_conn keeps syncing healthy accounts when one proxy is corrupt
+        let db_path = std::env::temp_dir().join(format!("vf_sync_best_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        let conn = crate::proxies::open_db_at(&db_path).unwrap();
+        let px_ok = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "OK".into(),
+                kind: "http".into(),
+                host: "127.0.0.1".into(),
+                port: 8888,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO proxies (id, name, kind, host, port, username, password, created_at, updated_at)
+             VALUES ('px_corrupt', 'Bad', 'http', '127.0.0.2', 8889, 'u', 'enc:v1:corrupt', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_ok", Some(&px_ok.id)).unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_corrupt", Some("px_corrupt")).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let patched_ids = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let patched_bg = patched_ids.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // 1 GET + 1 PATCH
+            for _ in 0..2 {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.starts_with("GET /admin/accounts ") {
+                        let body = r#"{"data":[{"id":"acc_ok","busy":false},{"id":"acc_corrupt","busy":false,"proxy":"http://***@127.0.0.2:8889"}]}"#;
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        let _ = s.write_all(resp.as_bytes());
+                    } else if let Some(line) = req.lines().next() {
+                        patched_bg.lock().push(line.to_string());
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                        let _ = s.write_all(resp.as_bytes());
+                    }
+                }
+            }
+        });
+
+        sync_proxies_to_sidecar_with_conn(port, "k", &conn);
+        server.join().unwrap();
+        let reqs = patched_ids.lock().clone();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].contains("/admin/accounts/acc_ok"));
+        let _ = std::fs::remove_file(&db_path);
     }
 }

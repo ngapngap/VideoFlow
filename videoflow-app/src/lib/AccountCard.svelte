@@ -4,6 +4,8 @@
   import { isAccountActionBlocked, shouldSyncSelectedProxy } from "./asyncGuard";
   import Icons from "./Icons.svelte";
   import Modal from "./Modal.svelte";
+  import { isQuotaExhausted } from "./museStatus";
+  import { formatHostPort } from "./proxyInput";
   import { formatApiError, showToast } from "./store";
 
   export let account: MuseAccount;
@@ -35,13 +37,17 @@
     }
   }
 
+  function isCardBusy(): boolean {
+    return isAccountActionBlocked({
+      actionBusy,
+      proxySaving,
+      quotaBusy,
+      running,
+      accountBusy: Boolean(account.busy),
+    });
+  }
+
   $: actionBlocked = isAccountActionBlocked({
-    actionBusy,
-    proxySaving,
-    running,
-    accountBusy: Boolean(account.busy),
-  });
-  $: proxyOrQuotaBlocked = isAccountActionBlocked({
     actionBusy,
     proxySaving,
     quotaBusy,
@@ -52,7 +58,7 @@
   function formatProxyOptionLabel(p: ProxyItem): string {
     const dot =
       p.last_status === "alive" ? "🟢" : p.last_status === "dead" ? "🔴" : "⚪";
-    const ipPart = p.exit_ip ? p.exit_ip : `${p.host}:${p.port}`;
+    const ipPart = p.exit_ip ? p.exit_ip : formatHostPort(p.host, p.port);
     const latPart =
       p.latency_ms != null
         ? `${p.latency_ms}ms`
@@ -88,29 +94,6 @@
     return Array.from(new Set(names));
   })();
 
-  function hasPositiveExtra(extra: string | null | undefined): boolean {
-    if (!extra || !extra.trim()) return false;
-    return /[1-9]/.test(extra);
-  }
-
-  function isResetDatePassed(resetsAt: string | null | undefined): boolean {
-    if (!resetsAt || !resetsAt.trim()) return false;
-    const raw = resetsAt.trim();
-    const parsed = Date.parse(raw);
-    if (!Number.isNaN(parsed)) {
-      return parsed <= Date.now();
-    }
-    return false;
-  }
-
-  function isQuotaExhausted(q: MuseQuotaSnapshot | undefined): boolean {
-    const usedPct = museQuotaPct(q);
-    if (usedPct == null || usedPct < 100) return false;
-    if (hasPositiveExtra(q?.extra_left)) return false;
-    if (isResetDatePassed(q?.resets_at)) return false;
-    return true;
-  }
-
   function museAccState(a: MuseAccount): { key: string; label: string; cls: string } {
     const now = Date.now() / 1000;
     const isQuota = /quota|credit|out of (usage|messages)|limit reached|exhaust/i.test(
@@ -124,7 +107,7 @@
         ? { key: "quota", label: "Hết hạn mức", cls: "warn" }
         : { key: "cooling", label: "Tạm chờ", cls: "info" };
     }
-    if (isQuotaExhausted(a.meta?.quota)) {
+    if (isQuotaExhausted(a)) {
       return { key: "quota", label: "Hết hạn mức", cls: "warn" };
     }
     return { key: "active", label: "Hoạt động", cls: "ok" };
@@ -171,14 +154,7 @@
 
   async function handleToggle(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       input.checked = account.enabled;
       return;
     }
@@ -197,15 +173,7 @@
   async function handleProxySelectChange(e: Event) {
     const selectEl = e.currentTarget as HTMLSelectElement;
     const nextPid = selectEl.value;
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        quotaBusy,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       selectEl.value = account.proxy_id || "";
       return;
     }
@@ -237,15 +205,7 @@
   }
 
   async function handleRefreshQuota() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        quotaBusy,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     quotaBusy = true;
@@ -268,14 +228,7 @@
   }
 
   async function handleRenew() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     actionBusy = true;
@@ -295,14 +248,7 @@
   }
 
   async function handleReset() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     actionBusy = true;
@@ -318,20 +264,17 @@
   }
 
   async function handleOpenLogin() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     actionBusy = true;
     try {
       const res = await api.muse_open_login(account.id);
-      showToast("info", res.message || "Đang mở trình duyệt đăng nhập...");
+      if (res?.ok === false) {
+        showToast("error", res.message || "Không thể mở trình duyệt đăng nhập.");
+        return;
+      }
+      showToast("info", res?.message || "Đang mở trình duyệt đăng nhập...");
       dispatch("openLogin", { id: account.id });
     } catch (e) {
       showToast("error", `Không thể mở trình duyệt: ${formatApiError(e)}`);
@@ -341,20 +284,17 @@
   }
 
   async function handleOpenView() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     actionBusy = true;
     try {
       const res = await api.muse_open_view(account.id);
-      showToast("info", res.message || "Đang mở trình duyệt xem hội thoại...");
+      if (res?.ok === false) {
+        showToast("error", res.message || "Không thể mở trình duyệt xem hội thoại.");
+        return;
+      }
+      showToast("info", res?.message || "Đang mở trình duyệt xem hội thoại...");
       dispatch("openView", { id: account.id });
     } catch (e) {
       showToast("error", `Không thể mở xem web: ${formatApiError(e)}`);
@@ -364,28 +304,14 @@
   }
 
   function requestDelete() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     deleteConfirmOpen = true;
   }
 
   async function confirmDelete() {
-    if (
-      isAccountActionBlocked({
-        actionBusy,
-        proxySaving,
-        running,
-        accountBusy: Boolean(account.busy),
-      })
-    ) {
+    if (isCardBusy()) {
       return;
     }
     actionBusy = true;
@@ -478,7 +404,7 @@
       value={selectedProxyId}
       aria-label={`Chọn proxy cho tài khoản ${account.label || account.id}`}
       on:change={handleProxySelectChange}
-      disabled={proxyOrQuotaBlocked}
+      disabled={actionBlocked}
     >
       <option value="">Trực tiếp (không dùng proxy)</option>
       {#each proxies as p (p.id)}
@@ -548,7 +474,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={proxyOrQuotaBlocked}
+      disabled={actionBlocked}
       on:click={handleRefreshQuota}
       title="Đọc lại hạn mức từ trang Settings → Usage của muse.ai"
     >

@@ -4,6 +4,7 @@ import type { MuseAccount } from "../src/lib/api.js";
 import {
   deriveStatusbarIpText,
   formatProxyHostPort,
+  isQuotaExhausted,
   resolveLockedAccount,
 } from "../src/lib/museStatus.js";
 
@@ -167,5 +168,115 @@ describe("deriveStatusbarIpText", () => {
       ]).text,
       "IP: Đa proxy (2 nguồn)"
     );
+  });
+});
+
+describe("isQuotaExhausted", () => {
+  function quotaSnap(overrides: Partial<NonNullable<MuseAccount["meta"]["quota"]>> = {}) {
+    return {
+      plan: "free",
+      weekly_used_pct: 100,
+      resets_at: null,
+      extra_left: "0",
+      found: true,
+      ...overrides,
+    };
+  }
+
+  it("honors explicit backend quota_exhausted flag when present", () => {
+    const flaggedTrue = makeAccount({
+      quota_exhausted: true,
+      meta: { quota: quotaSnap({ weekly_used_pct: 10 }) },
+    });
+    const flaggedFalse = makeAccount({
+      quota_exhausted: false,
+      meta: { quota: quotaSnap({ weekly_used_pct: 100, resets_at: "2099-12-31" }) },
+    });
+    assert.equal(isQuotaExhausted(flaggedTrue), true);
+    assert.equal(isQuotaExhausted(flaggedFalse), false);
+  });
+
+  it("handles zero extra tokens, unparseable/missing resets, and expired resets like Python", () => {
+    const nowMs = new Date(2026, 4, 10, 12, 0, 0).getTime();
+
+    assert.equal(
+      isQuotaExhausted(
+        makeAccount({ meta: { quota: quotaSnap({ resets_at: null }) } }),
+        nowMs
+      ),
+      false
+    );
+
+    assert.equal(
+      isQuotaExhausted(
+        makeAccount({ meta: { quota: quotaSnap({ resets_at: "next Tuesday??" }) } }),
+        nowMs
+      ),
+      false
+    );
+
+    assert.equal(
+      isQuotaExhausted(
+        makeAccount({
+          meta: {
+            quota: quotaSnap({ extra_left: "0B tokens left", resets_at: "May 20, 2026" }),
+          },
+        }),
+        nowMs
+      ),
+      true
+    );
+
+    assert.equal(
+      isQuotaExhausted(
+        makeAccount({
+          meta: {
+            quota: quotaSnap({ extra_left: "1,200 tokens", resets_at: "May 20, 2026" }),
+          },
+        }),
+        nowMs
+      ),
+      false
+    );
+
+    assert.equal(
+      isQuotaExhausted(
+        makeAccount({
+          meta: { quota: quotaSnap({ extra_left: "none", resets_at: "2026-05-09" }) },
+        }),
+        nowMs
+      ),
+      false
+    );
+  });
+
+  it("anchors year-less English and Chinese dates against checked_at", () => {
+    const checkedAtSec = Math.floor(new Date(2025, 11, 20, 10, 0, 0).getTime() / 1000);
+    const beforeJanResetMs = new Date(2026, 0, 4, 12, 0, 0).getTime();
+    const afterJanResetMs = new Date(2026, 0, 6, 1, 0, 0).getTime();
+
+    const enAcc = makeAccount({
+      meta: {
+        quota: quotaSnap({
+          extra_left: "0.0",
+          resets_at: "Jan 5",
+          checked_at: checkedAtSec,
+        }),
+      },
+    });
+    assert.equal(isQuotaExhausted(enAcc, beforeJanResetMs), true);
+    assert.equal(isQuotaExhausted(enAcc, afterJanResetMs), false);
+
+    const zhAcc = makeAccount({
+      meta: {
+        quota: quotaSnap({
+          extra_left: "0",
+          resets_at: "1月5日",
+          fetched_at: checkedAtSec,
+        }),
+      },
+    });
+    assert.equal(isQuotaExhausted(zhAcc, beforeJanResetMs), true);
+    assert.equal(isQuotaExhausted(zhAcc, afterJanResetMs), false);
   });
 });

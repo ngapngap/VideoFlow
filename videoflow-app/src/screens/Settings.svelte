@@ -81,7 +81,10 @@
   // ━━ VideoFlow Muse nội bộ: engine + pool cookie + hạn mức (tab Endpoint video) ━━
   let museLoading = false;
   let museErr = "";
-  let museSidecarBusy = false;
+  let museStarting = false;
+  let museStopping = false;
+  let museRestarting = false;
+  $: museSidecarBusy = museStarting || museStopping || museRestarting;
   let destroyed = false;
   let museRefreshSeq = 0;
 
@@ -107,8 +110,8 @@
   }
 
   async function museStart() {
-    if (museSidecarBusy || $running) return;
-    museSidecarBusy = true;
+    if (museSidecarBusy || $running || $museSidecarStatus?.sidecar.running) return;
+    museStarting = true;
     museErr = "";
     try {
       await api.muse_start_sidecar();
@@ -118,7 +121,7 @@
       museErr = formatApiError(e);
       showToast("error", museErr);
     } finally {
-      museSidecarBusy = false;
+      museStarting = false;
     }
   }
 
@@ -134,7 +137,7 @@
       await save();
       if (dirty) return;
     }
-    museSidecarBusy = true;
+    museRestarting = true;
     museErr = "";
     try {
       await api.muse_stop_sidecar();
@@ -154,13 +157,13 @@
     } finally {
       // Luôn đồng bộ badge/nút theo trạng thái THẬT, kể cả khi lỗi.
       await museRefresh();
-      museSidecarBusy = false;
+      museRestarting = false;
     }
   }
 
   async function museStop() {
     if (museSidecarBusy || $running) return;
-    museSidecarBusy = true;
+    museStopping = true;
     try {
       await api.muse_stop_sidecar();
       showToast("info", "Đã dừng engine VideoFlow Muse.");
@@ -168,7 +171,7 @@
     } catch (e) {
       museErr = formatApiError(e);
     } finally {
-      museSidecarBusy = false;
+      museStopping = false;
     }
   }
 
@@ -472,6 +475,8 @@
         ],
         schedule_hours: Math.round(Number(s.schedule_hours)),
         auto_cleanup_days: Math.round(Number(s.auto_cleanup_days)),
+        muse_chromium_path: (s.muse_chromium_path || "").trim(),
+        muse_sidecar_port: Math.round(Number(s.muse_sidecar_port)),
       };
 
       const result = await executeSettingsSave({
@@ -1223,11 +1228,11 @@
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy || $running}
+                disabled={museSidecarBusy || $running || Boolean($museSidecarStatus?.sidecar.running)}
                 on:click={museStart}
               >
                 <Icons name="play" size={14} />
-                <span>{museSidecarBusy ? "Đang khởi động..." : "Khởi động"}</span>
+                <span>{museStarting ? "Đang khởi động..." : "Khởi động"}</span>
               </button>
               <button
                 type="button"
@@ -1236,7 +1241,7 @@
                 on:click={museStop}
               >
                 <Icons name="stop" size={14} />
-                <span>Dừng</span>
+                <span>{museStopping ? "Đang dừng..." : "Dừng"}</span>
               </button>
               <button type="button" class="btn-secondary" disabled={museLoading} on:click={museRefresh}>
                 <Icons name="refresh" size={14} />
@@ -1251,7 +1256,7 @@
                   title="Cài đặt Port / Edge / headless đã đổi — áp dụng bằng cách khởi động lại engine"
                 >
                   <Icons name="redo" size={14} />
-                  <span>{museSidecarBusy ? "Đang áp dụng..." : "Áp dụng & khởi động lại"}</span>
+                  <span>{museRestarting ? "Đang áp dụng..." : "Áp dụng & khởi động lại"}</span>
                 </button>
               {/if}
             </div>

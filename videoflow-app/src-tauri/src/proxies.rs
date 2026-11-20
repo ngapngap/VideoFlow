@@ -225,6 +225,20 @@ fn register_proxy_password_for_redaction(plain: &str) {
 }
 
 fn migrate_plaintext_passwords(conn: &mut Connection) -> AppResult<()> {
+    let has_plaintext: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM proxies
+                 WHERE password IS NOT NULL AND password != '' AND password NOT GLOB 'enc:v1:*'
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| AppError::new("PROXY_DB_MIGRATE", format!("{e}")))?;
+    if !has_plaintext {
+        return Ok(());
+    }
+
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| AppError::new("PROXY_DB_MIGRATE", format!("{e}")))?;
@@ -232,7 +246,7 @@ fn migrate_plaintext_passwords(conn: &mut Connection) -> AppResult<()> {
         let mut stmt = tx
             .prepare(
                 "SELECT id, password FROM proxies
-                 WHERE password IS NOT NULL AND password != '' AND password NOT LIKE 'enc:v1:%'",
+                 WHERE password IS NOT NULL AND password != '' AND password NOT GLOB 'enc:v1:*'",
             )
             .map_err(|e| AppError::new("PROXY_DB_MIGRATE", format!("{e}")))?;
         let mapped = stmt
@@ -266,6 +280,8 @@ pub fn open_db_at(path: &Path) -> AppResult<Connection> {
     }
     let mut conn = Connection::open(path)
         .map_err(|e| AppError::new("PROXY_DB_OPEN", format!("Không mở được proxies.db: {e}")))?;
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(|e| AppError::new("PROXY_DB_INIT", format!("Không đặt được busy_timeout proxies.db: {e}")))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
@@ -435,7 +451,9 @@ pub fn resolve_proxy_url_in(conn: &Connection, proxy_id: &str) -> AppResult<Stri
     ))
 }
 
-pub fn resolve_proxy_urls_map_in(conn: &Connection) -> AppResult<HashMap<String, String>> {
+pub fn resolve_proxy_urls_map_best_effort_in(
+    conn: &Connection,
+) -> AppResult<(HashMap<String, String>, Vec<String>)> {
     let mut stmt = conn
         .prepare("SELECT id, kind, host, port, username, password FROM proxies")
         .map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
@@ -454,15 +472,21 @@ pub fn resolve_proxy_urls_map_in(conn: &Connection) -> AppResult<HashMap<String,
         .map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
 
     let mut out = HashMap::new();
+    let mut failed_ids = Vec::new();
     for item in rows {
         let (id, kind, host, port, username, stored_password) =
             item.map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
         let plain_password = match stored_password {
-            Some(ref s) if !s.is_empty() => {
-                let plain = decrypt_password(&id, s)?;
-                register_proxy_password_for_redaction(&plain);
-                Some(plain)
-            }
+            Some(ref s) if !s.is_empty() => match decrypt_password(&id, s) {
+                Ok(plain) => {
+                    register_proxy_password_for_redaction(&plain);
+                    Some(plain)
+                }
+                Err(_) => {
+                    failed_ids.push(id);
+                    continue;
+                }
+            },
             _ => None,
         };
         let url = format_proxy_url(
@@ -474,7 +498,18 @@ pub fn resolve_proxy_urls_map_in(conn: &Connection) -> AppResult<HashMap<String,
         );
         out.insert(id, url);
     }
-    Ok(out)
+    Ok((out, failed_ids))
+}
+
+pub fn resolve_proxy_urls_map_in(conn: &Connection) -> AppResult<HashMap<String, String>> {
+    let (map, failed) = resolve_proxy_urls_map_best_effort_in(conn)?;
+    if let Some(first_bad) = failed.first() {
+        return Err(AppError::new(
+            "PROXY_DECRYPT",
+            format!("Giải mã mật khẩu proxy '{first_bad}' thất bại."),
+        ));
+    }
+    Ok(map)
 }
 
 fn validate_input(input: &ProxyInput) -> AppResult<ProxyInput> {
@@ -523,17 +558,23 @@ fn validate_input(input: &ProxyInput) -> AppResult<ProxyInput> {
         raw_host.to_string()
     } else {
         if raw_host.chars().any(|c| {
-            matches!(c, '/' | '\\' | '@' | '?' | '#' | ':' | '[' | ']')
+            matches!(c, '/' | '\\' | '@' | '?' | '#' | ':' | '[' | ']' | ',' | ';')
                 || c.is_whitespace()
                 || c.is_control()
         }) {
             return Err(AppError::new(
                 "PROXY_INVALID",
-                "Host/IP proxy không hợp lệ (không chứa khoảng trắng, ký tự điều khiển, ':', '?', '#', '/', '@' hoặc ngoặc vuông).",
+                "Host/IP proxy không hợp lệ (không chứa khoảng trắng, ký tự điều khiển, ':', '?', '#', '/', '@', ',', ';' hoặc ngoặc vuông).",
             ));
         }
         raw_host.to_string()
     };
+    if host.len() > 253 {
+        return Err(AppError::new(
+            "PROXY_INVALID",
+            "Host/IP proxy vượt quá giới hạn 253 ký tự.",
+        ));
+    }
     if input.port == 0 {
         return Err(AppError::new(
             "PROXY_INVALID",
@@ -550,6 +591,35 @@ fn validate_input(input: &ProxyInput) -> AppResult<ProxyInput> {
         .as_ref()
         .filter(|s| !s.is_empty())
         .cloned();
+    if kind == "socks5" {
+        if username.as_deref().is_some_and(|u| u.len() > 255) {
+            return Err(AppError::new(
+                "PROXY_INVALID",
+                "Username SOCKS5 vượt quá giới hạn 255 bytes.",
+            ));
+        }
+        if password.as_deref().is_some_and(|p| p.len() > 255) {
+            return Err(AppError::new(
+                "PROXY_INVALID",
+                "Password SOCKS5 vượt quá giới hạn 255 bytes.",
+            ));
+        }
+    }
+    if format_proxy_url(
+        &kind,
+        &host,
+        input.port,
+        username.as_deref(),
+        password.as_deref(),
+    )
+    .len()
+        > 2048
+    {
+        return Err(AppError::new(
+            "PROXY_INVALID",
+            "URL proxy vượt quá độ dài tối đa 2048 ký tự.",
+        ));
+    }
     let note = input
         .note
         .as_ref()
@@ -575,8 +645,9 @@ fn load_assignments_map(conn: &Connection) -> AppResult<HashMap<String, Vec<Stri
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for item in rows.flatten() {
-        map.entry(item.0).or_default().push(item.1);
+    for item in rows {
+        let (pid, aid) = item.map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
+        map.entry(pid).or_default().push(aid);
     }
     Ok(map)
 }
@@ -589,8 +660,9 @@ pub fn load_account_to_proxy_map(conn: &Connection) -> AppResult<HashMap<String,
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
     let mut map = HashMap::new();
-    for item in rows.flatten() {
-        map.insert(item.0, item.1);
+    for item in rows {
+        let (aid, pid) = item.map_err(|e| AppError::new("PROXY_DB_READ", format!("{e}")))?;
+        map.insert(aid, pid);
     }
     Ok(map)
 }
@@ -734,13 +806,16 @@ pub fn update_proxy_in(conn: &Connection, proxy_id: &str, input: &ProxyInput) ->
     let v = validate_input(input)?;
     let now = chrono::Local::now().to_rfc3339();
 
+    let had_stored_pw = existing_stored_pw
+        .as_deref()
+        .is_some_and(|s| !s.is_empty());
     let existing_plain_pw = match existing_stored_pw {
-        Some(ref s) if !s.is_empty() => Some(decrypt_password(proxy_id, s)?),
+        Some(ref s) if !s.is_empty() => decrypt_password(proxy_id, s).ok(),
         _ => None,
     };
 
     let (password_changed, new_stored_pw) = if v.clear_password == Some(true) {
-        (existing_plain_pw.is_some(), None)
+        (had_stored_pw, None)
     } else if let Some(ref new_p) = v.password {
         let changed = existing_plain_pw.as_deref() != Some(new_p.as_str());
         register_proxy_password_for_redaction(new_p);
@@ -893,12 +968,56 @@ pub(crate) fn snapshot_proxy_row_in(conn: &Connection, proxy_id: &str) -> AppRes
     Ok(snap)
 }
 
-pub(crate) fn restore_proxy_row_in(conn: &mut Connection, snap: &ProxyRawSnapshot) -> AppResult<()> {
+pub(crate) fn restore_proxy_update_in(
+    conn: &mut Connection,
+    snap: &ProxyRawSnapshot,
+) -> AppResult<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
+    // Dùng UPDATE thay vì INSERT OR REPLACE để không kích hoạt ON DELETE CASCADE lên account_proxies
+    // và không ghi đè các gán/gỡ tài khoản vừa phát sinh đồng thời.
+    tx.execute(
+        "UPDATE proxies
+         SET name = ?2, kind = ?3, host = ?4, port = ?5, username = ?6,
+             password = ?7, note = ?8, last_status = ?9, exit_ip = ?10,
+             latency_ms = ?11, tested_at = ?12, last_error = ?13,
+             created_at = ?14, updated_at = ?15
+         WHERE id = ?1",
+        params![
+            snap.id,
+            snap.name,
+            snap.kind,
+            snap.host,
+            snap.port,
+            snap.username,
+            snap.password,
+            snap.note,
+            snap.last_status,
+            snap.exit_ip,
+            snap.latency_ms,
+            snap.tested_at,
+            snap.last_error,
+            snap.created_at,
+            snap.updated_at,
+        ],
+    )
+    .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
+
+    tx.commit()
+        .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
+    Ok(())
+}
+
+pub(crate) fn restore_proxy_delete_in(
+    conn: &mut Connection,
+    snap: &ProxyRawSnapshot,
+) -> AppResult<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
     tx.execute(
-        "INSERT OR REPLACE INTO proxies (
+        "INSERT OR IGNORE INTO proxies (
             id, name, kind, host, port, username, password, note,
             last_status, exit_ip, latency_ms, tested_at, last_error,
             created_at, updated_at
@@ -923,11 +1042,10 @@ pub(crate) fn restore_proxy_row_in(conn: &mut Connection, snap: &ProxyRawSnapsho
     )
     .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
 
-    tx.execute("DELETE FROM account_proxies WHERE proxy_id = ?1", params![snap.id])
-        .map_err(|e| AppError::new("PROXY_DB_WRITE", format!("{e}")))?;
     for (acc_id, upd) in &snap.assigned_links {
+        // INSERT OR IGNORE để không cướp tài khoản đã được gán sang proxy khác trong lúc rollback.
         tx.execute(
-            "INSERT OR REPLACE INTO account_proxies (account_id, proxy_id, updated_at)
+            "INSERT OR IGNORE INTO account_proxies (account_id, proxy_id, updated_at)
              VALUES (?1, ?2, ?3)",
             params![acc_id, snap.id, upd],
         )
@@ -1070,6 +1188,7 @@ pub fn test_proxy_connection_with_urls(
 
     let client = match reqwest::blocking::Client::builder()
         .proxy(req_proxy)
+        .redirect(reqwest::redirect::Policy::limited(5))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -1108,7 +1227,17 @@ pub fn test_proxy_connection_with_urls(
 
     let elapsed = started.elapsed().as_millis() as i64;
     let code = resp.status().as_u16();
-    if code == 407 {
+    if code >= 400 {
+        let msg = match code {
+            407 => "Proxy từ chối xác thực (HTTP 407 Proxy Authentication Required).".to_string(),
+            402 => "Proxy hoặc máy chủ đích yêu cầu thanh toán/hết hạn mức (HTTP 402).".to_string(),
+            403 | 404 | 429 => {
+                format!("Proxy hoặc máy chủ đích từ chối/chặn truy cập (HTTP {code}).")
+            }
+            451 => "Proxy hoặc máy chủ đích chặn truy cập theo khu vực pháp lý (HTTP 451).".to_string(),
+            400..500 => format!("Proxy hoặc máy chủ đích trả mã lỗi HTTP {code}."),
+            _ => format!("Máy chủ đích trả mã lỗi HTTP {code}."),
+        };
         return record_test_result_if_unchanged_in(
             conn,
             proxy_id,
@@ -1116,38 +1245,19 @@ pub fn test_proxy_connection_with_urls(
             false,
             None,
             Some(elapsed),
-            Some("Proxy từ chối xác thực (HTTP 407 Proxy Authentication Required)."),
-        );
-    }
-    if matches!(code, 403 | 404 | 429) {
-        return record_test_result_if_unchanged_in(
-            conn,
-            proxy_id,
-            &fp,
-            false,
-            None,
-            Some(elapsed),
-            Some(&format!("Proxy hoặc máy chủ đích từ chối/chặn truy cập (HTTP {code}).")),
-        );
-    }
-    if code >= 500 {
-        return record_test_result_if_unchanged_in(
-            conn,
-            proxy_id,
-            &fp,
-            false,
-            None,
-            Some(elapsed),
-            Some(&format!("Máy chủ đích trả mã lỗi HTTP {code}.")),
+            Some(&msg),
         );
     }
 
-    // Truy vấn Exit IP thực tế qua cùng client proxy
+    // Truy vấn Exit IP thực tế qua cùng client proxy (giới hạn 4096 bytes)
     let mut detected_ip: Option<String> = None;
     for ip_url in ip_urls {
         if let Ok(ip_resp) = client.get(*ip_url).timeout(Duration::from_secs(8)).send() {
             if ip_resp.status().is_success() {
-                if let Ok(body) = ip_resp.text() {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                if ip_resp.take(4096).read_to_end(&mut buf).is_ok() {
+                    let body = String::from_utf8_lossy(&buf);
                     let trimmed = body.trim();
                     if trimmed.starts_with('{') {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1896,7 +2006,7 @@ mod tests {
         let snap = snapshot_proxy_row_in(&conn, &snap_px.id).expect("snapshot");
         delete_proxy_in(&conn, &snap_px.id).expect("delete before restore");
         assert!(get_proxy_in(&conn, &snap_px.id).is_err());
-        restore_proxy_row_in(&mut conn, &snap).expect("restore snapshot");
+        restore_proxy_delete_in(&mut conn, &snap).expect("restore snapshot");
         let restored = get_proxy_in(&conn, &snap_px.id).expect("get restored");
         assert_eq!(restored.assigned_account_ids, vec!["acc_snap".to_string()]);
         assert_eq!(
@@ -2016,6 +2126,228 @@ mod tests {
         .expect_err("deleted proxy must not be resurrected");
         assert_eq!(stale_err.code, "PROXY_NOT_FOUND");
         assert!(get_proxy_in(&conn, &del_px.id).is_err());
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn pass2_resilience_validation_status_and_safe_rollback() {
+        let db_path = temp_db_path("pass2");
+        let conn = open_db_at(&db_path).expect("open proxies.db");
+
+        // 1. Case-sensitive ENC:V1: plaintext migration via reopen
+        conn.execute(
+            "INSERT INTO proxies (id, name, kind, host, port, username, password, created_at, updated_at)
+             VALUES ('px_legacy', 'Legacy', 'http', '127.0.0.1', 8080, 'u', 'ENC:V1:secret', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("insert uppercase plaintext");
+        drop(conn);
+        let mut conn = open_db_at(&db_path).expect("reopen migrates uppercase plaintext");
+        assert_eq!(
+            resolve_proxy_url_in(&conn, "px_legacy").expect("decrypt migrated"),
+            "http://u:ENC%3AV1%3Asecret@127.0.0.1:8080"
+        );
+        let stored: String = conn
+            .query_row("SELECT password FROM proxies WHERE id = 'px_legacy'", [], |r| r.get(0))
+            .expect("raw password");
+        assert!(stored.starts_with(ENC_PREFIX));
+
+        // 2. Corrupt ciphertext tolerated in resolve_proxy_urls_map_best_effort_in & repairable in update_proxy_in
+        conn.execute(
+            "INSERT INTO proxies (id, name, kind, host, port, username, password, created_at, updated_at)
+             VALUES ('px_bad', 'Bad Cipher', 'http', '127.0.0.2', 8081, 'u', 'enc:v1:!!!bad!!!', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .expect("insert corrupt proxy");
+        let (best_map, failed_ids) =
+            resolve_proxy_urls_map_best_effort_in(&conn).expect("best-effort resolve");
+        assert!(best_map.contains_key("px_legacy"));
+        assert_eq!(failed_ids, vec!["px_bad".to_string()]);
+
+        // Overwrite corrupt ciphertext with a fresh password
+        update_proxy_in(
+            &conn,
+            "px_bad",
+            &ProxyInput {
+                name: "Bad Cipher Repaired".into(),
+                kind: "http".into(),
+                host: "127.0.0.2".into(),
+                port: 8081,
+                username: Some("u".into()),
+                password: Some("newpw".into()),
+                clear_password: None,
+                note: None,
+            },
+        )
+        .expect("overwrite corrupt ciphertext");
+        assert_eq!(
+            resolve_proxy_url_in(&conn, "px_bad").expect("resolved repaired"),
+            "http://u:newpw@127.0.0.2:8081"
+        );
+        // Also clear corrupt ciphertext cleanly
+        conn.execute(
+            "UPDATE proxies SET password = 'enc:v1:broken' WHERE id = 'px_bad'",
+            [],
+        )
+        .expect("corrupt again");
+        let cleared = update_proxy_in(
+            &conn,
+            "px_bad",
+            &ProxyInput {
+                name: "Bad Cipher Cleared".into(),
+                kind: "http".into(),
+                host: "127.0.0.2".into(),
+                port: 8081,
+                username: Some("u".into()),
+                password: None,
+                clear_password: Some(true),
+                note: None,
+            },
+        )
+        .expect("clear corrupt ciphertext");
+        assert!(!cleared.has_password);
+
+        // 3. validate_input parity: comma, semicolon, host > 253, SOCKS5 > 255B, URL > 2048
+        for bad_host in ["a,b.com", "a;b.com", &"a".repeat(254)] {
+            let err = validate_input(&ProxyInput {
+                name: "Bad Host".into(),
+                kind: "http".into(),
+                host: bad_host.into(),
+                port: 8080,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            })
+            .expect_err("host must be rejected");
+            assert_eq!(err.code, "PROXY_INVALID");
+        }
+        let err_socks = validate_input(&ProxyInput {
+            name: "Long Socks Auth".into(),
+            kind: "socks5".into(),
+            host: "127.0.0.1".into(),
+            port: 1080,
+            username: Some("u".repeat(256)),
+            password: Some("p".into()),
+            clear_password: None,
+            note: None,
+        })
+        .expect_err("socks5 >255B username rejected");
+        assert_eq!(err_socks.code, "PROXY_INVALID");
+
+        let err_url = validate_input(&ProxyInput {
+            name: "Long URL".into(),
+            kind: "http".into(),
+            host: "127.0.0.1".into(),
+            port: 8080,
+            username: Some("u".repeat(1200)),
+            password: Some("p".repeat(1200)),
+            clear_password: None,
+            note: None,
+        })
+        .expect_err("URL > 2048 rejected");
+        assert_eq!(err_url.code, "PROXY_INVALID");
+
+        // 4. restore_proxy_update_in preserves concurrent account_proxies link; restore_proxy_delete_in doesn't steal
+        let px_a = create_proxy_in(
+            &conn,
+            &ProxyInput {
+                name: "A".into(),
+                kind: "http".into(),
+                host: "127.0.0.1".into(),
+                port: 8100,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let px_b = create_proxy_in(
+            &conn,
+            &ProxyInput {
+                name: "B".into(),
+                kind: "http".into(),
+                host: "127.0.0.1".into(),
+                port: 8101,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        let snap_a = snapshot_proxy_row_in(&conn, &px_a.id).unwrap();
+        // Concurrent edit & concurrent account link before update rollback
+        update_proxy_in(
+            &conn,
+            &px_a.id,
+            &ProxyInput {
+                name: "A-changed".into(),
+                kind: "http".into(),
+                host: "127.0.0.2".into(),
+                port: 8100,
+                username: None,
+                password: None,
+                clear_password: None,
+                note: None,
+            },
+        )
+        .unwrap();
+        set_account_proxy_in(&conn, "acc_concurrent", Some(&px_a.id)).unwrap();
+        restore_proxy_update_in(&mut conn, &snap_a).unwrap();
+        let a_after = get_proxy_in(&conn, &px_a.id).unwrap();
+        assert_eq!(a_after.host, "127.0.0.1");
+        assert_eq!(a_after.assigned_account_ids, vec!["acc_concurrent".to_string()]);
+
+        // Delete rollback must not steal account reassigned to px_b
+        set_account_proxy_in(&conn, "acc_move", Some(&px_a.id)).unwrap();
+        let snap_a2 = snapshot_proxy_row_in(&conn, &px_a.id).unwrap();
+        delete_proxy_in(&conn, &px_a.id).unwrap();
+        set_account_proxy_in(&conn, "acc_move", Some(&px_b.id)).unwrap();
+        restore_proxy_delete_in(&mut conn, &snap_a2).unwrap();
+        let map_now = load_account_to_proxy_map(&conn).unwrap();
+        assert_eq!(map_now.get("acc_move").map(String::as_str), Some(px_b.id.as_str()));
+
+        // 5. HTTP 402 and 451 must be marked dead
+        for status_code in [402u16, 451u16] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind http status server");
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 {status_code} Err\r\nContent-Length: 3\r\nConnection: close\r\n\r\nerr"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            let p_http = create_proxy_in(
+                &conn,
+                &ProxyInput {
+                    name: format!("HTTP {status_code}"),
+                    kind: "http".into(),
+                    host: "127.0.0.1".into(),
+                    port,
+                    username: None,
+                    password: None,
+                    clear_password: None,
+                    note: None,
+                },
+            )
+            .unwrap();
+            let res = test_proxy_connection_with_urls(
+                &conn,
+                &p_http.id,
+                &format!("http://127.0.0.1:{port}/check"),
+                &[],
+            )
+            .expect("test proxy");
+            server.join().unwrap();
+            assert_eq!(res.last_status, "dead", "HTTP {status_code} must be dead");
+        }
 
         let _ = std::fs::remove_file(&db_path);
     }

@@ -251,3 +251,11 @@ export function buildProxyInput(params: {
 
   return base;
 }
+
+/** Formats host:port, wrapping bare IPv6 literals in square brackets. */
+export function formatHostPort(host: string, port: number): string {
+  const h = host.trim();
+  const formattedHost =
+    h.includes(":") && !(h.startsWith("[") && h.endsWith("]")) ? `[${h}]` : h;
+  return `${formattedHost}:${port}`;
+}

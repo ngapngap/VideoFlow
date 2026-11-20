@@ -722,8 +722,10 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> AppResult<()> {
             .unwrap_or(0)
     );
     let tmp = dest.with_extension(part_ext);
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| AppError::new("WRITE_FAIL", format!("Không ghi được file tạm: {e}")))?;
+    std::fs::write(&tmp, bytes).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::new("WRITE_FAIL", format!("Không ghi được file tạm: {e}"))
+    })?;
     std::fs::rename(&tmp, dest).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         AppError::new("WRITE_FAIL", format!("Không đổi tên được file tạm: {e}"))
@@ -895,6 +897,8 @@ pub fn plan_row(
         } else {
             vec![Step::B2, Step::B3]
         }
+    } else if base_status == RowStatus::Cho && row.promt_tao_image.trim().is_empty() {
+        vec![Step::B3]
     } else {
         start_steps(base_status)
     };
@@ -1873,7 +1877,7 @@ pub fn run_with_emitter_and_hook(
                     }
 
                     ctx.clear_active_row(&row_key);
-                    if !row_incomplete && !stopped_ref.load(Ordering::SeqCst) {
+                    if !row_incomplete {
                         done_ref.fetch_add(1, Ordering::SeqCst);
                     }
 
@@ -5343,6 +5347,32 @@ mod tests {
         stop_b.store(true, Ordering::SeqCst);
         let _ = join_a.join();
         let _ = join_b.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plan_row_cho_empty_image_prompt_skips_to_b3() {
+        let dir = make_temp_project("plan_row_cho_empty_img");
+        let img_out = dir.join("image_out");
+        let cfg = Settings::default();
+        let row = Row {
+            row_no: 1,
+            anh_tham_chieu: "ref.png".into(),
+            promt_tao_image: "   ".into(),
+            promt_tao_video: "make it move".into(),
+            anh_da_tao: "".into(),
+            trang_thai: "Đang chờ".into(),
+            ..Default::default()
+        };
+        let eng_cfg = EngineConfig {
+            kind: "chung",
+            row_keys: vec![],
+            force_step: None,
+            reset_error_attempts: false,
+        };
+        let plan = plan_row(&row, None, &cfg, &eng_cfg, &img_out, None, 1)
+            .expect("Cho with empty image prompt must plan B3");
+        assert_eq!(plan.steps, vec![Step::B3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

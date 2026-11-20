@@ -102,10 +102,10 @@
   // Giữ tóm tắt lượt chạy trên Statusbar trong 10 giây sau khi kết thúc (mục 6.14, TC-37)
   let postRunSummary = "";
   let postRunTimer: ReturnType<typeof setTimeout> | null = null;
-  let seenFinishedRunId: number | null = null;
+  let seenFinishedObj: typeof $lastRunFinished = null;
 
-  $: if ($lastRunFinished && $lastRunFinished.run_id !== seenFinishedRunId) {
-    seenFinishedRunId = $lastRunFinished.run_id;
+  $: if ($lastRunFinished && $lastRunFinished !== seenFinishedObj) {
+    seenFinishedObj = $lastRunFinished;
     const stLabel =
       $lastRunFinished.status === "da_dung"
         ? "Đã dừng"
@@ -120,7 +120,7 @@
   }
 
   $: if (!$lastRunFinished) {
-    seenFinishedRunId = null;
+    seenFinishedObj = null;
     postRunSummary = "";
     if (postRunTimer) {
       clearTimeout(postRunTimer);
@@ -468,7 +468,8 @@
 
 <div
   class="layout"
-  style="--w-sidebar-current: var({sidebarCollapsed ? '--w-sidebar-collapsed' : '--w-sidebar'}); --h-top-offset: calc(var(--h-titlebar) + {lockedAccount ? '40px' : '0px'});"
+  class:sidebar-collapsed={sidebarCollapsed}
+  style="--h-top-offset: calc(var(--h-titlebar) + {lockedAccount ? '40px' : '0px'});"
 >
   <aside class="sidebar" class:collapsed={sidebarCollapsed}>
     <div class="sidebar-top">
@@ -998,10 +999,14 @@
 
 <style>
   .layout {
+    --w-sidebar-current: var(--w-sidebar);
     display: flex;
     height: calc(100% - var(--h-statusbar));
     width: 100%;
     overflow: hidden;
+  }
+  .layout.sidebar-collapsed {
+    --w-sidebar-current: var(--w-sidebar-collapsed);
   }
 
   /* Sidebar 232px -> 64px responsive */
@@ -1172,6 +1177,9 @@
   }
 
   @media (max-width: 1100px) {
+    .layout {
+      --w-sidebar-current: var(--w-sidebar-collapsed);
+    }
     .sidebar {
       width: var(--w-sidebar-collapsed);
       padding: 10px 8px;

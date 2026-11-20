@@ -69,6 +69,10 @@ class Settings(BaseSettings):
         "Needs MUSE2API_ACCOUNT_MAX_CONCURRENCY of at least 2; 0 disables.",
     )
     warm_prompt: str = Field(default="Hi", description="Message that starts a warm thread.")
+    defer_prewarm: bool = Field(
+        default=False,
+        description="When true, skip startup prewarm so a desktop parent can sync proxies before calling POST /admin/prewarm.",
+    )
 
     # --- timeouts (seconds) ---
     chat_timeout: float = 300.0

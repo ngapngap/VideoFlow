@@ -1,23 +1,6 @@
 // Lớp gọi lõi theo hợp đồng 13.2: UI không gọi API ngoài, không đọc file trực tiếp.
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
-/** Chuẩn hóa lỗi trả về từ Tauri (`{ code, message }`) hoặc JS `Error` thành chuỗi đọc được. */
-export function formatError(e: unknown): string {
-  if (typeof e === "string") return e;
-  if (e instanceof Error) return e.message;
-  if (e && typeof e === "object") {
-    const obj = e as Record<string, unknown>;
-    if (typeof obj.message === "string" && obj.message.trim()) return obj.message;
-    if (typeof obj.error === "string" && obj.error.trim()) return obj.error;
-    try {
-      return JSON.stringify(e);
-    } catch {
-      return String(e);
-    }
-  }
-  return String(e);
-}
-
 export function toAssetUrl(
   absPath: string | null | undefined,
   cacheKey?: string | number | null
@@ -317,6 +300,7 @@ export interface MuseAccount {
   last_error: string | null;
   success_count: number;
   fail_count: number;
+  quota_exhausted?: boolean;
   meta: {
     quota?: MuseQuotaSnapshot;
     [key: string]: unknown;

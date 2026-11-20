@@ -113,6 +113,8 @@ def mask_proxy_url(proxy: str | None) -> str | None:
         return "***"
     if not scheme or not host:
         return "***"
+    if "@" in parsed.path or "@" in parsed.query or "@" in parsed.fragment:
+        return "***"
 
     authority = parsed.netloc.rpartition("@")[2]
     if authority.startswith("["):
@@ -128,8 +130,11 @@ def mask_proxy_url(proxy: str | None) -> str | None:
         or parsed.password is not None
         or "@" in parsed.netloc
     )
+    if not has_creds and "@" in raw:
+        return "***"
     auth_part = "***@" if has_creds else ""
-    return f"{scheme}://{auth_part}{formatted_host}{port_part}{parsed.path}"
+    path_part = "" if parsed.path == "/" else parsed.path
+    return f"{scheme}://{auth_part}{formatted_host}{port_part}{path_part}"
 
 
 def _mask(value: str) -> str:

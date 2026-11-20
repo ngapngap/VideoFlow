@@ -7,6 +7,7 @@ extension for one-click cookie import (served by ``GET /admin/extension.zip``).
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import time
 import zipfile
@@ -20,7 +21,7 @@ from ... import __version__
 from ...accounts.keepalive import renew_account
 from ...accounts.model import Account, AccountStatus, mask_proxy_url
 from ...auth.keys import ApiKey
-from ...drivers.browser.driver import AccountBusy
+from ...drivers.browser.driver import AccountBusy, resolve_proxy
 from ...errors import InvalidRequest, Muse2APIError, NotFound
 from ...services.container import Services
 from ...upstream.muse import missing_session_cookies
@@ -126,7 +127,23 @@ def _is_account_busy(account_id: str, svc: Services) -> bool:
 def _account_public(acc: Account, svc: Services) -> dict:
     pub = acc.public()
     pub["busy"] = _is_account_busy(acc.id, svc)
+    pub["quota_exhausted"] = acc.quota_exhausted()
     return pub
+
+
+@router.post("/prewarm")
+async def prewarm_accounts(svc: Services = Depends(get_services)) -> dict:
+    count = 0
+    for acc in svc.pool.all():
+        if (
+            acc.enabled
+            and acc.status == AccountStatus.ACTIVE
+            and not acc.quota_exhausted()
+            and not missing_session_cookies(acc.cookies)
+        ):
+            svc.driver.prewarm(acc)
+            count += 1
+    return {"prewarmed": count}
 
 
 @router.get("/status")
@@ -238,9 +255,13 @@ async def update_account(account_id: str, body: AccountUpdate,
                     name: exp for name, exp in (acc.cookie_expires or {}).items()
                     if name not in body.cookies
                 }
-                # Fresh cookies give an invalid account another chance.
-                acc.status = AccountStatus.ACTIVE
-                acc.last_error = None
+                if acc.cookies and not missing_session_cookies(acc.cookies):
+                    # Fresh complete cookies give an invalid account another chance.
+                    acc.status = AccountStatus.ACTIVE
+                    acc.last_error = None
+                elif not acc.cookies:
+                    acc.status = AccountStatus.INVALID
+                    acc.last_error = "cookies cleared"
             if body.cookie_expires is not None:
                 if acc.cookie_expires is None:
                     acc.cookie_expires = {}
@@ -250,6 +271,9 @@ async def update_account(account_id: str, body: AccountUpdate,
             if cond is not None:
                 cond.notify_all()
             public_view = _account_public(acc, svc)
+            settings_obj = getattr(svc, "settings", None)
+            browser_proxy = getattr(settings_obj, "browser_proxy", "") if settings_obj else ""
+            expected_drv_proxy = resolve_proxy(acc, browser_proxy)
 
     if cond is not None and hasattr(svc.pool, "persist"):
         await svc.pool.persist()
@@ -258,7 +282,15 @@ async def update_account(account_id: str, body: AccountUpdate,
 
     driver = getattr(svc, "driver", None)
     if proxy_changed and driver is not None and hasattr(driver, "release_account_driver"):
-        await driver.release_account_driver(account_id)
+        release_fn = driver.release_account_driver
+        try:
+            accepts_kw = "only_if_proxy_mismatch" in inspect.signature(release_fn).parameters
+        except (TypeError, ValueError):
+            accepts_kw = False
+        if accepts_kw:
+            await release_fn(account_id, only_if_proxy_mismatch=expected_drv_proxy)
+        else:
+            await release_fn(account_id)
     elif body.cookies is not None and driver is not None and hasattr(driver, "mark_account_stale"):
         res = driver.mark_account_stale(account_id)
         if hasattr(res, "__await__"):

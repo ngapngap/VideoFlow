@@ -104,10 +104,10 @@ class KeyStore:
         return True
 
     async def save(self) -> None:
-        self._dirty = False
-        payload = json.dumps([k.model_dump(mode="json") for k in self.all()],
-                             ensure_ascii=False, indent=2)
         async with self._lock:
+            self._dirty = False
+            payload = json.dumps([k.model_dump(mode="json") for k in self.all()],
+                                 ensure_ascii=False, indent=2)
             await asyncio.to_thread(self._atomic_write, payload)
 
     async def flush(self) -> None:

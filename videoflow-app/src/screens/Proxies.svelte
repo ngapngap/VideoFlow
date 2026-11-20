@@ -6,16 +6,24 @@
   import Modal from "../lib/Modal.svelte";
   import {
     buildProxyInput,
+    formatHostPort,
     parseProxyPaste,
     validateProxyHost,
   } from "../lib/proxyInput";
-  import { formatApiError, running, showToast } from "../lib/store";
+  import {
+    formatApiError,
+    museAccounts,
+    refreshMuseState,
+    running,
+    showToast,
+    startMusePolling,
+  } from "../lib/store";
 
   let proxies: ProxyItem[] = [];
-  let accounts: MuseAccount[] = [];
   let loading = true;
   let loadSeq = 0;
   let destroyed = false;
+  let stopMusePolling: (() => void) | null = null;
 
   // Test states
   let testingIds = new Set<string>();
@@ -42,39 +50,26 @@
   let deleting = false;
 
   onMount(() => {
+    stopMusePolling = startMusePolling();
     void loadData();
   });
 
   onDestroy(() => {
     destroyed = true;
+    stopMusePolling?.();
+    stopMusePolling = null;
   });
 
   async function loadData() {
     if (destroyed) return;
     const seq = ++loadSeq;
     try {
-      const pxList = await api.proxy_list();
+      const [pxList] = await Promise.all([
+        api.proxy_list(),
+        refreshMuseState({ force: true }),
+      ]);
       if (destroyed || seq !== loadSeq) return;
       proxies = pxList;
-
-      try {
-        const st = await api.muse_sidecar_status();
-        if (!destroyed && seq === loadSeq) {
-          if (st.sidecar.running) {
-            const accRes = await api.muse_list_accounts();
-            if (!destroyed && seq === loadSeq) {
-              accounts = accRes.data ?? [];
-            }
-          } else {
-            accounts = [];
-          }
-        }
-      } catch {
-        // sidecar offline — vẫn hiển thị danh sách proxy bình thường
-        if (!destroyed && seq === loadSeq) {
-          accounts = [];
-        }
-      }
     } catch (e) {
       if (!destroyed && seq === loadSeq) {
         showToast("error", `Không thể tải danh sách proxy: ${formatApiError(e)}`);
@@ -86,7 +81,7 @@
     }
   }
 
-  $: accountMap = new Map(accounts.map((a) => [a.id, a]));
+  $: accountMap = new Map($museAccounts.map((a) => [a.id, a]));
 
   // Map exit_ip -> danh sách account IDs đang dùng exit_ip đó (qua mọi proxy)
   $: exitIpAccountsMap = (() => {
@@ -123,6 +118,7 @@
     p: ProxyItem,
     ipMap: Map<string, { accId: string; label: string; proxyName: string }[]>
   ): string[] {
+    if (p.assigned_account_ids.length === 0) return [];
     const ip = (p.exit_ip || "").trim();
     if (!ip) return [];
     const entries = ipMap.get(ip) ?? [];
@@ -278,11 +274,10 @@
 
   async function handleTestOne(p: ProxyItem) {
     if (destroyed || testingIds.has(p.id) || testingAll) return;
-    const seq = loadSeq;
     testingIds = new Set([...testingIds, p.id]);
     try {
       const updated = await api.proxy_test(p.id);
-      if (destroyed || seq !== loadSeq) return;
+      if (destroyed) return;
       proxies = mergeSingleTestedProxy(proxies, updated);
       if (updated.last_status === "alive") {
         showToast(
@@ -296,7 +291,7 @@
         );
       }
     } catch (e) {
-      if (destroyed || seq !== loadSeq) return;
+      if (destroyed) return;
       showToast("error", `Lỗi kiểm tra proxy "${p.name}": ${formatApiError(e)}`);
     } finally {
       if (!destroyed) {
@@ -455,7 +450,7 @@
                   <h3 class="p-name" title={p.name}>{p.name}</h3>
                 </div>
                 <div class="p-endpoint selectable">
-                  {p.host}:{p.port}
+                  {formatHostPort(p.host, p.port)}
                   {#if p.username}
                     <span class="auth-pill" title={`Tài khoản xác thực: ${p.username}`}>
                       · user: {p.username}{p.has_password ? " (có mật khẩu)" : ""}
@@ -732,7 +727,7 @@
     <button
       type="button"
       class="btn-primary"
-      disabled={formSaving}
+      disabled={formSaving || $running}
       on:click={handleSaveProxy}
     >
       {formSaving ? "Đang lưu..." : editingId ? "Lưu thay đổi" : "Thêm Proxy"}
@@ -752,7 +747,7 @@
     <div class="del-body">
       {#if deleteTarget.assigned_account_ids.length > 0}
         <p>
-          Proxy <b>{deleteTarget.name}</b> (<code>{deleteTarget.host}:{deleteTarget.port}</code>) đang được gán cho
+          Proxy <b>{deleteTarget.name}</b> (<code>{formatHostPort(deleteTarget.host, deleteTarget.port)}</code>) đang được gán cho
           <b>{deleteTarget.assigned_account_ids.length} tài khoản</b>:
           <b>{deleteTarget.assigned_account_ids.map((id) => accountDisplayName(id, accountMap)).join(", ")}</b>.
         </p>
@@ -761,7 +756,7 @@
         </p>
       {:else}
         <p>
-          Bạn có chắc chắn muốn xoá proxy <b>{deleteTarget.name}</b> (<code>{deleteTarget.host}:{deleteTarget.port}</code>) khỏi hệ thống?
+          Bạn có chắc chắn muốn xoá proxy <b>{deleteTarget.name}</b> (<code>{formatHostPort(deleteTarget.host, deleteTarget.port)}</code>) khỏi hệ thống?
         </p>
       {/if}
     </div>
@@ -778,7 +773,7 @@
     <button
       type="button"
       class="btn-danger"
-      disabled={deleting}
+      disabled={deleting || $running}
       on:click={confirmDeleteProxy}
     >
       {deleting ? "Đang xoá..." : "Xác nhận xoá"}

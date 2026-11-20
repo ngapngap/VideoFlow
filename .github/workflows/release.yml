@@ -53,6 +53,7 @@ jobs:
         run: |
           npm ci
           npm run check
+          npm test
 
       # tauri build script đòi file externalBin tồn tại; verify chỉ cần compile/test
       # nên dùng stub rỗng (bản thật do job `build` tạo sau khi verify xanh).
@@ -170,7 +171,6 @@ jobs:
           if ($item.Length -lt 8MB) { throw "Sidecar quá nhỏ ($mb MB) — thiếu hidden import?" }
           $sha = (Get-FileHash $f -Algorithm SHA256).Hash
           Write-Host "sidecar: $mb MB  sha256=$sha"
-          $env:SIDECAR_SHA256 = $sha
 
       # Chạy exe PyInstaller với BROWSER driver thật — PyInstaller không tự thấy
       # `muse2api.drivers.browser.*` (phải khai báo hiddenimports trong .spec); smoke mock
@@ -191,6 +191,7 @@ jobs:
             exit 0
           }
           $dataDir = "$env:TEMP\m2a-rel-browser"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
           $env:MUSE2API_DRIVER = "browser"
           $env:MUSE2API_PORT = "18701"
           $env:MUSE2API_CDP_PORT = "19207"
@@ -200,32 +201,40 @@ jobs:
           $env:MUSE2API_HEADLESS = "true"
           $env:MUSE2API_CHROMIUM_PATH = $browser
           $h = @{ Authorization = "Bearer relkey" }
-          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput "$dataDir\engine-stdout.log" -RedirectStandardError "$dataDir\engine-stderr.log"
+          function Get-SmokeLogs([string]$dir) {
+            $outLog = Get-Content -LiteralPath "$dir\engine-stdout.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            $errLog = Get-Content -LiteralPath "$dir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            $ce = if (Test-Path -LiteralPath $dir) {
+              (Get-ChildItem -LiteralPath $dir -Filter "chromium-stderr.log" -Recurse -File -ErrorAction SilentlyContinue |
+                ForEach-Object { "=== $($_.FullName) ===`n" + (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) }) -join "`n"
+            } else { "" }
+            return "--- engine stderr ---`n$errLog`n--- engine stdout ---`n$outLog`n--- chromium ---`n$ce"
+          }
           try {
             $ok = $false
             foreach ($i in 1..180) {
               Start-Sleep -Milliseconds 500
               if ($p.HasExited) {
-                $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                $ce = if (Test-Path -LiteralPath $dataDir) {
-                  (Get-ChildItem -LiteralPath $dataDir -Filter "chromium-stderr.log" -Recurse -File -ErrorAction SilentlyContinue |
-                    ForEach-Object { "=== $($_.FullName) ===`n" + (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) }) -join "`n"
-                } else { "" }
-                throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
+                $logs = Get-SmokeLogs $dataDir
+                throw "engine thoát sớm (exit $($p.ExitCode))`n$logs"
               }
               try {
                 if ((Invoke-WebRequest -Uri "http://127.0.0.1:18701/healthz" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $ok = $true; break }
               } catch { }
             }
-            if (-not $ok) { throw "engine browser không lên trong 90s" }
+            if (-not $ok) {
+              $logs = Get-SmokeLogs $dataDir
+              throw "engine browser không lên trong 90s`n$logs"
+            }
             $st = Invoke-RestMethod -Uri "http://127.0.0.1:18701/admin/status" -Headers $h
             Write-Host "browser: driver=$($st.driver.driver) ok=$($st.driver.ok) tabs=$($st.driver.tabs)"
             if ($st.driver.driver -ne "browser") { throw "driver sai: $($st.driver.driver)" }
             if (-not $st.driver.ok) { throw "browser driver không OK: $($st.driver | ConvertTo-Json -Compress)" }
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-            Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
-              Where-Object { $_.CommandLine -and $_.CommandLine.Contains($dataDir) } |
+            Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($dataDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
               ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
 
@@ -234,6 +243,7 @@ jobs:
         run: |
           $exe = "videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe"
           $dataDir = "$env:TEMP\m2a-rel-mock"
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
           $env:MUSE2API_DRIVER = "mock"
           $env:MUSE2API_PORT = "18702"
           $env:MUSE2API_DATA_DIR = $dataDir
@@ -241,20 +251,25 @@ jobs:
           $env:MUSE2API_ADMIN_KEY = "relkey"
           $h = @{ Authorization = "Bearer relkey" }
           $base = "http://127.0.0.1:18702"
-          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput "$dataDir\engine-stdout.log" -RedirectStandardError "$dataDir\engine-stderr.log"
           try {
             $ok = $false
             foreach ($i in 1..120) {
               Start-Sleep -Milliseconds 500
               if ($p.HasExited) {
                 $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                throw "engine mock thoát sớm (exit $($p.ExitCode))`n$err"
+                $out = Get-Content -LiteralPath "$dataDir\engine-stdout.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                throw "engine mock thoát sớm (exit $($p.ExitCode))`n--- stderr ---`n$err`n--- stdout ---`n$out"
               }
               try {
                 if ((Invoke-WebRequest -Uri "$base/healthz" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $ok = $true; break }
               } catch { }
             }
-            if (-not $ok) { throw "engine mock không lên trong 60s" }
+            if (-not $ok) {
+              $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+              $out = Get-Content -LiteralPath "$dataDir\engine-stdout.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+              throw "engine mock không lên trong 60s`n--- stderr ---`n$err`n--- stdout ---`n$out"
+            }
 
             $st = Invoke-RestMethod -Uri "$base/admin/status" -Headers $h
             Write-Host "mock: driver=$($st.driver.driver) ok=$($st.driver.ok)"

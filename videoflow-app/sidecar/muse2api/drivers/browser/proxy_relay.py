@@ -15,7 +15,9 @@ import base64
 import contextlib
 import ipaddress
 import logging
+import re
 import struct
+import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
 
@@ -30,6 +32,14 @@ _MAX_LEADING_EMPTY_LINES = 8
 
 class _HttpValidationError(Exception):
     """Raised on malformed or smuggling-prone HTTP framing from a client."""
+
+
+class _UpstreamProxyError(Exception):
+    """Raised when connecting to or authenticating with the upstream proxy fails."""
+
+
+class _UpstreamTimeoutError(_UpstreamProxyError):
+    """Raised when the upstream proxy times out."""
 
 
 @dataclass(slots=True)
@@ -52,17 +62,23 @@ def mask_proxy(proxy: str | None) -> str:
         return "direct"
     try:
         parsed = urlsplit(raw)
-        if parsed.username is None and parsed.password is None:
-            return raw
-        host = parsed.hostname or ""
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        port_part = f":{parsed.port}" if parsed.port else ""
-        user_part = f"{parsed.username}:***" if parsed.username is not None else "***"
-        scheme = f"{parsed.scheme}://" if parsed.scheme else ""
-        return f"{scheme}{user_part}@{host}{port_part}{parsed.path}"
-    except Exception:  # noqa: BLE001
+        port = parsed.port
+    except ValueError:
         return "***"
+    if "@" in parsed.path or "@" in parsed.query or "@" in parsed.fragment:
+        return "***"
+    if parsed.username is None and parsed.password is None:
+        if "@" in raw:
+            return "***"
+        return raw
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port_part = f":{port}" if port is not None else ""
+    user_part = f"{parsed.username}:***" if parsed.username is not None else "***"
+    scheme = f"{parsed.scheme}://" if parsed.scheme else ""
+    path_part = "" if parsed.path == "/" else parsed.path
+    return f"{scheme}{user_part}@{host}{port_part}{path_part}"
 
 
 def needs_proxy_relay(proxy: str | None) -> bool:
@@ -115,20 +131,61 @@ async def _pipe(
     writer: asyncio.StreamWriter,
     *,
     idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+    last_activity: list[float] | None = None,
 ) -> None:
+    slice_timeout = max(0.05, min(5.0, idle_timeout))
+    if last_activity is None:
+        last_activity = [time.monotonic()]
     try:
         while True:
-            data = await asyncio.wait_for(reader.read(_COPY_CHUNK), timeout=idle_timeout)
+            try:
+                data = await asyncio.wait_for(reader.read(_COPY_CHUNK), timeout=slice_timeout)
+            except asyncio.TimeoutError:
+                if time.monotonic() - last_activity[0] >= idle_timeout:
+                    raise
+                continue
             if not data:
                 break
+            last_activity[0] = time.monotonic()
             writer.write(data)
             await asyncio.wait_for(writer.drain(), timeout=idle_timeout)
+            last_activity[0] = time.monotonic()
     except (asyncio.CancelledError, asyncio.TimeoutError, ConnectionError, OSError):
         pass
     finally:
         with contextlib.suppress(Exception):
             if writer.can_write_eof():
                 writer.write_eof()
+
+
+async def _pipe_pair(
+    reader_a: asyncio.StreamReader,
+    writer_b: asyncio.StreamWriter,
+    reader_b: asyncio.StreamReader,
+    writer_a: asyncio.StreamWriter,
+    *,
+    idle_timeout: float,
+) -> None:
+    last_activity = [time.monotonic()]
+    t1 = asyncio.create_task(
+        _pipe(reader_a, writer_b, idle_timeout=idle_timeout, last_activity=last_activity)
+    )
+    t2 = asyncio.create_task(
+        _pipe(reader_b, writer_a, idle_timeout=idle_timeout, last_activity=last_activity)
+    )
+    tasks = {t1: writer_b, t2: writer_a}
+    try:
+        done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+        for finished in done:
+            if not tasks[finished].can_write_eof():
+                for p in pending:
+                    p.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        for t in (t1, t2):
+            if not t.done():
+                t.cancel()
 
 
 def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
@@ -146,11 +203,13 @@ def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
                 raise _HttpValidationError("Malformed HTTP header line")
             continue
         name_b, val_b = line.split(b":", 1)
+        if is_request and (not name_b or name_b != name_b.strip()):
+            raise _HttpValidationError("Invalid whitespace in HTTP header name")
         name = name_b.strip().lower().decode("latin-1")
         val = val_b.strip().decode("latin-1")
         if name == "content-length":
             parts = [p.strip() for p in val.split(",")]
-            if not parts or any(not p.isdigit() for p in parts):
+            if not parts or any(not (p.isascii() and p.isdigit()) for p in parts):
                 raise _HttpValidationError("Invalid Content-Length header")
             content_lengths.extend(int(p) for p in parts)
         elif name == "transfer-encoding":
@@ -172,7 +231,9 @@ def _parse_http_headers(head: bytes, *, is_request: bool) -> _ParsedHeaders:
         raise _HttpValidationError("Conflicting Content-Length headers")
     cl = content_lengths[0] if content_lengths else None
     has_te = bool(te_values)
-    is_chunked = "chunked" in te_values
+    if is_request and has_te and te_values[-1] != "chunked":
+        raise _HttpValidationError("Unsupported request Transfer-Encoding")
+    is_chunked = has_te and te_values[-1] == "chunked"
     if is_request and cl is not None and has_te:
         raise _HttpValidationError("Conflicting Content-Length and Transfer-Encoding headers")
 
@@ -199,13 +260,13 @@ def _parse_authority(authority: str, default_port: int) -> tuple[str, int]:
         rest = raw[end + 1 :]
         if not rest:
             port = default_port
-        elif rest.startswith(":") and rest[1:].isdigit():
+        elif rest.startswith(":") and rest[1:].isascii() and rest[1:].isdigit():
             port = int(rest[1:])
         else:
             raise _HttpValidationError("Invalid port in IPv6 authority")
     elif ":" in raw:
         host, port_s = raw.rsplit(":", 1)
-        if not port_s.isdigit():
+        if not (port_s.isascii() and port_s.isdigit()):
             raise _HttpValidationError("Invalid port in authority")
         port = int(port_s)
     else:
@@ -218,11 +279,15 @@ def _parse_authority(authority: str, default_port: int) -> tuple[str, int]:
 
 def _parse_http_target(target: str, host_header: str | None) -> tuple[str, str, int, str]:
     if "://" in target:
-        parsed = urlsplit(target)
+        try:
+            parsed = urlsplit(target)
+            port_val = parsed.port
+        except ValueError as exc:
+            raise _HttpValidationError("Invalid target URL") from exc
         scheme = (parsed.scheme or "").lower()
         if scheme not in ("http", "https") or not parsed.hostname:
             raise _HttpValidationError("Unsupported proxy target URL")
-        port = parsed.port or (443 if scheme == "https" else 80)
+        port = port_val if port_val is not None else (443 if scheme == "https" else 80)
         if not (1 <= port <= 65535):
             raise _HttpValidationError("Invalid target port")
         path = parsed.path or "/"
@@ -286,12 +351,14 @@ def _strip_connection_close(resp_head: bytes) -> bytes:
     for line in lines[1:]:
         if not line:
             continue
-        if line.lower().startswith(b"connection:"):
+        low = line.lower()
+        if low.startswith((b"connection:", b"proxy-connection:")):
+            hdr_name = line.split(b":", 1)[0].strip()
             tokens = [t.strip() for t in line.split(b":", 1)[1].split(b",")]
             kept = [t for t in tokens if t and t.lower() != b"close"]
             if not kept:
                 continue
-            rebuilt.extend(b"Connection: " + b", ".join(kept) + b"\r\n")
+            rebuilt.extend(hdr_name + b": " + b", ".join(kept) + b"\r\n")
             continue
         rebuilt.extend(line + b"\r\n")
     rebuilt.extend(b"\r\n")
@@ -327,16 +394,17 @@ async def _relay_chunked(
     while True:
         size_line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=timeout)
         size_token = size_line[:-2].split(b";", 1)[0].strip()
-        try:
-            chunk_size = int(size_token, 16)
-        except ValueError as exc:
-            raise _HttpValidationError("Invalid chunked transfer size") from exc
-        if chunk_size < 0:
-            raise _HttpValidationError("Negative chunked transfer size")
+        if not re.fullmatch(rb"[0-9A-Fa-f]+", size_token):
+            raise _HttpValidationError("Invalid chunked transfer size")
+        chunk_size = int(size_token, 16)
         writer.write(size_line)
         if chunk_size == 0:
+            trailer_bytes = 0
             while True:
                 trailer = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=timeout)
+                trailer_bytes += len(trailer)
+                if trailer_bytes > _HEADER_LIMIT:
+                    raise _HttpValidationError("Chunked trailer exceeds limit")
                 writer.write(trailer)
                 if trailer == b"\r\n":
                     break
@@ -372,7 +440,10 @@ class LocalProxyRelay:
         self.upstream_scheme = scheme
         self.upstream_host = parsed.hostname
         default_port = 443 if scheme == "https" else (1080 if scheme in ("socks5", "socks5h") else 80)
-        self.upstream_port = parsed.port or default_port
+        port_val = parsed.port
+        self.upstream_port = port_val if port_val is not None else default_port
+        if not (1 <= self.upstream_port <= 65535):
+            raise ValueError(f"Invalid upstream proxy port: {self.upstream_port}")
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
         self.close_timeout = close_timeout
@@ -452,10 +523,17 @@ class LocalProxyRelay:
 
     async def _open_upstream(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         ssl_arg = True if self.upstream_scheme == "https" else None
-        return await asyncio.wait_for(
-            asyncio.open_connection(self.upstream_host, self.upstream_port, ssl=ssl_arg),
-            timeout=self.connect_timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(self.upstream_host, self.upstream_port, ssl=ssl_arg),
+                timeout=self.connect_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise _UpstreamTimeoutError("Timed out connecting to upstream proxy") from exc
+        except (OSError, Exception) as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise _UpstreamProxyError(f"Failed connecting to upstream proxy: {exc}") from exc
 
     async def _socks5_connect(
         self, target_host: str, target_port: int
@@ -491,9 +569,18 @@ class LocalProxyRelay:
                 timeout=self.connect_timeout,
             )
             return upstream_reader, upstream_writer
-        except BaseException:
+        except _UpstreamProxyError:
             await self._close_writer(upstream_writer)
             raise
+        except asyncio.TimeoutError as exc:
+            await self._close_writer(upstream_writer)
+            raise _UpstreamTimeoutError("SOCKS5 handshake timed out") from exc
+        except asyncio.CancelledError:
+            await self._close_writer(upstream_writer)
+            raise
+        except Exception as exc:
+            await self._close_writer(upstream_writer)
+            raise _UpstreamProxyError(f"SOCKS5 handshake failed: {exc}") from exc
 
     async def _socks5_handshake(
         self,
@@ -511,10 +598,10 @@ class LocalProxyRelay:
         greeting_resp = await reader.readexactly(2)
         ver, method = greeting_resp[0], greeting_resp[1]
         if ver != 0x05:
-            raise OSError(f"Invalid SOCKS5 greeting version: {ver}")
+            raise _UpstreamProxyError(f"Invalid SOCKS5 greeting version: {ver}")
         if method == 0x02:
             if not self._has_auth:
-                raise OSError("SOCKS5 upstream demanded username/password auth")
+                raise _UpstreamProxyError("SOCKS5 upstream demanded username/password auth")
             auth_pkt = (
                 b"\x01"
                 + bytes([len(self._user_bytes)])
@@ -526,9 +613,9 @@ class LocalProxyRelay:
             await writer.drain()
             auth_resp = await reader.readexactly(2)
             if auth_resp[0] != 0x01 or auth_resp[1] != 0x00:
-                raise PermissionError(f"SOCKS5 auth rejected (status={auth_resp[1]})")
+                raise _UpstreamProxyError(f"SOCKS5 auth rejected (status={auth_resp[1]})")
         elif method != 0x00:
-            raise OSError(f"SOCKS5 no acceptable auth method (method={method:#x})")
+            raise _UpstreamProxyError(f"SOCKS5 no acceptable auth method (method={method:#x})")
 
         connect_req = b"\x05\x01\x00" + addr_payload + struct.pack("!H", target_port)
         writer.write(connect_req)
@@ -537,7 +624,9 @@ class LocalProxyRelay:
         reply_hdr = await reader.readexactly(4)
         r_ver, rep, _rsv, bnd_atyp = reply_hdr[0], reply_hdr[1], reply_hdr[2], reply_hdr[3]
         if r_ver != 0x05:
-            raise OSError(f"Invalid SOCKS5 reply version: {r_ver}")
+            raise _UpstreamProxyError(f"Invalid SOCKS5 reply version: {r_ver}")
+        if rep != 0x00:
+            raise _UpstreamProxyError(f"SOCKS5 CONNECT failed with reply={rep:#x}")
         if bnd_atyp == 0x01:
             await reader.readexactly(6)
         elif bnd_atyp == 0x04:
@@ -546,9 +635,7 @@ class LocalProxyRelay:
             bnd_len = (await reader.readexactly(1))[0]
             await reader.readexactly(bnd_len + 2)
         else:
-            raise OSError(f"Unsupported SOCKS5 BND ATYP: {bnd_atyp:#x}")
-        if rep != 0x00:
-            raise OSError(f"SOCKS5 CONNECT failed with reply={rep:#x}")
+            raise _UpstreamProxyError(f"Unsupported SOCKS5 BND ATYP: {bnd_atyp:#x}")
 
     def _inject_auth(self, head: bytes) -> bytes:
         """Replace or append Proxy-Authorization header in raw HTTP request headers."""
@@ -577,34 +664,44 @@ class LocalProxyRelay:
         client_writer: asyncio.StreamWriter,
         head: bytes,
         target: str,
-    ) -> asyncio.StreamWriter | None:
-        if self._is_socks5:
-            target_host, target_port = _parse_authority(target, 443)
-            upstream_reader, upstream_writer = await self._socks5_connect(target_host, target_port)
-            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await asyncio.wait_for(client_writer.drain(), timeout=self.idle_timeout)
-        else:
-            upstream_reader, upstream_writer = await self._open_upstream()
-            upstream_writer.write(self._inject_auth(head))
-            await asyncio.wait_for(upstream_writer.drain(), timeout=self.connect_timeout)
-            resp_head = await asyncio.wait_for(
-                _read_http_head(upstream_reader), timeout=self.connect_timeout
-            )
-            if not resp_head:
-                return upstream_writer
-            client_writer.write(resp_head)
-            await asyncio.wait_for(client_writer.drain(), timeout=self.idle_timeout)
-            status_line = resp_head.split(b"\r\n", 1)[0]
-            parts = status_line.split(b" ", 2)
-            if len(parts) < 2 or parts[1] != b"200":
-                return upstream_writer
+    ) -> None:
+        upstream_writer: asyncio.StreamWriter | None = None
+        try:
+            if self._is_socks5:
+                target_host, target_port = _parse_authority(target, 443)
+                upstream_reader, upstream_writer = await self._socks5_connect(target_host, target_port)
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await asyncio.wait_for(client_writer.drain(), timeout=self.idle_timeout)
+            else:
+                upstream_reader, upstream_writer = await self._open_upstream()
+                try:
+                    upstream_writer.write(self._inject_auth(head))
+                    await asyncio.wait_for(upstream_writer.drain(), timeout=self.connect_timeout)
+                    resp_head = await asyncio.wait_for(
+                        _read_http_head(upstream_reader), timeout=self.connect_timeout
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise _UpstreamTimeoutError("Upstream HTTP CONNECT timed out") from exc
+                except (OSError, asyncio.IncompleteReadError) as exc:
+                    raise _UpstreamProxyError(f"Upstream HTTP CONNECT failed: {exc}") from exc
+                if not resp_head:
+                    raise _UpstreamProxyError("Upstream closed during HTTP CONNECT")
+                client_writer.write(resp_head)
+                await asyncio.wait_for(client_writer.drain(), timeout=self.idle_timeout)
+                status_line = resp_head.split(b"\r\n", 1)[0]
+                parts = status_line.split(b" ", 2)
+                if len(parts) < 2 or parts[1] != b"200":
+                    return
 
-        await asyncio.gather(
-            _pipe(client_reader, upstream_writer, idle_timeout=self.idle_timeout),
-            _pipe(upstream_reader, client_writer, idle_timeout=self.idle_timeout),
-            return_exceptions=True,
-        )
-        return upstream_writer
+            await _pipe_pair(
+                client_reader,
+                upstream_writer,
+                upstream_reader,
+                client_writer,
+                idle_timeout=self.idle_timeout,
+            )
+        finally:
+            await self._close_writer(upstream_writer)
 
     async def _handle_client(
         self,
@@ -645,7 +742,7 @@ class LocalProxyRelay:
                     upstream_writer = None
                     upstream_reader = None
                     upstream_target = None
-                    upstream_writer = await self._handle_connect(
+                    await self._handle_connect(
                         client_reader, client_writer, head, target_str
                     )
                     return
@@ -702,14 +799,22 @@ class LocalProxyRelay:
                 prefetched_resp: bytes | None = None
                 skip_req_body = False
                 if req_hdrs.expect_100 and has_req_body:
+                    wait_100 = min(1.5, self.idle_timeout)
                     while True:
-                        interim = await asyncio.wait_for(
-                            _read_http_head(upstream_reader), timeout=self.idle_timeout
-                        )
+                        try:
+                            interim = await asyncio.wait_for(
+                                _read_http_head(upstream_reader), timeout=wait_100
+                            )
+                        except asyncio.TimeoutError:
+                            break
                         if not interim:
                             raise EOFError("Upstream closed during Expect: 100-continue")
                         s_parts = interim.split(b"\r\n", 1)[0].split(b" ", 2)
-                        status_code = int(s_parts[1]) if len(s_parts) >= 2 and s_parts[1].isdigit() else 0
+                        status_code = (
+                            int(s_parts[1])
+                            if len(s_parts) >= 2 and s_parts[1].isascii() and s_parts[1].isdigit()
+                            else 0
+                        )
                         if status_code == 100:
                             response_started = True
                             client_writer.write(interim)
@@ -751,7 +856,7 @@ class LocalProxyRelay:
 
                     status_line = resp_head.split(b"\r\n", 1)[0]
                     s_parts = status_line.split(b" ", 2)
-                    if len(s_parts) < 2 or not s_parts[1].isdigit():
+                    if len(s_parts) < 2 or not (s_parts[1].isascii() and s_parts[1].isdigit()):
                         raise OSError("Invalid HTTP response status line from upstream")
                     resp_ver = s_parts[0].upper()
                     status_code = int(s_parts[1])
@@ -760,10 +865,12 @@ class LocalProxyRelay:
                         response_started = True
                         client_writer.write(resp_head)
                         await asyncio.wait_for(client_writer.drain(), timeout=self.idle_timeout)
-                        await asyncio.gather(
-                            _pipe(client_reader, upstream_writer, idle_timeout=self.idle_timeout),
-                            _pipe(upstream_reader, client_writer, idle_timeout=self.idle_timeout),
-                            return_exceptions=True,
+                        await _pipe_pair(
+                            client_reader,
+                            upstream_writer,
+                            upstream_reader,
+                            client_writer,
+                            idle_timeout=self.idle_timeout,
                         )
                         return
                     if 100 <= status_code < 200:
@@ -785,8 +892,14 @@ class LocalProxyRelay:
                         and "close" not in req_hdrs.proxy_connection_tokens
                     )
 
-                upstream_close = "close" in resp_hdrs.connection_tokens or (
-                    resp_ver == b"HTTP/1.0" and "keep-alive" not in resp_hdrs.connection_tokens
+                upstream_close = (
+                    "close" in resp_hdrs.connection_tokens
+                    or "close" in resp_hdrs.proxy_connection_tokens
+                    or (
+                        resp_ver == b"HTTP/1.0"
+                        and "keep-alive" not in resp_hdrs.connection_tokens
+                        and "keep-alive" not in resp_hdrs.proxy_connection_tokens
+                    )
                 )
 
                 if method_u == b"HEAD" or status_code in (204, 304):
@@ -795,6 +908,9 @@ class LocalProxyRelay:
                 elif resp_hdrs.is_chunked:
                     body_mode = "chunked"
                     framed = True
+                elif resp_hdrs.has_transfer_encoding:
+                    body_mode = "eof"
+                    framed = False
                 elif resp_hdrs.content_length is not None:
                     body_mode = "length"
                     framed = True
@@ -848,6 +964,18 @@ class LocalProxyRelay:
             if not response_started:
                 with contextlib.suppress(Exception):
                     client_writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    await asyncio.wait_for(client_writer.drain(), timeout=self.close_timeout)
+        except _UpstreamTimeoutError as exc:
+            log.warning("upstream proxy timeout (%s): %s", mask_proxy(self.upstream_url), exc)
+            if not response_started:
+                with contextlib.suppress(Exception):
+                    client_writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n")
+                    await asyncio.wait_for(client_writer.drain(), timeout=self.close_timeout)
+        except _UpstreamProxyError as exc:
+            log.warning("upstream proxy error (%s): %s", mask_proxy(self.upstream_url), exc)
+            if not response_started:
+                with contextlib.suppress(Exception):
+                    client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                     await asyncio.wait_for(client_writer.drain(), timeout=self.close_timeout)
         except (asyncio.CancelledError, asyncio.IncompleteReadError, ConnectionError, OSError):
             pass

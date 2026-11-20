@@ -9,6 +9,7 @@ the loop skips them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -60,6 +61,8 @@ async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) 
             await pool.upsert(latest)
         return res
 
+    committed_snapshot: list[Account] = []
+
     def _on_success(latest: Account) -> tuple[bool, dict]:
         if pool.is_blocked_cb and pool.is_blocked_cb(account_id):
             return False, {"ok": False, "error": "account is busy in an interactive browser session"}
@@ -70,20 +73,25 @@ async def renew_account(pool: AccountPool, driver: MuseDriver, account_id: str) 
         latest.meta.update(info.meta)
         latest.meta["renewed_at"] = time.time()
         note_wake(latest, info.meta)
+        committed_snapshot.append(latest.model_copy(deep=True))
         return True, {"ok": info.ok, "meta": info.meta}
 
     if hasattr(pool, "try_update"):
         found, res = await pool.try_update(account_id, _on_success)
         if not found:
             return {"ok": False, "error": "account deleted"}
-        return res  # type: ignore[return-value]
-    latest = pool.get(account_id)
-    if latest is None:
-        return {"ok": False, "error": "account deleted"}
-    changed, res = _on_success(latest)
-    if changed:
-        await pool.upsert(latest)
-    return res
+    else:
+        latest = pool.get(account_id)
+        if latest is None:
+            return {"ok": False, "error": "account deleted"}
+        changed, res = _on_success(latest)
+        if changed:
+            await pool.upsert(latest)
+
+    if committed_snapshot and hasattr(driver, "sync_renewed_cookies"):
+        with contextlib.suppress(Exception):
+            await driver.sync_renewed_cookies(committed_snapshot[0])
+    return res  # type: ignore[return-value]
 
 
 async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float) -> None:

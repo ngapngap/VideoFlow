@@ -25,9 +25,10 @@ cargo run            # Chạy ứng dụng Desktop
 ### Bộ kiểm tra chất lượng & E2E tự động
 
 ```bash
-# Kiểm tra kiểu TypeScript & Accessibility (Svelte)
+# Kiểm tra kiểu TypeScript, Unit Tests frontend & đóng gói giao diện
 cd videoflow-app
 npm run check
+npm test
 npm run build
 
 # Kiểm tra Linter & Unit Tests cho Sidecar Python

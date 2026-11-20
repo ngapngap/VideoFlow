@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python" />
   <img src="https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi" alt="FastAPI" />
   <img src="https://img.shields.io/badge/API-OpenAI%20Compatible-green" alt="OpenAI Compatible" />
-  <img src="https://img.shields.io/badge/status-v0.1%20framework-orange" alt="Status" />
+  <img src="https://img.shields.io/badge/version-v1.5.1-blue" alt="Version v1.5.1" />
   <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License" />
 </p>
 
@@ -42,7 +42,7 @@ The project focuses on **clean engineering and easy collaboration**:
 
 ## Status
 
-> **Current**: the unit and mock-driver test suite passes locally (225 tests, no network access) and CI runs on every push to main; the browser driver and the direct-protocol driver still need live testing against a real muse.ai account.
+> **Current**: the unit and mock-driver test suite passes locally (235 tests, no network access) and CI runs on every push/PR; the browser driver and direct-protocol integrations have smoke coverage in CI/release workflows.
 
 | Module | Status | Notes |
 |---|---|---|
@@ -148,22 +148,16 @@ sidecar/
 ### Run locally
 
 ```bash
-git clone https://github.com/www222fff/muse2api.git
-cd muse2api
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
-cp .env.example .env      # defaults to MUSE2API_DRIVER=mock, no account needed
-python -m muse2api        # listens on http://127.0.0.1:18610 by default
+cd videoflow-app/sidecar
+python -m venv .venv
+# Linux/macOS: source .venv/bin/activate
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt pytest ruff
+set MUSE2API_DRIVER=mock   # PowerShell: $env:MUSE2API_DRIVER="mock"
+python -m muse2api         # listens on http://127.0.0.1:18610 by default
 ```
 
 If `MUSE2API_API_KEY` is not set, a key is generated on first start and saved to `data/api_key`.
-
-### Docker
-
-```bash
-cp .env.example .env
-docker compose up -d --build
-```
 
 ### Use a real account (browser driver)
 
@@ -277,6 +271,8 @@ curl http://localhost:18610/admin/accounts \
 | GET/POST/PATCH/DELETE | `/admin/accounts[/{id}]` | Account CRUD |
 | POST | `/admin/accounts/import` | Bulk account import with per-entry error reporting |
 | POST | `/admin/accounts/{id}/renew` · `/reset` | Renew session · reset account state |
+| POST | `/admin/accounts/{id}/open-login` · `/open-view` | Launch interactive login window (captures cookies) · inspect chat history in a headed browser |
+| POST | `/admin/prewarm` | Trigger delayed browser prewarm after proxy/account hydration (`MUSE2API_DEFER_PREWARM=true`) |
 | GET | `/admin/accounts/{id}/quota[?refresh=1]` | Quota snapshot (cached 30 min; `refresh=1` reads it again; 409 `account_busy` when every tab is busy) |
 | GET | `/admin/extension.zip` | The cookie-import Chrome extension |
 | GET | `/admin/status` · `/admin/tasks` | Service status · task list |
@@ -289,11 +285,7 @@ curl http://localhost:18610/admin/accounts \
 
 Open `http://localhost:18610/dashboard` and enter the admin key; it is kept in the browser's local storage and sent as a Bearer token to `/admin/*`. The page shows request volume, error rate and latency, the account pool (enable/disable, renew, reset), a live request log, and API key management.
 
-![Dashboard overview](docs/images/dashboard-overview.png)
-
 Each account card shows its quota (usage bar, plan, reset date, age of the reading, with a **Quota** button to read it again), when its session cookie expires, and whether its VM was confirmed running after the last wake. **Import hàng loạt** (bulk import) takes one `label | cookie string` per line.
-
-![Accounts](docs/images/dashboard-accounts.png)
 
 #### Cookie-import extension
 
@@ -327,6 +319,10 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `4` | Parallel requests per account (browser driver: one tab each, about 300 MB of memory per tab) |
 | `MUSE2API_WARM_THREADS` | `2` | Pre-started threads kept per account. A new muse.ai thread takes 20-40s to answer its first message, a started one about 5s, so chats that need a new thread go into a warm one. Each costs one extra short message of quota; needs a concurrency of at least 2 |
 | `MUSE2API_CHROMIUM_PATH` | auto-detected | Path to the browser executable |
+| `MUSE2API_CDP_PORT` | `19200` | Base CDP port used for managed Chromium instances |
+| `MUSE2API_HEADLESS` | `true` | Run managed browser profiles headless (`false` displays browser windows) |
+| `MUSE2API_DATA_DIR` | `./data` | Directory for `accounts.json`, `keys.json`, `requests.db`, browser profiles and media |
+| `MUSE2API_DEFER_PREWARM` | `false` | Defer initial warm-tab startup until Desktop calls `POST /admin/prewarm` after syncing proxy assignments |
 | `MUSE2API_KEEPALIVE_ENABLED` | `true` | Periodically renew sessions and wake each account's VM in the background |
 | `MUSE2API_KEEPALIVE_INTERVAL` | `600` | Seconds between keepalive rounds |
 | `MUSE2API_WAKE_CONFIRM_S` | `20` | Seconds to wait for a woken VM to report `RUNNING` |

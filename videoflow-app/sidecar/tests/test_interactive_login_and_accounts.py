@@ -361,7 +361,7 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
         fake_cdp_instances.append(inst)
         return inst
 
-    upsert_spy = AsyncMock(wraps=test_services.pool.upsert)
+    try_update_spy = AsyncMock(wraps=test_services.pool.try_update)
     sess = InteractiveSession(acc.id, "login")
 
     with (
@@ -377,7 +377,7 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
         ),
         patch("muse2api.drivers.browser.interactive.CDPSession.connect", side_effect=fake_connect),
         patch("muse2api.drivers.browser.interactive.asyncio.sleep", new=AsyncMock()),
-        patch.object(test_services.pool, "upsert", upsert_spy),
+        patch.object(test_services.pool, "try_update", try_update_spy),
     ):
         await test_services.interactive._run_login_session(acc, sess)
 
@@ -406,9 +406,9 @@ async def test_run_login_session_harvests_and_deduplicates_writes(test_services)
     assert last_cookie_idx < nav_idx
     assert calls[nav_idx][1] == {"url": "https://muse.ai/"}
 
-    # Two identical loop iterations should deduplicate to only 1 pool.upsert call
+    # Two identical loop iterations should deduplicate to only 1 pool.try_update call
     assert proc.get_cookies_calls == 2
-    assert upsert_spy.call_count == 1
+    assert try_update_spy.call_count == 1
 
     updated = test_services.pool.get(acc.id)
     assert updated.status == AccountStatus.ACTIVE

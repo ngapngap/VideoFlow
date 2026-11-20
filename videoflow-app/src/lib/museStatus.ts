@@ -255,3 +255,216 @@ export function deriveStatusbarIpText(
     title,
   };
 }
+
+const ZERO_EXTRA = new Set(["0", "0.0", "none", "null", "n/a", "-", "—"]);
+const QUANTITY_SUFFIX_RE = /^([0-9]*\.?[0-9]+)\s*([kmb])?\b/i;
+const ISO_TIME_TAIL_RE = /T\d{2}:\d{2}.*$/;
+const ZH_DATE_RE = /^(?:(\d{4})年)?\s*(\d{1,2})月(\d{1,2})日?$/;
+
+const SHORT_MONTHS: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+const FULL_MONTHS: Record<string, number> = {
+  january: 1,
+  february: 2,
+  march: 3,
+  april: 4,
+  may: 5,
+  june: 6,
+  july: 7,
+  august: 8,
+  september: 9,
+  october: 10,
+  november: 11,
+  december: 12,
+};
+
+function isExtraZero(text: string): boolean {
+  const cleaned = text.trim().toLowerCase().replace(/,/g, "");
+  if (!cleaned) return true;
+  const head = cleaned.split(/\s+/)[0];
+  if (ZERO_EXTRA.has(head)) return true;
+  const m = QUANTITY_SUFFIX_RE.exec(cleaned);
+  if (!m) return false;
+  const value = Number(m[1]);
+  if (!Number.isFinite(value)) return false;
+  return value <= 0;
+}
+
+function isValidYmd(year: number, month1: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month1) || !Number.isInteger(day)) {
+    return false;
+  }
+  if (year < 100 || month1 < 1 || month1 > 12 || day < 1 || day > 31) {
+    return false;
+  }
+  const d = new Date(year, month1 - 1, day, 12, 0, 0, 0);
+  return d.getFullYear() === year && d.getMonth() === month1 - 1 && d.getDate() === day;
+}
+
+function localEndOfDaySec(year: number, month1: number, day: number): number {
+  return new Date(year, month1 - 1, day, 23, 59, 59, 0).getTime() / 1000;
+}
+
+function safeReplaceYearEndOfDaySec(year: number, month1: number, day: number): number {
+  const safeDay = isValidYmd(year, month1, day) ? day : 28;
+  return localEndOfDaySec(year, month1, safeDay);
+}
+
+function resolveNoYearDeadlineSec(
+  month1: number,
+  day: number,
+  nowSec: number,
+  checkedAtSec?: number | null
+): number | null {
+  if (!isValidYmd(2024, month1, day)) return null;
+  const anchorSec =
+    typeof checkedAtSec === "number" && Number.isFinite(checkedAtSec) && checkedAtSec > 0
+      ? checkedAtSec
+      : nowSec;
+  const anchorYear = new Date(anchorSec * 1000).getFullYear();
+  let candSec = safeReplaceYearEndOfDaySec(anchorYear, month1, day);
+  if (candSec < anchorSec) {
+    candSec = safeReplaceYearEndOfDaySec(anchorYear + 1, month1, day);
+  }
+  return candSec - nowSec;
+}
+
+function resetDeadlineSec(
+  resetsAt: unknown,
+  nowSec: number,
+  checkedAt?: unknown
+): number | null {
+  if (resetsAt === null || resetsAt === undefined || resetsAt === "" || resetsAt === 0) {
+    return null;
+  }
+  if (typeof resetsAt === "number") {
+    return Number.isFinite(resetsAt) ? resetsAt - nowSec : null;
+  }
+  const checkedAtSec =
+    typeof checkedAt === "number" && Number.isFinite(checkedAt) ? checkedAt : null;
+
+  let text = String(resetsAt).trim();
+  if (!text) return null;
+  text = text.replace(ISO_TIME_TAIL_RE, "");
+  for (const sep of [" at ", " (", " – ", " - "]) {
+    const idx = text.indexOf(sep);
+    if (idx !== -1) {
+      text = text.slice(0, idx);
+    }
+  }
+  text = text.trim().replace(/,+$/, "").trim();
+  if ((text.match(/,/g) || []).length === 2) {
+    text = text.slice(0, text.lastIndexOf(",")).trim();
+  }
+
+  const zm = ZH_DATE_RE.exec(text);
+  if (zm) {
+    const mo = Number(zm[2]);
+    const dy = Number(zm[3]);
+    if (zm[1]) {
+      const yr = Number(zm[1]);
+      return isValidYmd(yr, mo, dy) ? localEndOfDaySec(yr, mo, dy) - nowSec : null;
+    }
+    return resolveNoYearDeadlineSec(mo, dy, nowSec, checkedAtSec);
+  }
+
+  const mCommaYear = /^([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})$/.exec(text);
+  if (mCommaYear) {
+    const key = mCommaYear[1].toLowerCase();
+    const mo = SHORT_MONTHS[key] ?? FULL_MONTHS[key];
+    const dy = Number(mCommaYear[2]);
+    const yr = Number(mCommaYear[3]);
+    if (mo && isValidYmd(yr, mo, dy)) {
+      return localEndOfDaySec(yr, mo, dy) - nowSec;
+    }
+    return null;
+  }
+
+  const mShortNoComma = /^([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})$/.exec(text);
+  if (mShortNoComma) {
+    const mo = SHORT_MONTHS[mShortNoComma[1].toLowerCase()];
+    const dy = Number(mShortNoComma[2]);
+    const yr = Number(mShortNoComma[3]);
+    if (mo && isValidYmd(yr, mo, dy)) {
+      return localEndOfDaySec(yr, mo, dy) - nowSec;
+    }
+    return null;
+  }
+
+  const mIso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(text);
+  if (mIso) {
+    const yr = Number(mIso[1]);
+    const mo = Number(mIso[2]);
+    const dy = Number(mIso[3]);
+    return isValidYmd(yr, mo, dy) ? localEndOfDaySec(yr, mo, dy) - nowSec : null;
+  }
+
+  const mSlash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(text);
+  if (mSlash) {
+    const a = Number(mSlash[1]);
+    const b = Number(mSlash[2]);
+    const yr = Number(mSlash[3]);
+    if (isValidYmd(yr, a, b)) {
+      return localEndOfDaySec(yr, a, b) - nowSec;
+    }
+    if (isValidYmd(yr, b, a)) {
+      return localEndOfDaySec(yr, b, a) - nowSec;
+    }
+    return null;
+  }
+
+  const mNoYear = /^([A-Za-z]+)\s+(\d{1,2})$/.exec(text);
+  if (mNoYear) {
+    const key = mNoYear[1].toLowerCase();
+    const mo = SHORT_MONTHS[key] ?? FULL_MONTHS[key];
+    const dy = Number(mNoYear[2]);
+    if (mo) {
+      return resolveNoYearDeadlineSec(mo, dy, nowSec, checkedAtSec);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Matches Python `Account.quota_exhausted()` parity rules:
+ * honors sidecar-computed `account.quota_exhausted` boolean when present,
+ * otherwise requires numeric `weekly_used_pct >= 100`, empty/zero `extra_left`,
+ * and a parseable `resets_at` deadline still in the future.
+ */
+export function isQuotaExhausted(
+  account: MuseAccount,
+  nowMs: number = Date.now()
+): boolean {
+  if (typeof account.quota_exhausted === "boolean") {
+    return account.quota_exhausted;
+  }
+  const q = account.meta?.quota;
+  if (!q) return false;
+  const pct = q.weekly_used_pct;
+  if (typeof pct !== "number" || !Number.isFinite(pct) || pct < 100) {
+    return false;
+  }
+  if (typeof q.extra_left === "string" && q.extra_left.trim() && !isExtraZero(q.extra_left)) {
+    return false;
+  }
+  const checkedAt = q.checked_at ?? q.fetched_at;
+  const resetIn = resetDeadlineSec(q.resets_at, nowMs / 1000, checkedAt);
+  if (resetIn === null) {
+    return false;
+  }
+  return resetIn > 0;
+}

@@ -1333,15 +1333,11 @@ pub(crate) fn spawn_engine_internal(
             }
             Ok(Err(e)) => {
                 let rid = created_rid_bg.load(Ordering::SeqCst);
-                if rid > 0 {
-                    if let Ok(conn) = crate::state_db::open(&p) {
-                        let ts_now = chrono::Local::now().to_rfc3339();
-                        let _ = conn.execute(
-                            "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
-                            rusqlite::params![ts_now, rid],
-                        );
-                    }
-                }
+                let (done_cnt, err_cnt) = if rid > 0 {
+                    finalize_interrupted_run_in_db(&p, rid)
+                } else {
+                    (0, 0)
+                };
                 let safe_msg = crate::settings::redact_secrets(&e.message);
                 let _ = app2.emit(
                     "run_error",
@@ -1353,22 +1349,18 @@ pub(crate) fn spawn_engine_internal(
                 serde_json::json!({
                     "run_id": rid,
                     "status": "gian_doan",
-                    "done_count": 0,
-                    "error_count": 0,
+                    "done_count": done_cnt,
+                    "error_count": err_cnt,
                     "duration_ms": start_inst.elapsed().as_millis() as i64
                 })
             }
             Err(panic_err) => {
                 let rid = created_rid_bg.load(Ordering::SeqCst);
-                if rid > 0 {
-                    if let Ok(conn) = crate::state_db::open(&p) {
-                        let ts_now = chrono::Local::now().to_rfc3339();
-                        let _ = conn.execute(
-                            "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
-                            rusqlite::params![ts_now, rid],
-                        );
-                    }
-                }
+                let (done_cnt, err_cnt) = if rid > 0 {
+                    finalize_interrupted_run_in_db(&p, rid)
+                } else {
+                    (0, 0)
+                };
                 let msg = panic_err
                     .downcast_ref::<String>()
                     .cloned()
@@ -1385,8 +1377,8 @@ pub(crate) fn spawn_engine_internal(
                 serde_json::json!({
                     "run_id": rid,
                     "status": "gian_doan",
-                    "done_count": 0,
-                    "error_count": 0,
+                    "done_count": done_cnt,
+                    "error_count": err_cnt,
                     "duration_ms": start_inst.elapsed().as_millis() as i64
                 })
             }
@@ -2386,10 +2378,47 @@ pub async fn muse_start_sidecar(state: State<'_, AppState>) -> AppResult<serde_j
         .map_err(|e| AppError::new("SERIALIZE_FAIL", format!("{e}")))
 }
 
+static PROXY_MUTATION_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn proxy_mutation_lock() -> &'static parking_lot::Mutex<()> {
+    PROXY_MUTATION_LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+fn finalize_interrupted_run_in_db(p: &Path, rid: i64) -> (i64, i64) {
+    let Ok(conn) = crate::state_db::open(p) else {
+        return (0, 0);
+    };
+    let ts_now = chrono::Local::now().to_rfc3339();
+    let _ = conn.execute(
+        "UPDATE runs SET status = 'gian_doan', finished_at = ?1 WHERE id = ?2 AND status = 'dang_chay'",
+        rusqlite::params![ts_now, rid],
+    );
+    let _ = conn.execute(
+        "UPDATE jobs
+         SET status = CASE WHEN status IN ('dang_cho', 'da_tao_image') THEN 'loi_tam_thoi' ELSE status END,
+             image_status = CASE WHEN image_status = 'dang_chay' THEN 'loi' ELSE image_status END,
+             video_status = CASE WHEN video_status = 'dang_chay' THEN 'loi' ELSE video_status END,
+             finished_at = COALESCE(finished_at, ?1)
+         WHERE run_id = ?2 AND (image_status = 'dang_chay' OR video_status = 'dang_chay')",
+        rusqlite::params![ts_now, rid],
+    );
+    conn.query_row(
+        "SELECT COALESCE(done_count, 0), COALESCE(error_count, 0) FROM runs WHERE id = ?1",
+        rusqlite::params![rid],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )
+    .unwrap_or((0, 0))
+}
+
 #[tauri::command]
-pub fn muse_stop_sidecar() -> AppResult<bool> {
-    crate::muse_sidecar::stop()?;
-    Ok(true)
+pub async fn muse_stop_sidecar() -> AppResult<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::muse_sidecar::stop()?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
 }
 
 fn enrich_account_json_with_proxy(
@@ -2440,23 +2469,31 @@ fn enrich_account_json_with_proxy(
                     .unwrap_or(serde_json::Value::Null),
             );
             let expected_masked = px.to_masked_url();
-            if current_masked.as_deref() != Some(expected_masked.as_str()) && !is_busy {
-                if let Some((port, key)) = sidecar_session {
-                    if let (Ok(safe_id), Some(full_url)) =
-                        (muse_sanitize_id(&acc_id), proxy_urls.get(&px.id))
-                    {
-                        let patch_body = serde_json::json!({ "proxy": full_url });
-                        let _ = crate::muse_sidecar::admin_send(
-                            port,
-                            key,
-                            "PATCH",
-                            &format!("/admin/accounts/{safe_id}"),
-                            Some(&patch_body),
-                        );
+            let mut synced = current_masked.as_deref() == Some(expected_masked.as_str());
+            if !synced {
+                match sidecar_session {
+                    None => synced = true,
+                    Some((port, key)) if !is_busy => {
+                        if let (Ok(safe_id), Some(full_url)) =
+                            (muse_sanitize_id(&acc_id), proxy_urls.get(&px.id))
+                        {
+                            let patch_body = serde_json::json!({ "proxy": full_url });
+                            synced = crate::muse_sidecar::admin_send(
+                                port,
+                                key,
+                                "PATCH",
+                                &format!("/admin/accounts/{safe_id}"),
+                                Some(&patch_body),
+                            )
+                            .is_ok();
+                        }
                     }
+                    Some(_) => {}
                 }
             }
-            obj.insert("proxy".into(), serde_json::Value::String(expected_masked));
+            if synced {
+                obj.insert("proxy".into(), serde_json::Value::String(expected_masked));
+            }
             return;
         }
     }
@@ -2495,6 +2532,33 @@ fn enrich_account_json_with_proxy(
     }
 }
 
+fn enrich_accounts_slice_from_db(
+    conn: &rusqlite::Connection,
+    items: &mut [serde_json::Value],
+    sidecar_session: Option<(u16, &str)>,
+) {
+    let Ok(proxies) = crate::proxies::list_proxies_in(conn) else {
+        return;
+    };
+    let Ok(acc_to_proxy) = crate::proxies::load_account_to_proxy_map(conn) else {
+        return;
+    };
+    let proxy_urls = crate::proxies::resolve_proxy_urls_map_best_effort_in(conn)
+        .map(|(m, _)| m)
+        .unwrap_or_default();
+    let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
+        proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+    for item in items.iter_mut() {
+        enrich_account_json_with_proxy(
+            item,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            sidecar_session,
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2507,21 +2571,12 @@ pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
         let mut res =
             crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")?;
         if let Ok(conn) = crate::proxies::open_db() {
-            let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-            let acc_to_proxy = crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-            let proxy_urls = crate::proxies::resolve_proxy_urls_map_in(&conn).unwrap_or_default();
-            let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
             if let Some(arr) = res.get_mut("data").and_then(|d| d.as_array_mut()) {
-                for item in arr.iter_mut() {
-                    enrich_account_json_with_proxy(
-                        item,
-                        &acc_to_proxy,
-                        &proxy_by_id,
-                        &proxy_urls,
-                        Some((session.port, &session.api_key)),
-                    );
-                }
+                enrich_accounts_slice_from_db(
+                    &conn,
+                    arr,
+                    Some((session.port, &session.api_key)),
+                );
             }
         }
         Ok(res)
@@ -2542,6 +2597,7 @@ pub async fn muse_add_cookie(
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let clean_pid = proxy_id
             .as_deref()
             .map(str::trim)
@@ -2580,24 +2636,19 @@ pub async fn muse_add_cookie(
                 .unwrap_or("")
                 .to_string();
             if !acc_id.is_empty() {
-                if let Ok(conn) = crate::proxies::open_db() {
-                    let _ = crate::proxies::set_account_proxy_in(
+                if let Some(ref pid) = clean_pid {
+                    let conn = crate::proxies::open_db()?;
+                    crate::proxies::set_account_proxy_in(&conn, &acc_id, Some(pid.as_str()))?;
+                    enrich_accounts_slice_from_db(
                         &conn,
-                        &acc_id,
-                        clean_pid.as_deref(),
+                        std::slice::from_mut(acc_obj),
+                        Some((port, &key)),
                     );
-                    let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-                    let acc_to_proxy =
-                        crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-                    let proxy_urls =
-                        crate::proxies::resolve_proxy_urls_map_in(&conn).unwrap_or_default();
-                    let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                        proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
-                    enrich_account_json_with_proxy(
-                        acc_obj,
-                        &acc_to_proxy,
-                        &proxy_by_id,
-                        &proxy_urls,
+                } else if let Ok(conn) = crate::proxies::open_db() {
+                    let _ = crate::proxies::set_account_proxy_in(&conn, &acc_id, None);
+                    enrich_accounts_slice_from_db(
+                        &conn,
+                        std::slice::from_mut(acc_obj),
                         Some((port, &key)),
                     );
                 }
@@ -2623,7 +2674,9 @@ pub async fn muse_update_account(
     }
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let (port, key) = muse_session_or_err(&cfg)?;
+        let safe_id = muse_sanitize_id(&account_id)?;
         let mut body = serde_json::Map::new();
         if let Some(e) = enabled {
             body.insert("enabled".into(), serde_json::Value::Bool(e));
@@ -2633,13 +2686,24 @@ pub async fn muse_update_account(
         }
 
         let mut target_proxy_id: Option<Option<String>> = None;
+        let has_raw_proxy = proxy_id.is_none()
+            && proxy.as_deref().is_some_and(|p| !p.trim().is_empty());
+        let mut prev_proxy_url_for_rb: Option<String> = None;
+
         if let Some(pid_raw) = proxy_id {
+            let conn = crate::proxies::open_db()?;
+            if let Ok(map) = crate::proxies::load_account_to_proxy_map(&conn) {
+                prev_proxy_url_for_rb = Some(
+                    map.get(&safe_id)
+                        .and_then(|old_pid| crate::proxies::resolve_proxy_url_in(&conn, old_pid).ok())
+                        .unwrap_or_default(),
+                );
+            }
             let trimmed = pid_raw.trim();
             if trimmed.is_empty() {
                 body.insert("proxy".into(), serde_json::Value::String(String::new()));
                 target_proxy_id = Some(None);
             } else {
-                let conn = crate::proxies::open_db()?;
                 let px = crate::proxies::get_proxy_in(&conn, trimmed)?;
                 let url = crate::proxies::resolve_proxy_url_in(&conn, &px.id)?;
                 body.insert("proxy".into(), serde_json::Value::String(url));
@@ -2653,7 +2717,6 @@ pub async fn muse_update_account(
             }
         }
 
-        let safe_id = muse_sanitize_id(&account_id)?;
         let path = format!("/admin/accounts/{safe_id}");
         let mut res = crate::muse_sidecar::admin_send(
             port,
@@ -2663,25 +2726,55 @@ pub async fn muse_update_account(
             Some(&serde_json::Value::Object(body)),
         )?;
 
-        if let Ok(conn) = crate::proxies::open_db() {
-            if let Some(ref pid_opt) = target_proxy_id {
-                crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref())?;
+        if let Some(ref pid_opt) = target_proxy_id {
+            let conn = match crate::proxies::open_db() {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(ref old_u) = prev_proxy_url_for_rb {
+                        let rb_body = serde_json::json!({ "proxy": old_u });
+                        let _ = crate::muse_sidecar::admin_send(
+                            port,
+                            &key,
+                            "PATCH",
+                            &path,
+                            Some(&rb_body),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            if let Err(e) = crate::proxies::set_account_proxy_in(&conn, &safe_id, pid_opt.as_deref())
+            {
+                if let Some(ref old_u) = prev_proxy_url_for_rb {
+                    let rb_body = serde_json::json!({ "proxy": old_u });
+                    let _ = crate::muse_sidecar::admin_send(
+                        port,
+                        &key,
+                        "PATCH",
+                        &path,
+                        Some(&rb_body),
+                    );
+                }
+                return Err(e);
             }
-            if let Some(acc_obj) = res.get_mut("account") {
-                let proxies = crate::proxies::list_proxies_in(&conn).unwrap_or_default();
-                let acc_to_proxy =
-                    crate::proxies::load_account_to_proxy_map(&conn).unwrap_or_default();
-                let proxy_urls =
-                    crate::proxies::resolve_proxy_urls_map_in(&conn).unwrap_or_default();
-                let proxy_by_id: std::collections::HashMap<String, crate::proxies::ProxyItem> =
-                    proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
-                enrich_account_json_with_proxy(
-                    acc_obj,
-                    &acc_to_proxy,
-                    &proxy_by_id,
-                    &proxy_urls,
-                    Some((port, &key)),
-                );
+            if !has_raw_proxy {
+                if let Some(acc_obj) = res.get_mut("account") {
+                    enrich_accounts_slice_from_db(
+                        &conn,
+                        std::slice::from_mut(acc_obj),
+                        Some((port, &key)),
+                    );
+                }
+            }
+        } else if !has_raw_proxy {
+            if let Ok(conn) = crate::proxies::open_db() {
+                if let Some(acc_obj) = res.get_mut("account") {
+                    enrich_accounts_slice_from_db(
+                        &conn,
+                        std::slice::from_mut(acc_obj),
+                        Some((port, &key)),
+                    );
+                }
             }
         }
         Ok(res)
@@ -2727,6 +2820,7 @@ pub async fn muse_delete_account(
 ) -> AppResult<serde_json::Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let (port, key) = muse_session_or_err(&cfg)?;
         let safe_id = muse_sanitize_id(&account_id)?;
         let path = format!("/admin/accounts/{safe_id}");
@@ -2888,6 +2982,34 @@ fn check_sidecar_accounts_not_busy(
     Ok(())
 }
 
+fn restore_sidecar_proxy_batch(
+    session: &crate::muse_sidecar::SidecarSession,
+    ids: &[String],
+    old_url: &str,
+) -> Option<String> {
+    let rollback_body = serde_json::json!({ "proxy": old_url });
+    let mut failed = Vec::new();
+    for id in ids {
+        if let Err(e) = crate::muse_sidecar::admin_send(
+            session.port,
+            &session.api_key,
+            "PATCH",
+            &format!("/admin/accounts/{id}"),
+            Some(&rollback_body),
+        ) {
+            failed.push(format!("{id} ({})", e.code));
+        }
+    }
+    if failed.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Không khôi phục được proxy sidecar cho account: {}",
+            failed.join(", ")
+        ))
+    }
+}
+
 pub(crate) fn proxy_update_in_with_session(
     conn: &mut rusqlite::Connection,
     proxy_id: &str,
@@ -2895,70 +3017,96 @@ pub(crate) fn proxy_update_in_with_session(
     session_opt: Option<&crate::muse_sidecar::SidecarSession>,
 ) -> AppResult<crate::proxies::ProxyItem> {
     let existing = crate::proxies::get_proxy_in(conn, proxy_id)?;
-    if let Some(session) = session_opt {
-        check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+    let norm_kind = input.kind.trim().to_ascii_lowercase();
+    let raw_host = input.host.trim();
+    let norm_host = raw_host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_host);
+    let norm_user = input
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let endpoint_or_secret_changed = existing.kind != norm_kind
+        || existing.host != norm_host
+        || existing.port != input.port
+        || existing.username.as_deref() != norm_user
+        || (input.clear_password == Some(true) && existing.has_password)
+        || input.password.as_deref().is_some_and(|s| !s.is_empty());
+
+    if endpoint_or_secret_changed {
+        if let Some(session) = session_opt {
+            check_sidecar_accounts_not_busy(session, &existing.assigned_account_ids)?;
+        }
     }
 
     let old_snap = crate::proxies::snapshot_proxy_row_in(conn, proxy_id)?;
-    let old_url = crate::proxies::resolve_proxy_url_in(conn, proxy_id)?;
+    let old_url_opt = crate::proxies::resolve_proxy_url_in(conn, proxy_id).ok();
     let updated = crate::proxies::update_proxy_in(conn, proxy_id, input)?;
 
-    if let Some(session) = session_opt {
-        if !updated.assigned_account_ids.is_empty() {
-            let new_url = match crate::proxies::resolve_proxy_url_in(conn, proxy_id) {
-                Ok(u) => u,
-                Err(e) => {
-                    let _ = crate::proxies::restore_proxy_row_in(conn, &old_snap);
-                    return Err(e);
-                }
-            };
-            let mut patched_ids: Vec<String> = Vec::new();
-            for acc_id in &updated.assigned_account_ids {
-                let safe_id = match muse_sanitize_id(acc_id) {
-                    Ok(s) => s,
+    if endpoint_or_secret_changed {
+        if let Some(session) = session_opt {
+            if !updated.assigned_account_ids.is_empty() {
+                let new_url = match crate::proxies::resolve_proxy_url_in(conn, proxy_id) {
+                    Ok(u) => u,
                     Err(e) => {
-                        let _ = crate::proxies::restore_proxy_row_in(conn, &old_snap);
-                        let rollback_body = serde_json::json!({ "proxy": &old_url });
-                        for pid in &patched_ids {
-                            let _ = crate::muse_sidecar::admin_send(
-                                session.port,
-                                &session.api_key,
-                                "PATCH",
-                                &format!("/admin/accounts/{pid}"),
-                                Some(&rollback_body),
-                            );
+                        if let Err(rb_e) = crate::proxies::restore_proxy_update_in(conn, &old_snap) {
+                            eprintln!("proxy_update DB rollback failed: {}", rb_e.message);
                         }
                         return Err(e);
                     }
                 };
-                let body = serde_json::json!({ "proxy": &new_url });
-                match crate::muse_sidecar::admin_send(
-                    session.port,
-                    &session.api_key,
-                    "PATCH",
-                    &format!("/admin/accounts/{safe_id}"),
-                    Some(&body),
-                ) {
-                    Ok(_) => patched_ids.push(safe_id),
-                    Err(e) if e.code == "MUSE_NOT_FOUND" => {
-                        let _ = crate::proxies::remove_account_link_in(conn, acc_id);
-                    }
-                    Err(e) => {
-                        let _ = crate::proxies::restore_proxy_row_in(conn, &old_snap);
-                        let rollback_body = serde_json::json!({ "proxy": &old_url });
-                        for pid in &patched_ids {
-                            let _ = crate::muse_sidecar::admin_send(
-                                session.port,
-                                &session.api_key,
-                                "PATCH",
-                                &format!("/admin/accounts/{pid}"),
-                                Some(&rollback_body),
-                            );
+                if old_url_opt.as_deref() != Some(new_url.as_str()) {
+                    let mut patched_ids: Vec<String> = Vec::new();
+                    for acc_id in &updated.assigned_account_ids {
+                        let safe_id = match muse_sanitize_id(acc_id) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = crate::proxies::restore_proxy_update_in(conn, &old_snap);
+                                if let Some(ref old_url) = old_url_opt {
+                                    if let Some(warn) =
+                                        restore_sidecar_proxy_batch(session, &patched_ids, old_url)
+                                    {
+                                        eprintln!("{warn}");
+                                    }
+                                }
+                                return Err(e);
+                            }
+                        };
+                        let body = serde_json::json!({ "proxy": &new_url });
+                        match crate::muse_sidecar::admin_send(
+                            session.port,
+                            &session.api_key,
+                            "PATCH",
+                            &format!("/admin/accounts/{safe_id}"),
+                            Some(&body),
+                        ) {
+                            Ok(_) => patched_ids.push(safe_id),
+                            Err(e) if e.code == "MUSE_NOT_FOUND" => {
+                                let _ = crate::proxies::remove_account_link_in(conn, acc_id);
+                            }
+                            Err(e) => {
+                                let mut warnings = Vec::new();
+                                if let Err(rb_e) =
+                                    crate::proxies::restore_proxy_update_in(conn, &old_snap)
+                                {
+                                    warnings.push(format!("DB rollback lỗi: {}", rb_e.message));
+                                }
+                                if let Some(ref old_url) = old_url_opt {
+                                    if let Some(warn) =
+                                        restore_sidecar_proxy_batch(session, &patched_ids, old_url)
+                                    {
+                                        warnings.push(warn);
+                                    }
+                                }
+                                let mut msg = crate::settings::redact_secrets(&e.message);
+                                if !warnings.is_empty() {
+                                    msg = format!("{msg} [Rollback warning: {}]", warnings.join("; "));
+                                }
+                                return Err(AppError::new(&e.code, msg));
+                            }
                         }
-                        return Err(AppError::new(
-                            &e.code,
-                            crate::settings::redact_secrets(&e.message),
-                        ));
                     }
                 }
             }
@@ -2979,7 +3127,7 @@ pub(crate) fn proxy_delete_in_with_session(
     }
 
     let old_snap = crate::proxies::snapshot_proxy_row_in(conn, proxy_id)?;
-    let old_url = crate::proxies::resolve_proxy_url_in(conn, proxy_id)?;
+    let old_url_opt = crate::proxies::resolve_proxy_url_in(conn, proxy_id).ok();
     let affected = crate::proxies::delete_proxy_in(conn, proxy_id)?;
 
     if let Some(session) = session_opt {
@@ -2989,16 +3137,13 @@ pub(crate) fn proxy_delete_in_with_session(
                 let safe_id = match muse_sanitize_id(acc_id) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = crate::proxies::restore_proxy_row_in(conn, &old_snap);
-                        let rollback_body = serde_json::json!({ "proxy": &old_url });
-                        for cid in &cleared_ids {
-                            let _ = crate::muse_sidecar::admin_send(
-                                session.port,
-                                &session.api_key,
-                                "PATCH",
-                                &format!("/admin/accounts/{cid}"),
-                                Some(&rollback_body),
-                            );
+                        let _ = crate::proxies::restore_proxy_delete_in(conn, &old_snap);
+                        if let Some(ref old_url) = old_url_opt {
+                            if let Some(warn) =
+                                restore_sidecar_proxy_batch(session, &cleared_ids, old_url)
+                            {
+                                eprintln!("{warn}");
+                            }
                         }
                         return Err(e);
                     }
@@ -3014,21 +3159,23 @@ pub(crate) fn proxy_delete_in_with_session(
                     Ok(_) => cleared_ids.push(safe_id),
                     Err(e) if e.code == "MUSE_NOT_FOUND" => {}
                     Err(e) => {
-                        let _ = crate::proxies::restore_proxy_row_in(conn, &old_snap);
-                        let rollback_body = serde_json::json!({ "proxy": &old_url });
-                        for cid in &cleared_ids {
-                            let _ = crate::muse_sidecar::admin_send(
-                                session.port,
-                                &session.api_key,
-                                "PATCH",
-                                &format!("/admin/accounts/{cid}"),
-                                Some(&rollback_body),
-                            );
+                        let mut warnings = Vec::new();
+                        if let Err(rb_e) = crate::proxies::restore_proxy_delete_in(conn, &old_snap)
+                        {
+                            warnings.push(format!("DB rollback lỗi: {}", rb_e.message));
                         }
-                        return Err(AppError::new(
-                            &e.code,
-                            crate::settings::redact_secrets(&e.message),
-                        ));
+                        if let Some(ref old_url) = old_url_opt {
+                            if let Some(warn) =
+                                restore_sidecar_proxy_batch(session, &cleared_ids, old_url)
+                            {
+                                warnings.push(warn);
+                            }
+                        }
+                        let mut msg = crate::settings::redact_secrets(&e.message);
+                        if !warnings.is_empty() {
+                            msg = format!("{msg} [Rollback warning: {}]", warnings.join("; "));
+                        }
+                        return Err(AppError::new(&e.code, msg));
                     }
                 }
             }
@@ -3058,6 +3205,7 @@ pub async fn proxy_update(
 ) -> AppResult<crate::proxies::ProxyItem> {
     ensure_not_running(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let mut conn = crate::proxies::open_db()?;
         let session_opt = crate::muse_sidecar::current_session();
         proxy_update_in_with_session(&mut conn, &proxy_id, &input, session_opt.as_ref())
@@ -3073,6 +3221,7 @@ pub async fn proxy_delete(
 ) -> AppResult<serde_json::Value> {
     ensure_not_running(&state)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let _mut_guard = proxy_mutation_lock().lock();
         let mut conn = crate::proxies::open_db()?;
         let session_opt = crate::muse_sidecar::current_session();
         let affected = proxy_delete_in_with_session(&mut conn, &proxy_id, session_opt.as_ref())?;
@@ -3117,12 +3266,20 @@ pub(crate) fn proxy_test_all_with_urls_in(
             .collect::<std::collections::VecDeque<_>>(),
     );
     let results = parking_lot::Mutex::new(vec![None::<crate::proxies::ProxyItem>; total]);
+    let first_err = parking_lot::Mutex::new(None::<AppError>);
 
     std::thread::scope(|s| {
         for _ in 0..worker_count {
             s.spawn(|| {
-                let Ok(worker_conn) = crate::proxies::open_db_at(db_path) else {
-                    return;
+                let worker_conn = match crate::proxies::open_db_at(db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let mut slot = first_err.lock();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
                 };
                 loop {
                     let next = queue.lock().pop_front();
@@ -3144,6 +3301,10 @@ pub(crate) fn proxy_test_all_with_urls_in(
             });
         }
     });
+
+    if let Some(err) = first_err.into_inner() {
+        return Err(err);
+    }
 
     Ok(results.into_inner().into_iter().flatten().collect())
 }
@@ -3561,12 +3722,30 @@ fn validate_export_save_path_with_approved(
     project_dir: &Path,
     save_path: &str,
     allowed_exts: &[&str],
-) -> AppResult<()> {
+) -> AppResult<PathBuf> {
     let trimmed = save_path.trim();
     if trimmed.is_empty() {
         return Err(AppError::new("EMPTY_PATH", "Đường dẫn lưu file trống."));
     }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Đường dẫn lưu file chứa ký tự điều khiển không hợp lệ.",
+        ));
+    }
     let pb = PathBuf::from(trimmed);
+    let Some(fname) = pb.file_name().and_then(|n| n.to_str()) else {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Đường dẫn lưu file thiếu tên file hợp lệ.",
+        ));
+    };
+    if fname.contains(':') || fname.chars().any(|c| c.is_control()) {
+        return Err(AppError::new(
+            "FORBIDDEN_EXPORT_PATH",
+            "Tên file xuất không được chứa ':' hoặc ký tự điều khiển.",
+        ));
+    }
     let ext_ok = pb
         .extension()
         .and_then(|e| e.to_str())
@@ -3601,25 +3780,22 @@ fn validate_export_save_path_with_approved(
     let proj_canon = std::fs::canonicalize(project_dir).ok();
     let parent_canon = pb.parent().and_then(|p| std::fs::canonicalize(p).ok());
     if let (Some(ref proj_c), Some(ref par_c)) = (&proj_canon, &parent_canon) {
-        if par_c.starts_with(proj_c) {
-            if let Some(fname) = pb.file_name().and_then(|n| n.to_str()) {
-                if fname.eq_ignore_ascii_case("prompts.csv")
-                    || fname.eq_ignore_ascii_case("state.db")
-                    || fname.eq_ignore_ascii_case("state.db-wal")
-                    || fname.eq_ignore_ascii_case("state.db-shm")
-                {
-                    return Err(AppError::new(
-                        "FORBIDDEN_EXPORT_PATH",
-                        "Không cho phép ghi đè file hệ thống của dự án (prompts.csv / state.db).",
-                    ));
-                }
-            }
+        if par_c.starts_with(proj_c)
+            && (fname.eq_ignore_ascii_case("prompts.csv")
+                || fname.eq_ignore_ascii_case("state.db")
+                || fname.eq_ignore_ascii_case("state.db-wal")
+                || fname.eq_ignore_ascii_case("state.db-shm"))
+        {
+            return Err(AppError::new(
+                "FORBIDDEN_EXPORT_PATH",
+                "Không cho phép ghi đè file hệ thống của dự án (prompts.csv / state.db).",
+            ));
         }
     }
 
     let key = normalize_win_path_key(trimmed);
     if approved.contains(&key) {
-        return Ok(());
+        return Ok(pb);
     }
 
     if let (Some(ref proj_c), Some(ref par_c)) = (&proj_canon, &parent_canon) {
@@ -3627,7 +3803,7 @@ fn validate_export_save_path_with_approved(
             && (!pb.exists()
                 || std::fs::canonicalize(&pb).is_ok_and(|target_c| target_c.starts_with(proj_c)))
         {
-            return Ok(());
+            return Ok(pb);
         }
     }
     Err(AppError::new(
@@ -3641,7 +3817,7 @@ fn validate_export_save_path(
     project_dir: &Path,
     save_path: &str,
     allowed_exts: &[&str],
-) -> AppResult<()> {
+) -> AppResult<PathBuf> {
     let approved = state.approved_export_paths.read();
     validate_export_save_path_with_approved(&approved, project_dir, save_path, allowed_exts)
 }
@@ -3734,7 +3910,7 @@ pub async fn pick_save_log(
 pub fn export_history_csv_at(
     p: &Path,
     filter: Option<serde_json::Value>,
-    save_path: &str,
+    save_path: impl AsRef<Path>,
 ) -> AppResult<bool> {
     let parsed: HistoryExportFilter = match filter {
         Some(serde_json::Value::String(s)) => HistoryExportFilter {
@@ -3816,7 +3992,7 @@ pub fn export_history_csv_at(
         wtr.flush()
             .map_err(|e| AppError::new("CSV_EXPORT_FAIL", format!("{e}")))?;
     }
-    std::fs::write(save_path, &out)
+    std::fs::write(save_path.as_ref(), &out)
         .map_err(|e| AppError::new("CSV_EXPORT_FAIL", format!("Không ghi được file: {e}")))?;
     Ok(true)
 }
@@ -3828,8 +4004,8 @@ pub fn export_history_csv(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let p = project_path(&state)?;
-    validate_export_save_path(&state, &p, &save_path, &["csv"])?;
-    export_history_csv_at(&p, filter, &save_path)
+    let validated = validate_export_save_path(&state, &p, &save_path, &["csv"])?;
+    export_history_csv_at(&p, filter, &validated)
 }
 
 fn query_logs_at(
@@ -3948,10 +4124,10 @@ pub fn export_logs_txt(
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let p = project_path(&state)?;
-    validate_export_save_path(&state, &p, &save_path, &["log", "txt"])?;
+    let validated = validate_export_save_path(&state, &p, &save_path, &["log", "txt"])?;
     let items = query_logs_at(&p, run_id, level.as_deref(), 5000)?;
     let text = format_logs_txt_content(&items);
-    std::fs::write(&save_path, text.as_bytes())
+    std::fs::write(&validated, text.as_bytes())
         .map_err(|e| AppError::new("LOG_EXPORT_FAIL", format!("Không ghi được file log: {e}")))?;
     Ok(true)
 }
@@ -4360,7 +4536,7 @@ mod tests {
         export_history_csv_at(
             &dir,
             Some(serde_json::json!({ "status": "da_dung", "kind": "lam_lai" })),
-            &out_csv.to_string_lossy(),
+            &out_csv,
         )
         .unwrap();
         let exported_text = String::from_utf8(std::fs::read(&out_csv).unwrap()).unwrap();
@@ -4972,6 +5148,131 @@ mod tests {
         assert!(!txt.contains("superPw"));
         assert!(txt.contains("http://alice:[REDACTED]@198.51.100.2:8080/api"));
 
+        // Pass-2: NTFS ADS path (`prompts.csv:x.csv`) must be blocked even when in approved paths
+        let ads_path = dir.join("prompts.csv:x.csv");
+        let mut approved_ads = approved.clone();
+        approved_ads.insert(normalize_win_path_key(&ads_path.to_string_lossy()));
+        let err_ads = validate_export_save_path_with_approved(
+            &approved_ads,
+            &dir,
+            &ads_path.to_string_lossy(),
+            &["csv"],
+        )
+        .unwrap_err();
+        assert_eq!(err_ads.code, "FORBIDDEN_EXPORT_PATH");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pass2_proxy_enrich_no_lie_and_metadata_only_update_while_busy() {
+        let db_path = std::env::temp_dir().join(format!(
+            "vf_cmd_pass2_{}_{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let mut conn = crate::proxies::open_db_at(&db_path).unwrap();
+        let px = crate::proxies::create_proxy_in(
+            &conn,
+            &crate::proxies::ProxyInput {
+                name: "InitialName".into(),
+                kind: "http".into(),
+                host: "198.51.100.20".into(),
+                port: 8080,
+                username: Some("u".into()),
+                password: Some("pw".into()),
+                clear_password: None,
+                note: Some("old note".into()),
+            },
+        )
+        .unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_1", Some(&px.id)).unwrap();
+        let acc_to_proxy = crate::proxies::load_account_to_proxy_map(&conn).unwrap();
+        let proxies = crate::proxies::list_proxies_in(&conn).unwrap();
+        let proxy_by_id: HashMap<String, crate::proxies::ProxyItem> =
+            proxies.into_iter().map(|p| (p.id.clone(), p)).collect();
+        let (proxy_urls, _) =
+            crate::proxies::resolve_proxy_urls_map_best_effort_in(&conn).unwrap();
+
+        // 1. Busy account must NOT lie about obj["proxy"] when sidecar still holds old proxy
+        let srv = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::Read;
+            // Only expects ONE request for the PATCH failure test
+            if let Ok((mut s, _)) = srv.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                write_http_json_test(
+                    &mut s,
+                    "500 Internal Server Error",
+                    r#"{"error":{"code":"sync_fail","message":"boom"}}"#,
+                );
+            }
+        });
+        let live_sess = crate::muse_sidecar::SidecarSession {
+            port: srv_port,
+            api_key: "k".into(),
+        };
+
+        let mut busy_acc = serde_json::json!({
+            "id": "acc_1",
+            "busy": true,
+            "proxy": "http://***@old.invalid:3128"
+        });
+        enrich_account_json_with_proxy(
+            &mut busy_acc,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((srv_port, "k")),
+        );
+        assert_eq!(
+            busy_acc.get("proxy").and_then(|v| v.as_str()),
+            Some("http://***@old.invalid:3128"),
+            "busy account must retain actual sidecar proxy"
+        );
+
+        // Idle account where PATCH fails must also NOT lie about obj["proxy"]
+        let mut fail_acc = serde_json::json!({
+            "id": "acc_1",
+            "busy": false,
+            "proxy": "http://***@old.invalid:3128"
+        });
+        enrich_account_json_with_proxy(
+            &mut fail_acc,
+            &acc_to_proxy,
+            &proxy_by_id,
+            &proxy_urls,
+            Some((srv_port, "k")),
+        );
+        server.join().unwrap();
+        assert_eq!(
+            fail_acc.get("proxy").and_then(|v| v.as_str()),
+            Some("http://***@old.invalid:3128"),
+            "failed PATCH must retain actual sidecar proxy"
+        );
+
+        // 2. Metadata-only proxy_update succeeds even while assigned account is busy (no sidecar traffic needed)
+        let metadata_updated = proxy_update_in_with_session(
+            &mut conn,
+            &px.id,
+            &crate::proxies::ProxyInput {
+                name: "RenamedOnly".into(),
+                kind: "http".into(),
+                host: "198.51.100.20".into(),
+                port: 8080,
+                username: Some("u".into()),
+                password: None,
+                clear_password: None,
+                note: Some("updated note".into()),
+            },
+            Some(&live_sess),
+        )
+        .expect("metadata-only update should not touch sidecar");
+        assert_eq!(metadata_updated.name, "RenamedOnly");
+        assert_eq!(metadata_updated.note.as_deref(), Some("updated note"));
+
+        let _ = std::fs::remove_file(&db_path);
     }
 }

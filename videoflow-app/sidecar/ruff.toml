@@ -4,7 +4,7 @@ target-version = "py310"
 exclude = ["build", "dist", "web"]
 
 [lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC"]
 ignore = [
   "E501",  # line length do formatter lo
   "B008",  # FastAPI Depends() trong default arg là pattern chuẩn

@@ -82,7 +82,7 @@ Yêu cầu: Python 3.10+ với các dependency của muse2api + PyInstaller.
 
 ```powershell
 cd videoflow-app/sidecar
-pip install "fastapi>=0.115" "uvicorn[standard]>=0.32" "pydantic>=2.9" "pydantic-settings>=2.5" "httpx[socks]>=0.27" "websockets>=13.0" "python-multipart>=0.0.9" pyinstaller
+pip install -r requirements.txt pyinstaller
 pyinstaller muse2api.spec --distpath ../src-tauri/binaries --workpath build --noconfirm
 ```
 
@@ -91,16 +91,24 @@ pyinstaller muse2api.spec --distpath ../src-tauri/binaries --workpath build --no
 
 ## Kiểm thử nhanh
 
+Từ `videoflow-app/sidecar` sau khi build xong binary ở `..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe`:
+
 ```powershell
-# Mock driver — không cần Chromium, kiểm API surface
+# 1. Mock driver — không cần Chromium, kiểm tra API surface
 $env:MUSE2API_DRIVER="mock"; $env:MUSE2API_PORT="18699"; $env:MUSE2API_DATA_DIR="$env:TEMP\m2a"
-$env:MUSE2API_API_KEY="testkey123"
-.\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
+$env:MUSE2API_API_KEY="testkey123"; $env:MUSE2API_ADMIN_KEY="testkey123"
+..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
 curl http://127.0.0.1:18699/healthz
+curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/v1/models
 curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18699/admin/status
 
-# Browser driver — cần Edge/Chrome
-$env:MUSE2API_DRIVER="browser"; $env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+# 2. Browser driver — cần Edge/Chrome (kiểm tra Playwright/Chromium/CDP/proxy_relay packaging)
+$env:MUSE2API_DRIVER="browser"; $env:MUSE2API_PORT="18703"; $env:MUSE2API_CDP_PORT="19203"
+$env:MUSE2API_DATA_DIR="$env:TEMP\m2a-browser"; $env:MUSE2API_HEADLESS="true"
+$env:MUSE2API_CHROMIUM_PATH="C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+..\src-tauri\binaries\videoflow-muse-x86_64-pc-windows-msvc.exe
+curl http://127.0.0.1:18703/healthz
+curl -H "Authorization: Bearer testkey123" http://127.0.0.1:18703/admin/status
 ```
 
 ## Fix 5 — Enforce hạn mức khi lease (trước đây quota chỉ để xem)
@@ -141,9 +149,10 @@ enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `Ups
 
 ## Build & phát hành
 
-Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`).
+Sidecar được **CI build tự động** khi push tag `v*` (xem `.github/workflows/release.yml`, cũng như bước build/smoke ở `.github/workflows/ci.yml`).
 Trên GitHub runner môi trường Python sạch nên exe ~17.6 MB (máy dev local cài nhiều
-package nên ~43 MB) — cả hai đều chạy được; release job có smoke test exe thật
-(mock driver + `/healthz` + `/v1/models`) trước khi bundle.
+package nên ~43 MB) — cả hai đều chạy được; cả `ci.yml` và `release.yml` đều chạy hai smoke test cho exe PyInstaller:
+- **Mock smoke test:** kiểm `/healthz` + `/v1/models`
+- **Browser smoke test:** chạy với Edge/Chrome headless và kiểm `/healthz` + `/admin/status` (`driver == "browser"`, `ok == true`)
 
 Chi tiết quy trình phát hành + secrets: `videoflow-app/docs/RELEASE.md`.

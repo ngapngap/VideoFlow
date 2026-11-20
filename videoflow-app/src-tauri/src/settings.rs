@@ -549,6 +549,15 @@ fn redact_bearer(input: &str) -> String {
                 .sum();
             if prev_ok && ws_bytes > 0 {
                 let after_ws = &after_kw[ws_bytes..];
+                if after_ws
+                    .strip_prefix("[REDACTED]")
+                    .is_some_and(|tail| tail.chars().next().map_or(true, |c| !is_bearer_token_char(c)))
+                {
+                    let keep_len = 6 + ws_bytes + "[REDACTED]".len();
+                    out.push_str(&rest[..keep_len]);
+                    idx += keep_len;
+                    continue;
+                }
                 let tok_bytes: usize = after_ws
                     .chars()
                     .take_while(|c| is_bearer_token_char(*c))
@@ -841,5 +850,9 @@ mod tests {
         assert!(redacted_edge.contains("http://useronly@1.2.3.4:8080"));
         assert!(redacted_edge.contains("socks5://u:[REDACTED]@5.6.7.8:1080"));
         assert!(!redacted_edge.contains(":ab@"));
+
+        // Bearer & URL redaction must remain idempotent across multiple passes
+        let twice = redact_secrets(&redact_secrets("ERROR Bearer tok123 and http://u:p@1.2.3.4:8080/x"));
+        assert_eq!(twice, "ERROR Bearer [REDACTED] and http://u:[REDACTED]@1.2.3.4:8080/x");
     }
 }

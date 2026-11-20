@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..errors import InvalidRequest
+
 ROLE_LABELS = {
     "system": "System",
     "developer": "System",
@@ -43,6 +45,8 @@ def _content_to_text(content: Any, images: list[str]) -> str:
             ref = part.get("image_url")
             if isinstance(ref, dict):
                 ref = ref.get("url")
+            if ref is not None and not isinstance(ref, str):
+                raise InvalidRequest("image_url must be a string")
             if ref:
                 images.append(ref)
     return "\n".join(p for p in parts if p)

@@ -20,10 +20,11 @@ import httpx
 from ...accounts.model import Account, AccountStatus
 from ...accounts.pool import AccountPool
 from ...config import Settings
+from ...errors import NotFound
 from .cdp import CDPSession
-from .chromium import find_chromium
-from .driver import AccountBusy
-from .proxy_relay import LocalProxyRelay, needs_proxy_relay
+from .chromium import _kill_stale_browsers, find_chromium
+from .driver import AccountBusy, resolve_proxy
+from .proxy_relay import LocalProxyRelay, mask_proxy, needs_proxy_relay
 
 log = logging.getLogger(__name__)
 
@@ -242,7 +243,12 @@ class InteractiveBrowserManager:
                     return {"ok": True, "message": already_msg, "status": "already_open"}
                 if self.is_account_busy(account.id):
                     raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
-                latest = self.pool.get(account.id) if hasattr(self.pool, "get") else None
+                if hasattr(self.pool, "get"):
+                    latest = self.pool.get(account.id)
+                    if latest is None:
+                        raise NotFound(f"account '{account.id}' not found")
+                else:
+                    latest = None
                 snap = (latest or account).model_copy(deep=True)
                 sess = InteractiveSession(snap.id, kind)
                 coro = (
@@ -272,7 +278,7 @@ class InteractiveBrowserManager:
         await _terminate_proc(sess.proc)
         if sess.task is not None and inspect.isawaitable(sess.task):
             with contextlib.suppress(BaseException):
-                await asyncio.wait_for(asyncio.shield(sess.task), timeout=10.0)
+                await asyncio.wait_for(asyncio.shield(sess.task), timeout=22.0)
         async with self._lock:
             if self._sessions.get(account_id) is sess:
                 self._sessions.pop(account_id, None)
@@ -362,6 +368,36 @@ class InteractiveBrowserManager:
     def _get_profile_dir(self, account_id: str) -> Path:
         return self.settings.account_profile_dir(account_id)
 
+    async def _prepare_profile_and_proxy(
+        self,
+        profile_dir: Path,
+        args: list[str],
+        account: Account,
+    ) -> LocalProxyRelay | None:
+        def _prep_dir_and_clean() -> None:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            _kill_stale_browsers(profile_dir)
+            for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    (profile_dir / lock).unlink()
+
+        await asyncio.to_thread(_prep_dir_and_clean)
+
+        proxy = resolve_proxy(account, self.settings.browser_proxy)
+        if not proxy:
+            return None
+        if needs_proxy_relay(proxy):
+            relay = LocalProxyRelay(proxy)
+            try:
+                effective_proxy = await relay.start()
+            except Exception:
+                await relay.stop()
+                raise
+            args.insert(1, f"--proxy-server={effective_proxy}")
+            return relay
+        args.insert(1, f"--proxy-server={proxy.strip().rstrip('/')}")
+        return None
+
     async def _run_login_session(self, account: Account, sess: InteractiveSession) -> None:
         account_id = account.id
         proxy_relay: LocalProxyRelay | None = None
@@ -372,12 +408,6 @@ class InteractiveBrowserManager:
                     await self.driver.release_account_driver(account_id)
 
             profile_dir = self._get_profile_dir(account_id)
-            profile_dir.mkdir(parents=True, exist_ok=True)
-
-            for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
-                with contextlib.suppress(FileNotFoundError, OSError):
-                    (profile_dir / lock).unlink()
-
             try:
                 exe = find_chromium(self.settings.chromium_path)
             except Exception as exc:
@@ -385,8 +415,6 @@ class InteractiveBrowserManager:
                 return
 
             port = find_free_port()
-            proxy = account.proxy or self.settings.browser_proxy or ""
-
             target_url = "https://muse.ai/"
             args = [
                 exe,
@@ -400,13 +428,15 @@ class InteractiveBrowserManager:
                 "--window-size=1280,820",
                 "about:blank",
             ]
-            if proxy:
-                if needs_proxy_relay(proxy):
-                    proxy_relay = LocalProxyRelay(proxy)
-                    effective_proxy = await proxy_relay.start()
-                else:
-                    effective_proxy = proxy
-                args.insert(1, f"--proxy-server={effective_proxy}")
+            try:
+                proxy_relay = await self._prepare_profile_and_proxy(profile_dir, args, account)
+            except Exception as exc:
+                log.error(
+                    "failed to start proxy relay (%s) for interactive login: %s",
+                    mask_proxy(resolve_proxy(account, self.settings.browser_proxy)),
+                    exc,
+                )
+                return
 
             log.info("launching headed browser for account %s login on port %d", account_id, port)
             try:
@@ -502,21 +532,40 @@ class InteractiveBrowserManager:
                                 tuple(sorted(jwt_tokens.items())),
                             )
                             if snapshot != last_snapshot:
-                                acc = self.pool.get(account_id)
-                                if acc:
-                                    acc.cookies.update(new_cookies)
-                                    acc.cookie_expires.update(new_expires)
-                                    acc.status = AccountStatus.ACTIVE
-                                    acc.last_error = None
+                                def _apply_harvest(
+                                    latest: Account,
+                                    cookies: dict[str, str] = new_cookies,
+                                    expires: dict[str, int] = new_expires,
+                                    tokens: dict[str, Any] = jwt_tokens,
+                                ) -> tuple[bool, None]:
+                                    latest.cookies.update(cookies)
+                                    if latest.cookie_expires is None:
+                                        latest.cookie_expires = {}
+                                    for name in cookies:
+                                        if name not in expires:
+                                            latest.cookie_expires.pop(name, None)
+                                    latest.cookie_expires.update(expires)
+                                    latest.status = AccountStatus.ACTIVE
+                                    latest.last_error = None
                                     if captured_auth_headers:
-                                        acc.meta["auth_headers"] = {
-                                            **acc.meta.get("auth_headers", {}),
+                                        latest.meta["auth_headers"] = {
+                                            **latest.meta.get("auth_headers", {}),
                                             **captured_auth_headers,
                                         }
-                                    if jwt_tokens:
-                                        acc.meta["auth_tokens"] = jwt_tokens
-                                    acc.meta["last_harvest_at"] = time.time()
-                                    await self.pool.upsert(acc)
+                                    if tokens:
+                                        latest.meta["auth_tokens"] = tokens
+                                    latest.meta["last_harvest_at"] = time.time()
+                                    return True, None
+
+                                if hasattr(self.pool, "try_update"):
+                                    found, _ = await self.pool.try_update(account_id, _apply_harvest)
+                                else:
+                                    acc = self.pool.get(account_id)
+                                    found = acc is not None
+                                    if acc is not None:
+                                        _apply_harvest(acc)
+                                        await self.pool.upsert(acc)
+                                if found:
                                     last_snapshot = snapshot
                                     sess.harvested = True
                     except Exception as poll_exc:
@@ -543,12 +592,6 @@ class InteractiveBrowserManager:
                     await self.driver.release_account_driver(account_id)
 
             profile_dir = self._get_profile_dir(account_id)
-            profile_dir.mkdir(parents=True, exist_ok=True)
-
-            for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
-                with contextlib.suppress(FileNotFoundError, OSError):
-                    (profile_dir / lock).unlink()
-
             try:
                 exe = find_chromium(self.settings.chromium_path)
             except Exception as exc:
@@ -556,8 +599,6 @@ class InteractiveBrowserManager:
                 return
 
             port = find_free_port()
-            proxy = account.proxy or self.settings.browser_proxy or ""
-
             raw_url = (
                 (account.meta.get("hot_page") or {}).get("url")
                 or account.meta.get("last_thread_url")
@@ -576,13 +617,15 @@ class InteractiveBrowserManager:
                 "--window-size=1280,820",
                 "about:blank",
             ]
-            if proxy:
-                if needs_proxy_relay(proxy):
-                    proxy_relay = LocalProxyRelay(proxy)
-                    effective_proxy = await proxy_relay.start()
-                else:
-                    effective_proxy = proxy
-                args.insert(1, f"--proxy-server={effective_proxy}")
+            try:
+                proxy_relay = await self._prepare_profile_and_proxy(profile_dir, args, account)
+            except Exception as exc:
+                log.error(
+                    "failed to start proxy relay (%s) for interactive view: %s",
+                    mask_proxy(resolve_proxy(account, self.settings.browser_proxy)),
+                    exc,
+                )
+                return
 
             log.info("launching headed browser for account %s view on %s", account_id, target_url)
             try:

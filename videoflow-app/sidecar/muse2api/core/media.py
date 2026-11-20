@@ -102,12 +102,14 @@ def _assert_public_url(url: str) -> str:
     """Reject non-http(s) URLs and malformed ports/hosts (SSRF guard)."""
     parsed = urllib.parse.urlparse(url)
     try:
-        _ = parsed.port
+        port = parsed.port
         httpx_url = httpx.URL(url)
     except (httpx.InvalidURL, ValueError) as exc:
         raise InvalidRequest("image_url must be a public http(s) URL") from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname or not httpx_url.raw_host:
         raise InvalidRequest("image_url must be a public http(s) URL")
+    if port is not None and not (1 <= port <= 65535):
+        raise InvalidRequest("image_url port must be between 1 and 65535")
     return url
 
 
@@ -178,8 +180,18 @@ async def _assert_public_host(hostname: str) -> None:
     await _resolve_public_ips(hostname)
 
 
+def _is_ip_literal(host: str) -> bool:
+    clean = host.strip("[]").split("%", 1)[0]
+    try:
+        ipaddress.ip_address(clean)
+        return True
+    except ValueError:
+        return False
+
+
 async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
     """Fetch an image URL with single-shot DNS IP pinning, manual redirects, and a size cap."""
+    deadline = time.monotonic() + timeout
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
@@ -190,41 +202,72 @@ async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
             for hop in range(_MAX_REDIRECTS + 1):
                 url = _assert_public_url(url)
                 parsed = httpx.URL(url)
-                hostname = urllib.parse.urlparse(url).hostname or ""
-                pinned_ip = (await _resolve_public_ips(hostname))[0]
-                pinned_url = str(parsed.copy_with(username="", password="", host=pinned_ip))
-                headers = {"Host": parsed.netloc.decode("ascii")}
-                extensions = {"sni_hostname": parsed.raw_host.decode("ascii")}
-                async with client.stream(
-                    "GET", pinned_url, headers=headers, extensions=extensions
-                ) as resp:
-                    if resp.status_code in (301, 302, 303, 307, 308):
-                        if hop >= _MAX_REDIRECTS:
-                            raise InvalidRequest("image_url exceeded redirect limit")
-                        location = resp.headers.get("location")
-                        if not location:
-                            raise InvalidRequest("image_url redirect missing location")
-                        url = urllib.parse.urljoin(url, location)
-                        continue
-                    resp.raise_for_status()
-                    content_length = resp.headers.get("content-length")
-                    if content_length is not None:
-                        try:
-                            declared_len = int(content_length.strip())
-                        except ValueError:
-                            declared_len = None
-                        if declared_len is not None and declared_len > _MAX_FETCH_BYTES:
-                            raise InvalidRequest("image_url response exceeds 20 MiB")
-                    mime = (
-                        resp.headers.get("content-type", "image/png").split(";")[0].strip()
-                        or "image/png"
-                    )
-                    body = bytearray()
-                    async for chunk in resp.aiter_bytes(65536):
-                        body.extend(chunk)
-                        if len(body) > _MAX_FETCH_BYTES:
-                            raise InvalidRequest("image_url response exceeds 20 MiB")
-                    return bytes(body), mime
+                raw_host = parsed.raw_host.decode("ascii")
+                lookup_host = raw_host.strip("[]")
+                public_ips = await _resolve_public_ips(lookup_host)
+                headers = {
+                    "Host": parsed.netloc.decode("ascii"),
+                    "Accept-Encoding": "identity",
+                }
+                extensions = {} if _is_ip_literal(lookup_host) else {"sni_hostname": raw_host}
+
+                redirect_next: str | None = None
+                last_connect_exc: httpx.HTTPError | None = None
+                for idx, pinned_ip in enumerate(public_ips):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise httpx.TimeoutException("image_url fetch deadline exceeded")
+                    pinned_url = str(parsed.copy_with(username="", password="", host=pinned_ip))
+                    try:
+                        async with client.stream(
+                            "GET",
+                            pinned_url,
+                            headers=headers,
+                            extensions=extensions,
+                            timeout=remaining,
+                        ) as resp:
+                            if resp.status_code in (301, 302, 303, 307, 308):
+                                if hop >= _MAX_REDIRECTS:
+                                    raise InvalidRequest("image_url exceeded redirect limit")
+                                location = resp.headers.get("location")
+                                if not location:
+                                    raise InvalidRequest("image_url redirect missing location")
+                                redirect_next = urllib.parse.urljoin(url, location)
+                                break
+                            resp.raise_for_status()
+                            ce = (resp.headers.get("content-encoding") or "").strip().lower()
+                            if ce and ce != "identity":
+                                raise InvalidRequest("compressed image responses are not supported")
+                            content_length = resp.headers.get("content-length")
+                            if content_length is not None:
+                                try:
+                                    declared_len = int(content_length.strip())
+                                except ValueError:
+                                    declared_len = None
+                                if declared_len is not None and declared_len > _MAX_FETCH_BYTES:
+                                    raise InvalidRequest("image_url response exceeds 20 MiB")
+                            mime = (
+                                resp.headers.get("content-type", "image/png").split(";")[0].strip()
+                                or "image/png"
+                            )
+                            body = bytearray()
+                            async for chunk in resp.aiter_bytes(65536):
+                                if time.monotonic() > deadline:
+                                    raise httpx.TimeoutException("image_url fetch deadline exceeded")
+                                body.extend(chunk)
+                                if len(body) > _MAX_FETCH_BYTES:
+                                    raise InvalidRequest("image_url response exceeds 20 MiB")
+                            return bytes(body), mime
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                        last_connect_exc = exc
+                        if idx < len(public_ips) - 1:
+                            continue
+                        raise
+                if redirect_next is not None:
+                    url = redirect_next
+                    continue
+                if last_connect_exc is not None:
+                    raise last_connect_exc
             raise InvalidRequest("image_url exceeded redirect limit")
     except httpx.HTTPError as exc:
         raise InvalidRequest(f"failed to fetch image_url: {exc}") from exc
@@ -247,6 +290,8 @@ def _decode_base64_bounded(payload: str, *, err_msg: str) -> bytes:
         raise InvalidRequest(err_msg) from exc
     if len(raw) > _MAX_FETCH_BYTES:
         raise InvalidRequest("image exceeds 20 MiB")
+    if not raw:
+        raise InvalidRequest(err_msg)
     return raw
 
 
