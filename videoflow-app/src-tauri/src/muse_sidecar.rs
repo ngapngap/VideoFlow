@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 /// Tên exe engine trong bundle: Tauri externalBin bỏ hậu tố target-triple khi cài đặt.
 pub const SIDECAR_EXE_BUNDLED: &str = "videoflow-muse.exe";
-/// Tên exe engine trong `src-tauri/binaries/` lúc dev (giữ hậu tố target-triple).
+/// Tên exe engine trong `src-tauri/binaries/` lúc dev (giữ hậu tố target-triple MSVC / GNU).
 pub const SIDECAR_EXE_DEV: &str = "videoflow-muse-x86_64-pc-windows-msvc.exe";
+pub const SIDECAR_EXE_DEV_GNU: &str = "videoflow-muse-x86_64-pc-windows-gnu.exe";
 /// Thư mục dữ liệu engine (accounts.json, browser profile, log) trong %APPDATA%.
 pub const MUSE_DATA_DIR: &str = "muse";
 
@@ -79,7 +80,7 @@ fn exe_name() -> &'static str {
 /// Đường dẫn exe sidecar: cạnh exe app (bundle: `videoflow-muse.exe`) hoặc `binaries/` từ
 /// ancestor (dev: `target/debug/...` → `src-tauri/binaries/videoflow-muse-<triple>.exe`).
 pub fn sidecar_exe_path() -> AppResult<PathBuf> {
-    let names = [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV];
+    let names = [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV, SIDECAR_EXE_DEV_GNU];
     if let Ok(cur) = std::env::current_exe() {
         if let Some(dir) = cur.parent() {
             for name in names {
@@ -144,8 +145,13 @@ pub fn detect_chromium(override_path: &str) -> AppResult<PathBuf> {
     ))
 }
 
-/// Sinh API key nội bộ ngẫu nhiên cho phiên (chỉ giữ trong RAM).
+/// Sinh API key nội bộ ngẫu nhiên bằng CSPRNG cho phiên (chỉ giữ trong RAM).
 fn generate_api_key() -> String {
+    let mut buf = [0u8; 16];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        return format!("vf_{hex}");
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -157,16 +163,31 @@ fn generate_api_key() -> String {
     format!("vf_{hex}")
 }
 
-/// Tìm port trống: thử port ưa thích trước, bận thì xin OS một port ngẫu nhiên.
-fn find_free_port(preferred: u16) -> AppResult<u16> {
-    if TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+/// Tìm port trống: thử port ưa thích trước (nếu khác `exclude`), bận thì xin OS một port ngẫu nhiên.
+fn find_free_port_excluding(preferred: u16, exclude: Option<u16>) -> AppResult<u16> {
+    if Some(preferred) != exclude && TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
         return Ok(preferred);
     }
-    TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không xin được port trống: {e}")))?
-        .local_addr()
-        .map(|a| a.port())
-        .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không đọc được port: {e}")))
+    for _ in 0..16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không xin được port trống: {e}")))?;
+        let port = listener
+            .local_addr()
+            .map(|a| a.port())
+            .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không đọc được port: {e}")))?;
+        if Some(port) != exclude {
+            return Ok(port);
+        }
+    }
+    Err(AppError::new(
+        "MUSE_PORT_FAIL",
+        "Không tìm được port trống không trùng.",
+    ))
+}
+
+#[cfg(test)]
+fn find_free_port(preferred: u16) -> AppResult<u16> {
+    find_free_port_excluding(preferred, None)
 }
 
 fn blocking_client_with_timeout(timeout_secs: u64) -> AppResult<reqwest::blocking::Client> {
@@ -313,13 +334,24 @@ pub fn ensure_running(cfg: &Settings) -> AppResult<SidecarSession> {
     })
 }
 
-/// Phiên hiện tại (port + API key) nếu sidecar đang chạy.
+/// Phiên hiện tại (port + API key) nếu sidecar đang chạy và tiến trình chưa thoát.
 pub fn current_session() -> Option<SidecarSession> {
-    let guard = sidecar_cell().read();
-    guard.as_ref().map(|h| SidecarSession {
-        port: h.port,
-        api_key: h.api_key.clone(),
-    })
+    let mut guard = sidecar_cell().write();
+    if let Some(h) = guard.as_mut() {
+        match h.child.try_wait() {
+            Ok(Some(_)) | Err(_) => {
+                *guard = None;
+                return None;
+            }
+            Ok(None) => {
+                return Some(SidecarSession {
+                    port: h.port,
+                    api_key: h.api_key.clone(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Khóa tuần tự hóa việc spawn: hai lệnh song song (vd bấm Thêm cookie khi engine chưa chạy)
@@ -335,24 +367,23 @@ fn start_lock() -> &'static parking_lot::Mutex<()> {
 /// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
 pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let _spawn_guard = start_lock().lock();
-    let already_running = sidecar_cell().read().is_some();
-    if already_running {
+    if current_session().is_some() {
         return status(cfg);
     }
 
     let exe = sidecar_exe_path()?;
     let chromium = detect_chromium(&cfg.muse_chromium_path)?;
-    let port = find_free_port(cfg.muse_sidecar_port)?;
-    let cdp_port = find_free_port(19210)?;
-    let api_key = generate_api_key();
-    crate::settings::register_secret_for_redaction(&api_key);
-
     let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
     std::fs::create_dir_all(&data_dir).ok();
 
-    // Dọn sidecar & Edge mồ côi (từ phiên app cũ đóng bất thường) trước khi mở log / spawn.
+    // Dọn sidecar & Edge mồ côi (từ phiên app cũ đóng bất thường) TRƯỚC khi chọn port và mở log.
     kill_orphan_sidecars();
-    kill_orphan_edges(&data_dir.join("browser-profile"));
+    kill_orphan_edges(&data_dir);
+
+    let port = find_free_port_excluding(cfg.muse_sidecar_port, None)?;
+    let cdp_port = find_free_port_excluding(19210, Some(port))?;
+    let api_key = generate_api_key();
+    crate::settings::register_secret_for_redaction(&api_key);
 
     // Log stdout/stderr của sidecar ra file để chẩn đoán khi khởi động thất bại.
     let stdout_path = data_dir.join("engine-stdout.log");
@@ -365,7 +396,7 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
         if attempt == 2 {
             log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
             kill_orphan_sidecars();
-            kill_orphan_edges(&data_dir.join("browser-profile"));
+            kill_orphan_edges(&data_dir);
             std::thread::sleep(Duration::from_millis(1500));
         }
 
@@ -496,7 +527,7 @@ fn kill_orphan_sidecars() {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        for img in [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV] {
+        for img in [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV, SIDECAR_EXE_DEV_GNU] {
             let _ = Command::new("taskkill")
                 .args(["/IM", img, "/T", "/F"])
                 .creation_flags(CREATE_NO_WINDOW)
@@ -506,19 +537,18 @@ fn kill_orphan_sidecars() {
     }
 }
 
-/// Dọn Edge/Chrome mồ côi còn giữ profile của engine hoặc cờ debugging port 19210
+/// Dọn Edge/Chrome mồ côi còn giữ profile dưới `data_dir` (`browser-profile` hoặc `profiles/*`)
 /// (xảy ra khi engine bị kill cứng không qua taskkill /T, hoặc app crash trước khi stop).
-/// Chỉ kill process có command line chứa ĐÚNG profile dir của app hoặc port 19210 —
-/// không đụng Edge/Chrome của người dùng.
-fn kill_orphan_edges(profile_dir: &std::path::Path) {
+/// Chỉ kill process có command line chứa ĐÚNG `data_dir` của app — không đụng Edge/Chrome của người dùng.
+fn kill_orphan_edges(data_dir: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let needle = profile_dir.to_string_lossy().replace('\'', "''");
+        let needle = data_dir.to_string_lossy().replace('\'', "''");
         let script = format!(
             "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | \
-             Where-Object {{ $_.CommandLine -and ($_.CommandLine.Contains('{needle}') -or $_.CommandLine.Contains('--remote-debugging-port=19210')) }} | \
+             Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{needle}') }} | \
              ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
         );
         let _ = Command::new("powershell")
@@ -530,7 +560,7 @@ fn kill_orphan_edges(profile_dir: &std::path::Path) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = profile_dir;
+        let _ = data_dir;
     }
 }
 
@@ -555,17 +585,16 @@ fn kill_child_tree(child: &mut Child) {
 
 /// Dừng sidecar (taskkill /T /F để chết cả Chromium con do sidecar mở).
 pub fn stop() -> AppResult<()> {
+    let _spawn_guard = start_lock().lock();
     let handle = sidecar_cell().write().take();
     let Some(mut h) = handle else {
         return Ok(());
     };
     kill_child_tree(&mut h.child);
     // Crashpad/utility của Edge có thể sống sót sau taskkill /T và giữ profile —
-    // dọn luôn để lần khởi động sau không bị "Chromium did not expose DevTools".
-    let profile = crate::settings::app_data_dir()
-        .join(MUSE_DATA_DIR)
-        .join("browser-profile");
-    kill_orphan_edges(&profile);
+    // dọn luôn toàn bộ profile trong `data_dir` để lần khởi động sau không bị kẹt.
+    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    kill_orphan_edges(&data_dir);
     log_info("VideoFlow Muse engine đã dừng");
     Ok(())
 }
@@ -709,6 +738,14 @@ mod tests {
         let chosen = find_free_port(busy).expect("phải chọn được port rảnh");
         assert!(chosen > 0);
         assert_ne!(chosen, busy, "port đang bị giữ phải được đổi sang port rảnh khác");
+
+        // Khi exclude trùng với preferred (ngay cả khi preferred đang rảnh), cũng phải chọn port khác.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let excluded = find_free_port_excluding(free_port, Some(free_port))
+            .expect("phải tránh port nằm trong exclude");
+        assert_ne!(excluded, free_port);
     }
 
     /// Chạy khi có exe engine cạnh app (dev: `binaries/`) — CI release build exe trước

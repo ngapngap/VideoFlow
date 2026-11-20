@@ -2208,11 +2208,15 @@ pub fn muse_stop_sidecar() -> AppResult<bool> {
 }
 
 #[tauri::command]
-pub async fn muse_list_accounts(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
-    let cfg = state.settings_cache.read().clone();
+pub async fn muse_list_accounts() -> AppResult<serde_json::Value> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (port, key) = muse_session_or_err(&cfg)?;
-        crate::muse_sidecar::admin_get(port, &key, "/admin/accounts")
+        let session = crate::muse_sidecar::current_session().ok_or_else(|| {
+            AppError::new(
+                "MUSE_SIDECAR_STOPPED",
+                "Engine VideoFlow Muse đang dừng — hãy khởi động engine trước khi tải danh sách tài khoản.",
+            )
+        })?;
+        crate::muse_sidecar::admin_get(session.port, &session.api_key, "/admin/accounts")
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?

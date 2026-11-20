@@ -41,6 +41,11 @@ videoflow-app/src-tauri/manifest.rc
 _build/
 .zcode/
 rustup-init.exe
+*proxy*.csv
+*proxies*.csv
+*proxy*.txt
+*proxies*.txt
+.proxies*
 
 # Hệ thống / IDE
 .DS_Store

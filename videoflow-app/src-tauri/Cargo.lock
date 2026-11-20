@@ -4755,6 +4755,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "csv",
+ "getrandom 0.2.17",
  "image",
  "keyring",
  "parking_lot",

@@ -96,8 +96,8 @@ def test_account_profile_directory_isolation(tmp_path: Path):
     p2 = resolve_account_profile_dir(settings, "acc_2")
 
     assert p1 != p2
-    assert p1 == tmp_path / "data" / "muse" / "profiles" / "acc_1"
-    assert p2 == tmp_path / "data" / "muse" / "profiles" / "acc_2"
+    assert p1 == tmp_path / "data" / "profiles" / "acc_1"
+    assert p2 == tmp_path / "data" / "profiles" / "acc_2"
     assert p1.name == "acc_1"
     assert p2.name == "acc_2"
 

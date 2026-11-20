@@ -89,6 +89,11 @@ pub fn run() {
             commands::check_app_update,
             commands::install_app_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("VideoFlow Desktop chạy thất bại");
+        .build(tauri::generate_context!())
+        .expect("VideoFlow Desktop khởi tạo thất bại")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                muse_sidecar::stop_for_quit();
+            }
+        });
 }

@@ -158,8 +158,8 @@ impl Settings {
             clean.backoff_s[1].max(1),
             clean.backoff_s[2].max(1),
         ];
-        clean.schedule_hours = clean.schedule_hours.max(1);
-        clean.auto_cleanup_days = clean.auto_cleanup_days.max(1);
+        clean.schedule_hours = clean.schedule_hours.clamp(1, 8760);
+        clean.auto_cleanup_days = clean.auto_cleanup_days.clamp(0, 3650);
 
         clean.recent_projects = clean
             .recent_projects
@@ -684,6 +684,16 @@ mod tests {
         assert_eq!(loaded.backoff_s, [1, 1, 5]);
         assert_eq!(loaded.recent_projects.len(), 5);
         assert_eq!(loaded.recent_projects[0], "p1");
+
+        // auto_cleanup_days = 0 (tắt tự dọn) phải được giữ nguyên = 0, và schedule_hours quá lớn phải clamp về 8760
+        let zero_cleanup = Settings {
+            auto_cleanup_days: 0,
+            schedule_hours: 99_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(zero_cleanup.auto_cleanup_days, 0);
+        assert_eq!(zero_cleanup.schedule_hours, 8760);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -83,14 +83,14 @@ def resolve_proxy(account: Account | None, global_proxy: str = "") -> str:
 
 
 def resolve_account_profile_dir(settings: Settings, account_id: str | None) -> Path:
-    """Return isolated profile directory muse/profiles/<account_id> for the account."""
+    """Return isolated profile directory profiles/<account_id> under data_dir for the account."""
     if not account_id:
         return settings.profile_dir
     if hasattr(settings, "account_profile_dir"):
         return settings.account_profile_dir(account_id)
     if settings.browser_profile_dir:
         return settings.browser_profile_dir.parent / "profiles" / account_id
-    return settings.data_dir / "muse" / "profiles" / account_id
+    return settings.data_dir / "profiles" / account_id
 
 
 def allocate_cdp_port(base_port: int) -> int:
