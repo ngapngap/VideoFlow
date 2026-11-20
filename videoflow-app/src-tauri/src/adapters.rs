@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 const MAX_VIDEO_INPUT_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const DOWNLOAD_BACKOFF_S: [u64; 3] = [2, 5, 10];
 
-static HTTP_CLIENTS: OnceLock<parking_lot::Mutex<HashMap<u64, reqwest::blocking::Client>>> =
-    OnceLock::new();
+static HTTP_CLIENTS: OnceLock<
+    parking_lot::Mutex<HashMap<(u64, bool), reqwest::blocking::Client>>,
+> = OnceLock::new();
 
 #[cfg(test)]
 static TEST_API_KEYS: OnceLock<parking_lot::Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -96,16 +97,28 @@ fn resolve_image_base_and_key(cfg: &Settings) -> Result<(String, String, String)
     }
 }
 
-fn client(timeout_s: u64) -> reqwest::blocking::Client {
-    let key = timeout_s.max(1);
+fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    matches!(
+        parsed.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    )
+}
+
+fn client_for_url(timeout_s: u64, url: &str) -> reqwest::blocking::Client {
+    let no_proxy = cfg!(test) || is_loopback_url(url);
+    let key = (timeout_s.max(1), no_proxy);
     let cache = HTTP_CLIENTS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut map = cache.lock();
     if let Some(c) = map.get(&key) {
         return c.clone();
     }
-    let builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(key));
-    #[cfg(test)]
-    let builder = builder.no_proxy();
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(key.0));
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
     let built = builder.build().expect("build http client");
     map.insert(key, built.clone());
     built
@@ -310,6 +323,9 @@ impl ApiFail {
 pub fn contains_quota_keyword(low: &str) -> bool {
     [
         "insufficient_quota",
+        "upstream_quota_exhausted",
+        "quota_exhausted",
+        "quota exhausted",
         "quota_exceeded",
         "quota exceeded",
         "exceeded your current quota",
@@ -437,7 +453,7 @@ pub fn create_image(cfg: &Settings, image_path: &Path, prompt: &str) -> Result<I
 
     let url = format!("{base_clean}/images/edits");
 
-    let resp = client(cfg.image_timeout_s)
+    let resp = client_for_url(cfg.image_timeout_s, &url)
         .post(&url)
         .bearer_auth(&key)
         .multipart(form)
@@ -597,7 +613,7 @@ pub fn create_video_task(
         "seconds": cfg.video_seconds
     });
 
-    let mut req = client(cfg.video_create_timeout_s)
+    let mut req = client_for_url(cfg.video_create_timeout_s, &url)
         .post(&url)
         .bearer_auth(&key)
         .json(&payload);
@@ -799,7 +815,7 @@ pub fn poll_once(cfg: &Settings, task_id: &str) -> Result<PollOutcome, ApiFail> 
     let (base_clean, key) = resolve_video_base_and_key(cfg)?;
     let url = format!("{base_clean}/videos/{safe_tid}");
 
-    let resp = client(60)
+    let resp = client_for_url(60, &url)
         .get(&url)
         .bearer_auth(&key)
         .send()
@@ -1078,7 +1094,7 @@ pub fn download_video(
         let (base_clean, key) = resolve_video_base_and_key(cfg)?;
         let attach_auth = !key.is_empty() && is_same_origin(&current_url, &base_clean);
 
-        let mut req = client(600).get(current_url.trim());
+        let mut req = client_for_url(600, current_url.trim()).get(current_url.trim());
         if attach_auth {
             req = req.bearer_auth(&key);
         }
@@ -1266,7 +1282,7 @@ pub fn test_connection(
         return Ok((false, 0, "Chưa nhập Base URL endpoint".into()));
     }
     let url = format!("{}/models", base.trim_end_matches('/'));
-    let mut req = client(30).get(&url);
+    let mut req = client_for_url(30, &url).get(&url);
     if !key.is_empty() {
         req = req.bearer_auth(&key);
     }
@@ -1302,7 +1318,7 @@ pub fn list_models(
         ));
     }
     let url = format!("{}/models", base.trim_end_matches('/'));
-    let mut req = client(30).get(&url);
+    let mut req = client_for_url(30, &url).get(&url);
     if !key.is_empty() {
         req = req.bearer_auth(&key);
     }
@@ -1647,5 +1663,25 @@ mod tests {
         assert!(verify_mp4_file(&bad_mp4, None).is_err());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn loopback_url_va_upstream_quota_exhausted() {
+        assert!(is_loopback_url("http://127.0.0.1:18610/v1/videos"));
+        assert!(is_loopback_url("http://localhost:18610/v1/images/edits"));
+        assert!(is_loopback_url("http://[::1]:18610/v1/models"));
+        assert!(!is_loopback_url("https://muse.photowrapped.com/v1"));
+        assert!(!is_loopback_url("not-a-url"));
+
+        assert!(contains_quota_keyword("upstream_quota_exhausted"));
+        assert!(contains_quota_keyword("quota_exhausted"));
+        assert!(contains_quota_keyword("quota exhausted"));
+        let fail = ApiFail::classify_http(
+            429,
+            None,
+            r#"{"error":{"code":"upstream_quota_exhausted","message":"Account out of quota"}}"#,
+        );
+        assert_eq!(fail.kind, ApiFailKind::HetQuota);
+        assert_eq!(fail.code, "QUOTA_EXHAUSTED");
     }
 }

@@ -209,3 +209,25 @@ async def test_browser_driver_renew_session_passes_account_proxy(tmp_path: Path)
         mock_renew.assert_awaited_once_with(
             acc.cookies, proxy="http://namdm:secret@10.0.0.1:8188"
         )
+
+
+@pytest.mark.asyncio
+async def test_root_coordinator_startup_skips_unused_default_chromium(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path / "data")
+    root_drv = BrowserDriver(settings)
+
+    with (
+        patch(
+            "muse2api.drivers.browser.driver.find_chromium",
+            return_value="msedge.exe",
+        ),
+        patch(
+            "muse2api.drivers.browser.driver.ChromiumProcess.start",
+            new=AsyncMock(side_effect=AssertionError("root coordinator must not spawn Chromium")),
+        ),
+    ):
+        await root_drv.startup()
+        h = await root_drv.health()
+        assert h["ok"] is True
+        assert h["browser_alive"] is False
+        assert root_drv._chromium is None

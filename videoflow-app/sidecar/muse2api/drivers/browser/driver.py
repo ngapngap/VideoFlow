@@ -390,6 +390,15 @@ class BrowserDriver(MuseDriver):
 
     async def startup(self) -> None:
         exe = find_chromium(self.settings.chromium_path)
+        if self.account is None:
+            # Root coordinator delegates every request to per-account sub-drivers;
+            # avoid spawning an unused default Chromium on data/browser-profile.
+            self._coordinator_ready = True
+            log.info(
+                "browser driver coordinator ready (lazy per-account browsers, chromium=%s)",
+                exe,
+            )
+            return
         self._chromium = ChromiumProcess(
             exe, self.port, self.profile_dir, self.settings.headless,
             proxy=self.proxy,
@@ -431,7 +440,7 @@ class BrowserDriver(MuseDriver):
                     break
             return {
                 "driver": self.name,
-                "ok": alive or self.browser_alive,
+                "ok": alive or self.browser_alive or getattr(self, "_coordinator_ready", False),
                 "browser_alive": alive or self.browser_alive,
                 "tabs": tabs + len([t for ts in self._tabs.values() for t in ts]),
                 "busy_tabs": busy + sum(t.busy for ts in self._tabs.values() for t in ts),
@@ -439,12 +448,12 @@ class BrowserDriver(MuseDriver):
                 "active_account_id": active_acc,
                 "active_proxy": active_prx,
             }
-        ok = self.browser_alive
+        ok = self.browser_alive or getattr(self, "_coordinator_ready", False)
         tabs = [t for ts in self._tabs.values() for t in ts]
         return {
             "driver": self.name,
             "ok": ok,
-            "browser_alive": ok,
+            "browser_alive": self.browser_alive,
             "tabs": len(tabs),
             "busy_tabs": sum(t.busy for t in tabs),
             "active_account_id": self.account_id if any(t.busy for t in tabs) else None,

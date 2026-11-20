@@ -350,7 +350,8 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
     std::fs::create_dir_all(&data_dir).ok();
 
-    // Dọn Edge mồ côi còn giữ profile (engine bị kill cứng lần trước) trước khi spawn.
+    // Dọn sidecar & Edge mồ côi (từ phiên app cũ đóng bất thường) trước khi mở log / spawn.
+    kill_orphan_sidecars();
     kill_orphan_edges(&data_dir.join("browser-profile"));
 
     // Log stdout/stderr của sidecar ra file để chẩn đoán khi khởi động thất bại.
@@ -363,16 +364,13 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     for attempt in 1..=2 {
         if attempt == 2 {
             log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
+            kill_orphan_sidecars();
             kill_orphan_edges(&data_dir.join("browser-profile"));
             std::thread::sleep(Duration::from_millis(1500));
         }
 
-        let stdout_file = std::fs::File::create(&stdout_path).map_err(|e| {
-            AppError::new("MUSE_SIDECAR_FAIL", format!("Không mở được log stdout: {e}"))
-        })?;
-        let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
-            AppError::new("MUSE_SIDECAR_FAIL", format!("Không mở được log stderr: {e}"))
-        })?;
+        let stdout_file = open_sidecar_log_file(&stdout_path, "stdout")?;
+        let stderr_file = open_sidecar_log_file(&stderr_path, "stderr")?;
 
         let mut cmd = Command::new(&exe);
         cmd.env("MUSE2API_DRIVER", "browser")
@@ -461,6 +459,50 @@ impl EngineErrorHint for AppError {
             }
         }
         AppError::new(&self.code, parts.join(" — "))
+    }
+}
+
+/// Mở file log sidecar; nếu file chính vẫn bị tiến trình khác khóa (Windows OS error 32),
+/// fallback sang append hoặc file log kèm PID để không làm hỏng bước khởi động engine.
+fn open_sidecar_log_file(path: &std::path::Path, stream_name: &str) -> AppResult<std::fs::File> {
+    match std::fs::File::create(path) {
+        Ok(f) => Ok(f),
+        Err(first_err) => {
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                return Ok(f);
+            }
+            let fallback = path.with_file_name(format!(
+                "engine-{stream_name}-{}.log",
+                std::process::id()
+            ));
+            std::fs::File::create(&fallback).map_err(|e| {
+                AppError::new(
+                    "MUSE_SIDECAR_FAIL",
+                    format!("Không mở được log {stream_name}: {first_err} (fallback: {e})"),
+                )
+            })
+        }
+    }
+}
+
+/// Dọn tiến trình `videoflow-muse*.exe` mồ côi còn sót từ phiên trước (tránh OS error 32
+/// khi tạo lại `engine-stdout.log` / `engine-stderr.log` và tránh tranh port 18610).
+fn kill_orphan_sidecars() {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        for img in [SIDECAR_EXE_BUNDLED, SIDECAR_EXE_DEV] {
+            let _ = Command::new("taskkill")
+                .args(["/IM", img, "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
 
