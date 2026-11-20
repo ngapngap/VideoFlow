@@ -163,35 +163,41 @@ fn migrate_logs_v4_check_constraint(conn: &Connection) -> Result<(), rusqlite::E
         return Ok(());
     }
 
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys = OFF;
-        BEGIN TRANSACTION;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
 
-        CREATE TABLE logs_new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            level TEXT NOT NULL CHECK (level IN ('info','warn','error')),
-            run_id INTEGER REFERENCES runs(id),
-            row_key TEXT,
-            step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet','auto_merge')),
-            message TEXT NOT NULL,
-            detail TEXT
-        );
+    let migration_res = (|| -> Result<(), rusqlite::Error> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE logs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                level TEXT NOT NULL CHECK (level IN ('info','warn','error')),
+                run_id INTEGER REFERENCES runs(id),
+                row_key TEXT,
+                step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet','auto_merge')),
+                message TEXT NOT NULL,
+                detail TEXT
+            );
 
-        INSERT INTO logs_new (id, ts, level, run_id, row_key, step, message, detail)
-        SELECT id, ts, level, run_id, row_key, step, message, detail FROM logs;
+            INSERT INTO logs_new (id, ts, level, run_id, row_key, step, message, detail)
+            SELECT id, ts, level, run_id, row_key, step, message, detail FROM logs;
 
-        DROP TABLE logs;
-        ALTER TABLE logs_new RENAME TO logs;
+            DROP TABLE logs;
+            ALTER TABLE logs_new RENAME TO logs;
 
-        CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
-        CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+            CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+            CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+            "#,
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
 
-        COMMIT;
-        PRAGMA foreign_keys = ON;
-        "#,
-    )?;
+    let fk_on_res = conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA foreign_key_check;");
+    migration_res?;
+    fk_on_res?;
+
     Ok(())
 }
 
@@ -410,6 +416,184 @@ pub fn latest_job_status(
     } else {
         Ok(None)
     }
+}
+
+/// Di chuyển an toàn `file_refs.row_key` từ `from_key` sang `to_key` trong transaction `tx`,
+/// tránh vi phạm chỉ mục duy nhất `uq_refs_row_kind_ver(row_key, kind, version)`.
+/// - Bỏ qua các dòng đã có `row_key == to_key` (bao gồm an toàn cho đổi chữ hoa/thường).
+/// - Nếu đụng `(to_key, kind, version)` với cùng `file_name` (không phân biệt hoa/thường):
+///   gộp `is_current = MAX(existing, incoming)` rồi xóa bản ghi trùng.
+/// - Nếu đụng `(to_key, kind, version)` với `file_name` khác:
+///   cấp lại `version = COALESCE(MAX(version), 0) + 1` theo `(LOWER(to_key), kind)` và cập nhật
+///   `row_key = to_key, version = new_ver` (không bao giờ làm mất bản ghi).
+pub fn migrate_file_refs_row_key(
+    tx: &Connection,
+    from_key: &str,
+    to_key: &str,
+    kind_filter: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    if from_key.trim().is_empty() || to_key.trim().is_empty() {
+        return Ok(());
+    }
+
+    let rows: Vec<(i64, String, String, String, i64, i64)> = {
+        let mut stmt = if kind_filter.is_some() {
+            tx.prepare(
+                "SELECT id, row_key, kind, file_name, version, is_current
+                 FROM file_refs
+                 WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2
+                 ORDER BY version ASC, id ASC",
+            )?
+        } else {
+            tx.prepare(
+                "SELECT id, row_key, kind, file_name, version, is_current
+                 FROM file_refs
+                 WHERE LOWER(row_key) = LOWER(?1)
+                 ORDER BY version ASC, id ASC",
+            )?
+        };
+
+        let mut collected = Vec::new();
+        let mut iter = match kind_filter {
+            Some(k) => stmt.query(rusqlite::params![from_key, k])?,
+            None => stmt.query(rusqlite::params![from_key])?,
+        };
+        while let Some(r) = iter.next()? {
+            collected.push((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ));
+        }
+        collected
+    };
+
+    for (id, cur_row_key, kind, file_name, version, is_current) in rows {
+        if cur_row_key == to_key {
+            continue;
+        }
+
+        let existing: Option<(i64, String, i64)> = tx
+            .query_row(
+                "SELECT id, file_name, is_current
+                 FROM file_refs
+                 WHERE row_key = ?1 AND kind = ?2 AND version = ?3 AND id != ?4
+                 LIMIT 1",
+                rusqlite::params![to_key, kind, version, id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        match existing {
+            Some((existing_id, existing_file_name, existing_is_current)) => {
+                if existing_file_name.eq_ignore_ascii_case(&file_name) {
+                    let merged_current = existing_is_current.max(is_current);
+                    if merged_current != existing_is_current {
+                        tx.execute(
+                            "UPDATE file_refs SET is_current = ?1 WHERE id = ?2",
+                            rusqlite::params![merged_current, existing_id],
+                        )?;
+                    }
+                    tx.execute("DELETE FROM file_refs WHERE id = ?1", rusqlite::params![id])?;
+                } else {
+                    let new_ver: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(version), 0) + 1
+                         FROM file_refs
+                         WHERE LOWER(row_key) = LOWER(?1) AND kind = ?2",
+                        rusqlite::params![to_key, kind],
+                        |r| r.get(0),
+                    )?;
+                    tx.execute(
+                        "UPDATE file_refs SET row_key = ?1, version = ?2 WHERE id = ?3",
+                        rusqlite::params![to_key, new_ver, id],
+                    )?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "UPDATE file_refs SET row_key = ?1 WHERE id = ?2",
+                    rusqlite::params![to_key, id],
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Di chuyển an toàn `jobs.row_key` từ `from_key` sang `to_key` trong transaction `tx`,
+/// tránh vi phạm chỉ mục duy nhất `uq_jobs_run_row(run_id, row_key)`.
+/// - Nếu `(run_id, to_key)` đã tồn tại (`existing_job_id`), chuyển toàn bộ `attempts.job_id`
+///   và `file_refs.job_id` sang `existing_job_id`, xóa job bị gộp và đảm bảo `existing_job_id`
+///   mang `row_key = to_key`.
+pub fn migrate_jobs_row_key(
+    tx: &Connection,
+    from_key: &str,
+    to_key: &str,
+) -> Result<(), rusqlite::Error> {
+    if from_key.trim().is_empty() || to_key.trim().is_empty() {
+        return Ok(());
+    }
+
+    let jobs_to_migrate: Vec<(i64, i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, run_id, row_key
+             FROM jobs
+             WHERE LOWER(row_key) = LOWER(?1)
+             ORDER BY id ASC",
+        )?;
+        let mut collected = Vec::new();
+        let mut iter = stmt.query(rusqlite::params![from_key])?;
+        while let Some(r) = iter.next()? {
+            collected.push((r.get(0)?, r.get(1)?, r.get(2)?));
+        }
+        collected
+    };
+
+    for (job_id, run_id, cur_row_key) in jobs_to_migrate {
+        if cur_row_key == to_key {
+            continue;
+        }
+
+        let existing_job_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM jobs
+                 WHERE run_id = ?1 AND row_key = ?2 AND id != ?3
+                 LIMIT 1",
+                rusqlite::params![run_id, to_key, job_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        match existing_job_id {
+            Some(survivor_id) => {
+                tx.execute(
+                    "UPDATE attempts SET job_id = ?1 WHERE job_id = ?2",
+                    rusqlite::params![survivor_id, job_id],
+                )?;
+                tx.execute(
+                    "UPDATE file_refs SET job_id = ?1 WHERE job_id = ?2",
+                    rusqlite::params![survivor_id, job_id],
+                )?;
+                tx.execute("DELETE FROM jobs WHERE id = ?1", rusqlite::params![job_id])?;
+                tx.execute(
+                    "UPDATE jobs SET row_key = ?1 WHERE id = ?2",
+                    rusqlite::params![to_key, survivor_id],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE jobs SET row_key = ?1 WHERE id = ?2",
+                    rusqlite::params![to_key, job_id],
+                )?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -860,6 +1044,332 @@ mod tests {
         assert!(latest_job_status(&conn, "only_once.png").unwrap().is_some());
         assert!(latest_job_status(&conn, "a.png").unwrap().is_some());
         assert!(latest_job_status(&conn, "b_superseded.png").unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_v3_to_v4_logs_constraint_restores_foreign_keys() {
+        let dir = temp_project_dir("migrate_v3_to_v4_logs");
+        let db_path = dir.join("state.db");
+        {
+            let conn = Connection::open(&db_path).expect("open raw v3 db");
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                PRAGMA user_version = 3;
+
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('chung','rieng','lich','lam_lai')),
+                    status TEXT NOT NULL CHECK (status IN ('dang_chay','hoan_tat','da_dung','gian_doan')),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    total_rows INTEGER NOT NULL DEFAULT 0,
+                    done_count INTEGER NOT NULL DEFAULT 0,
+                    error_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES runs(id),
+                    row_key TEXT NOT NULL,
+                    row_no INTEGER,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('dang_cho','da_tao_image','da_tao_video','loi_tao_image','loi_tao_video','loi_tam_thoi','bo_qua')),
+                    image_status TEXT NOT NULL DEFAULT 'chua_chay',
+                    video_status TEXT NOT NULL DEFAULT 'chua_chay',
+                    image_prompt_hash TEXT,
+                    video_prompt_hash TEXT,
+                    video_task_id TEXT,
+                    video_download_url TEXT,
+                    attempts_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    duration_ms INTEGER
+                );
+                CREATE TABLE file_refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER REFERENCES jobs(id),
+                    row_key TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('tham_chieu','anh','video')),
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    is_current INTEGER NOT NULL DEFAULT 1,
+                    size_bytes INTEGER,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id),
+                    step TEXT NOT NULL CHECK (step IN ('B2','B3','download')),
+                    attempt_no INTEGER NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    result TEXT NOT NULL CHECK (result IN ('ok','loi_tam_thoi','loi_nghiep_vu')),
+                    http_status INTEGER,
+                    error_code TEXT,
+                    error_message TEXT
+                );
+                CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    level TEXT NOT NULL CHECK (level IN ('info','warn','error')),
+                    run_id INTEGER REFERENCES runs(id),
+                    row_key TEXT,
+                    step TEXT CHECK (step IN ('B1','B2','B3','download','dong_bo','ghi_sheet')),
+                    message TEXT NOT NULL,
+                    detail TEXT
+                );
+                INSERT INTO runs(id, kind, status, started_at, total_rows)
+                VALUES (1, 'chung', 'hoan_tat', '2026-11-18T00:00:00Z', 1);
+                INSERT INTO logs(ts, level, run_id, step, message)
+                VALUES ('2026-11-18T00:00:01Z', 'info', 1, 'B2', 'existing v3 log');
+                "#,
+            )
+            .expect("setup raw v3 schema");
+
+            let old_err = conn.execute(
+                "INSERT INTO logs(ts, level, run_id, step, message)
+                 VALUES ('2026-11-18T00:00:02Z', 'info', 1, 'auto_merge', 'should fail on v3')",
+                [],
+            );
+            assert!(old_err.is_err(), "v3 logs CHECK constraint must reject 'auto_merge'");
+        }
+
+        // 1. Thành công: nâng cấp v3 -> v4, cho phép 'auto_merge', bảo toàn log cũ và giữ FK = 1
+        let conn = open(&dir).expect("open & migrate v3 -> v4");
+        let fk_after_ok: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .expect("read foreign_keys after ok");
+        assert_eq!(fk_after_ok, 1, "foreign_keys must remain ON after migration");
+
+        conn.execute(
+            "INSERT INTO logs(ts, level, run_id, step, message)
+             VALUES ('2026-11-18T00:00:03Z', 'info', 1, 'auto_merge', 'merged ok')",
+            [],
+        )
+        .expect("v4 logs CHECK constraint must allow 'auto_merge'");
+
+        let cnt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 2);
+        drop(conn);
+
+        // 2. Rollback khi lỗi: tạo bảng logs thiếu cột `detail` để migration fail giữa chừng -> FK vẫn phải = 1!
+        let err_dir = temp_project_dir("migrate_v3_to_v4_err");
+        let err_conn = Connection::open(err_dir.join("state.db")).expect("open err db");
+        err_conn
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT);
+                CREATE TABLE logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    run_id INTEGER REFERENCES runs(id),
+                    row_key TEXT,
+                    step TEXT CHECK (step IN ('B1','B2','B3')),
+                    message TEXT NOT NULL
+                );
+                INSERT INTO logs(ts, level, step, message) VALUES ('2026-11-18T00:00:00Z', 'info', 'B1', 'kept');
+                "#,
+            )
+            .expect("setup broken logs table");
+        let res = migrate_logs_v4_check_constraint(&err_conn);
+        assert!(res.is_err(), "broken logs schema must return Err");
+        let fk_after_err: i64 = err_conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .expect("read foreign_keys after error");
+        assert_eq!(fk_after_err, 1, "foreign_keys MUST be restored to 1 even on migration error");
+        let kept: i64 = err_conn
+            .query_row("SELECT COUNT(*) FROM logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "rolled-back transaction must preserve original logs table");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&err_dir);
+    }
+
+    #[test]
+    fn test_migrate_file_refs_and_jobs_row_key_collisions() {
+        let dir = temp_project_dir("migrate_row_key_collisions");
+        let conn = open(&dir).expect("open db");
+
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-18T00:00:00Z', 2)",
+            [],
+        )
+        .unwrap();
+        let run1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-18T01:00:00Z', 2)",
+            [],
+        )
+        .unwrap();
+        let run2 = conn.last_insert_rowid();
+
+        // run1 chỉ có 'cat.png' (không đụng); run2 có CẢ 'cat.png' và 'cat.png#h1' (đụng uq_jobs_run_row!)
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'cat.png', 'da_tao_image')",
+            rusqlite::params![run1],
+        )
+        .unwrap();
+        let job_r1 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'cat.png', 'loi_tao_image')",
+            rusqlite::params![run2],
+        )
+        .unwrap();
+        let job_r2_absorbed = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'cat.png#h1', 'da_tao_video')",
+            rusqlite::params![run2],
+        )
+        .unwrap();
+        let job_r2_survivor = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO attempts(job_id, step, attempt_no, result) VALUES (?1, 'B2', 1, 'loi_nghiep_vu')",
+            rusqlite::params![job_r2_absorbed],
+        )
+        .unwrap();
+
+        // file_refs cho 'cat.png':
+        // - (anh, v1): trùng tên file (khác hoa/thường) với to_key -> gộp is_current = MAX(0, 1) = 1 và xóa trùng
+        // - (anh, v2): khác tên file với to_key -> cấp lại thành v3 (không mất dòng!)
+        // - (video, v1): không trùng ở to_key -> giữ v1 và đổi row_key
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'cat.png', 'anh', 'Cat_Gen.png', 'image_out/Cat_Gen.png', 1, 1, '2026-11-18T00:01:00Z')",
+            rusqlite::params![job_r2_absorbed],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'cat.png', 'anh', 'legacy_v2.png', 'image_out/legacy_v2.png', 2, 0, '2026-11-18T00:02:00Z')",
+            rusqlite::params![job_r1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'cat.png', 'video', 'cat_gen.mp4', 'video_out/cat_gen.mp4', 1, 1, '2026-11-18T00:03:00Z')",
+            rusqlite::params![job_r2_absorbed],
+        )
+        .unwrap();
+
+        // file_refs sẵn có ở 'cat.png#h1':
+        // - (anh, v1): 'cat_gen.png' (is_current = 0)
+        // - (anh, v2): 'new_v2.png' (is_current = 0)
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'cat.png#h1', 'anh', 'cat_gen.png', 'image_out/cat_gen.png', 1, 0, '2026-11-18T01:01:00Z')",
+            rusqlite::params![job_r2_survivor],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'cat.png#h1', 'anh', 'new_v2.png', 'image_out/new_v2.png', 2, 0, '2026-11-18T01:02:00Z')",
+            rusqlite::params![job_r2_survivor],
+        )
+        .unwrap();
+
+        // Case-only rename test trên khóa riêng: 'Dog.png' + 'dog.png' cùng (anh, v1, same file) và 'Dog.png' (anh, v2)
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (NULL, 'dog.png', 'anh', 'dog_gen.png', 'image_out/dog_gen.png', 1, 0, '2026-11-18T02:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (NULL, 'Dog.png', 'anh', 'dog_gen.png', 'image_out/dog_gen.png', 1, 1, '2026-11-18T02:01:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (NULL, 'Dog.png', 'anh', 'dog_gen_v2.png', 'image_out/dog_gen_v2.png', 2, 0, '2026-11-18T02:02:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        migrate_jobs_row_key(&tx, "CAT.PNG", "cat.png#h1").expect("migrate_jobs_row_key");
+        migrate_file_refs_row_key(&tx, "CAT.PNG", "cat.png#h1", None)
+            .expect("migrate_file_refs_row_key");
+        migrate_file_refs_row_key(&tx, "Dog.png", "dog.png", Some("anh"))
+            .expect("case-only migrate_file_refs_row_key");
+        tx.commit().unwrap();
+
+        // 1. Không còn job hay file_refs nào mang 'cat.png' hoặc 'Dog.png'
+        let old_jobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE row_key = 'cat.png'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_jobs, 0);
+
+        // run1 job được đổi sang 'cat.png#h1'; run2 job bị gộp vào job_r2_survivor
+        let r1_rk: String = conn
+            .query_row("SELECT row_key FROM jobs WHERE id = ?1", rusqlite::params![job_r1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(r1_rk, "cat.png#h1");
+        let absorbed_exists: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs WHERE id = ?1", rusqlite::params![job_r2_absorbed], |r| r.get(0))
+            .unwrap();
+        assert_eq!(absorbed_exists, 0);
+
+        // attempt của absorbed job đã chuyển sang job_r2_survivor
+        let att_job: i64 = conn
+            .query_row("SELECT job_id FROM attempts LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(att_job, job_r2_survivor);
+
+        // 2. Kiểm tra file_refs của 'cat.png#h1': 3 ảnh (v1 gộp is_current=1, v2 new_v2.png, v3 legacy_v2.png) + 1 video (v1)
+        let img_refs: Vec<(i64, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT version, file_name, is_current FROM file_refs WHERE row_key = 'cat.png#h1' AND kind = 'anh' ORDER BY version ASC")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(img_refs.len(), 3);
+        assert_eq!(img_refs[0], (1, "cat_gen.png".to_string(), 1));
+        assert_eq!(img_refs[1], (2, "new_v2.png".to_string(), 0));
+        assert_eq!(img_refs[2], (3, "legacy_v2.png".to_string(), 0));
+
+        let vid_ref: (i64, i64) = conn
+            .query_row(
+                "SELECT job_id, version FROM file_refs WHERE row_key = 'cat.png#h1' AND kind = 'video'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(vid_ref, (job_r2_survivor, 1));
+
+        // 3. Kiểm tra case-only rename 'Dog.png' -> 'dog.png'
+        let dog_refs: Vec<(String, i64, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT row_key, version, file_name, is_current FROM file_refs WHERE LOWER(row_key) = 'dog.png' ORDER BY version ASC")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|x| x.unwrap())
+                .collect()
+        };
+        assert_eq!(dog_refs.len(), 2);
+        assert_eq!(dog_refs[0], ("dog.png".to_string(), 1, "dog_gen.png".to_string(), 1));
+        assert_eq!(dog_refs[1], ("dog.png".to_string(), 2, "dog_gen_v2.png".to_string(), 0));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

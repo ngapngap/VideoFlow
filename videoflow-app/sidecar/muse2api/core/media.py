@@ -22,6 +22,7 @@ _EXT_BY_MIME = {
     "image/jpeg": ".jpg",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "image/avif": ".avif",
     "video/mp4": ".mp4",
     "video/webm": ".webm",
     "video/quicktime": ".mov",
@@ -86,60 +87,138 @@ class MediaStore:
 
 
 _MAX_FETCH_BYTES = 20 * 1024 * 1024  # 20 MiB cap on server-side image fetches
+_MAX_B64_LEN = ((_MAX_FETCH_BYTES + 2) // 3) * 4
 _MAX_REDIRECTS = 5
+_BLOCKED_V6_NETWORKS = (
+    ipaddress.IPv6Network("64:ff9b::/96"),    # NAT64 well-known (RFC 6052)
+    ipaddress.IPv6Network("64:ff9b:1::/48"),  # NAT64 local-use (RFC 8215)
+    ipaddress.IPv6Network("2002::/16"),       # 6to4 (RFC 3056)
+    ipaddress.IPv6Network("2001::/32"),       # Teredo (RFC 4380)
+    ipaddress.IPv6Network("::/96"),           # Deprecated IPv4-compatible (RFC 4291)
+)
 
 
 def _assert_public_url(url: str) -> str:
-    """Reject non-http(s) URLs and hosts resolving to non-public IPs (SSRF guard)."""
+    """Reject non-http(s) URLs and malformed ports/hosts (SSRF guard)."""
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    try:
+        _ = parsed.port
+        httpx_url = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError) as exc:
+        raise InvalidRequest("image_url must be a public http(s) URL") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or not httpx_url.raw_host:
         raise InvalidRequest("image_url must be a public http(s) URL")
     return url
 
 
-async def _assert_public_host(hostname: str) -> None:
-    """Reject hostnames resolving to non-public IPs (SSRF guard)."""
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True only if ``ip`` is a globally routable unicast address."""
+    if ip.version == 6:
+        if ip.scope_id is not None:
+            return False
+        if ip.ipv4_mapped is not None:
+            return _is_public_ip(ip.ipv4_mapped)
+        if ip.sixtofour is not None or ip.teredo is not None or ip.is_site_local:
+            return False
+        if any(ip in net for net in _BLOCKED_V6_NETWORKS):
+            return False
+    return (
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
+
+
+async def _resolve_public_ips(hostname: str) -> list[str]:
+    """Resolve hostname once and return validated public IP strings (unwrapping v4-mapped)."""
+    if not hostname or "%" in hostname:
+        raise InvalidRequest("image_url must resolve to a public IP address")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not _is_public_ip(literal):
+            raise InvalidRequest("image_url must resolve to a public IP address")
+        if literal.version == 6 and literal.ipv4_mapped is not None:
+            literal = literal.ipv4_mapped
+        return [literal.compressed]
+
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
             hostname, None, type=socket.SOCK_STREAM
         )
     except socket.gaierror as exc:
         raise InvalidRequest("image_url host does not resolve") from exc
+    if not infos:
+        raise InvalidRequest("image_url host does not resolve")
+
+    resolved: list[str] = []
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError as exc:
+            raise InvalidRequest("image_url must resolve to a public IP address") from exc
+        if not _is_public_ip(ip):
+            raise InvalidRequest("image_url must resolve to a public IP address")
         if ip.version == 6 and ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
-        if (
-            not ip.is_global
-            or ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise InvalidRequest("image_url must resolve to a public IP address")
+        s = ip.compressed
+        if s not in resolved:
+            resolved.append(s)
+    return resolved
+
+
+async def _assert_public_host(hostname: str) -> None:
+    """Reject hostnames resolving to non-public IPs (SSRF guard)."""
+    await _resolve_public_ips(hostname)
 
 
 async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
-    """Fetch an image URL with manual redirect validation and a size cap."""
-    url = _assert_public_url(url)
-    await _assert_public_host(urllib.parse.urlparse(url).hostname or "")
+    """Fetch an image URL with single-shot DNS IP pinning, manual redirects, and a size cap."""
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=False, trust_env=False
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
         ) as client:
-            for _ in range(_MAX_REDIRECTS + 1):
-                async with client.stream("GET", url) as resp:
+            for hop in range(_MAX_REDIRECTS + 1):
+                url = _assert_public_url(url)
+                parsed = httpx.URL(url)
+                hostname = urllib.parse.urlparse(url).hostname or ""
+                pinned_ip = (await _resolve_public_ips(hostname))[0]
+                pinned_url = str(parsed.copy_with(username="", password="", host=pinned_ip))
+                headers = {"Host": parsed.netloc.decode("ascii")}
+                extensions = {"sni_hostname": parsed.raw_host.decode("ascii")}
+                async with client.stream(
+                    "GET", pinned_url, headers=headers, extensions=extensions
+                ) as resp:
                     if resp.status_code in (301, 302, 303, 307, 308):
+                        if hop >= _MAX_REDIRECTS:
+                            raise InvalidRequest("image_url exceeded redirect limit")
                         location = resp.headers.get("location")
                         if not location:
                             raise InvalidRequest("image_url redirect missing location")
-                        url = _assert_public_url(urllib.parse.urljoin(url, location))
-                        await _assert_public_host(urllib.parse.urlparse(url).hostname or "")
+                        url = urllib.parse.urljoin(url, location)
                         continue
                     resp.raise_for_status()
-                    mime = resp.headers.get("content-type", "image/png").split(";")[0]
+                    content_length = resp.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            declared_len = int(content_length.strip())
+                        except ValueError:
+                            declared_len = None
+                        if declared_len is not None and declared_len > _MAX_FETCH_BYTES:
+                            raise InvalidRequest("image_url response exceeds 20 MiB")
+                    mime = (
+                        resp.headers.get("content-type", "image/png").split(";")[0].strip()
+                        or "image/png"
+                    )
                     body = bytearray()
                     async for chunk in resp.aiter_bytes(65536):
                         body.extend(chunk)
@@ -151,25 +230,37 @@ async def _fetch_public_image(url: str, *, timeout: float) -> tuple[bytes, str]:
         raise InvalidRequest(f"failed to fetch image_url: {exc}") from exc
 
 
+def _decode_base64_bounded(payload: str, *, err_msg: str) -> bytes:
+    """Reject oversized base64 strings before invoking ``base64.b64decode``."""
+    if len(payload) > _MAX_B64_LEN * 2:
+        raise InvalidRequest("image exceeds 20 MiB")
+    compact = "".join(payload.split())
+    if len(compact) > _MAX_B64_LEN:
+        raise InvalidRequest("image exceeds 20 MiB")
+    if compact and len(compact) % 4 == 0:
+        pad = 2 if compact.endswith("==") else 1 if compact.endswith("=") else 0
+        if (len(compact) // 4) * 3 - pad > _MAX_FETCH_BYTES:
+            raise InvalidRequest("image exceeds 20 MiB")
+    try:
+        raw = base64.b64decode(compact, validate=True)
+    except ValueError as exc:
+        raise InvalidRequest(err_msg) from exc
+    if len(raw) > _MAX_FETCH_BYTES:
+        raise InvalidRequest("image exceeds 20 MiB")
+    return raw
+
+
 async def load_image_ref(ref: str, *, timeout: float = 20.0) -> tuple[bytes, str]:
     """Decode a data URL or download an http(s) URL. Returns ``(bytes, mime)``."""
     ref = ref.strip()
     if ref.startswith("data:"):
-        header, _, payload = ref.partition(",")
-        mime = header[5:].split(";")[0] or "image/png"
-        try:
-            raw = base64.b64decode(payload)
-        except ValueError as exc:
-            raise InvalidRequest("invalid base64 image data") from exc
-        if len(raw) > _MAX_FETCH_BYTES:
-            raise InvalidRequest("image exceeds 20 MiB")
-        return raw, mime
+        header, sep, payload = ref.partition(",")
+        if not sep:
+            raise InvalidRequest("invalid base64 image data")
+        mime = header[5:].split(";")[0].strip() or "image/png"
+        return _decode_base64_bounded(payload, err_msg="invalid base64 image data"), mime
     if ref.startswith(("http://", "https://")):
         return await _fetch_public_image(ref, timeout=timeout)
-    try:
-        raw = base64.b64decode(ref, validate=True)
-    except ValueError as exc:
-        raise InvalidRequest("image must be a data URL, http(s) URL or base64 string") from exc
-    if len(raw) > _MAX_FETCH_BYTES:
-        raise InvalidRequest("image exceeds 20 MiB")
-    return raw, "image/png"
+    return _decode_base64_bounded(
+        ref, err_msg="image must be a data URL, http(s) URL or base64 string"
+    ), "image/png"

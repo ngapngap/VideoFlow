@@ -565,13 +565,70 @@ pub fn versioned_file_name(stem: &str, ver: i64, ext: &str) -> String {
     }
 }
 
-static VERSION_LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+#[derive(Default)]
+struct ReservedVersions {
+    reserved_paths: std::collections::HashSet<String>,
+    reserved_db_versions: std::collections::HashSet<(String, String, i64)>,
+}
 
-pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str) -> i64 {
-    let _guard = VERSION_LOCK
-        .get_or_init(|| parking_lot::Mutex::new(()))
-        .lock();
+static VERSION_LOCK: std::sync::OnceLock<parking_lot::Mutex<ReservedVersions>> =
+    std::sync::OnceLock::new();
 
+fn version_registry() -> &'static parking_lot::Mutex<ReservedVersions> {
+    VERSION_LOCK.get_or_init(|| parking_lot::Mutex::new(ReservedVersions::default()))
+}
+
+fn escape_sqlite_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn normalize_reserved_path(path: &Path) -> String {
+    let s = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
+pub struct VersionReservation {
+    pub version: i64,
+    pub file_name: String,
+    pub dest: PathBuf,
+    reserved_path_key: String,
+    reserved_db_key: (String, String, i64),
+}
+
+impl Drop for VersionReservation {
+    fn drop(&mut self) {
+        let mut reg = version_registry().lock();
+        reg.reserved_paths.remove(&self.reserved_path_key);
+        reg.reserved_db_versions.remove(&self.reserved_db_key);
+    }
+}
+
+/// Chọn và đặt giữ phiên bản kế tiếp (chỉ giữ `VERSION_LOCK` trong lúc chọn số phiên bản,
+/// nhả mutex trước I/O/mạng; giữ `VersionReservation` tới sau `tx.commit()` để chặn hai worker
+/// cùng stem/row_key đè file hoặc va chạm `uq_refs_row_kind_ver`).
+pub fn reserve_next_version(
+    conn: &Connection,
+    out_dir: &Path,
+    row_key: &str,
+    kind: &str,
+) -> VersionReservation {
     let ext = if kind == "anh" { "png" } else { "mp4" };
     // row_key là "<tên ảnh>#<hash prompt>" → stem phải lấy từ tên ảnh, nếu không tên
     // file đầu ra sẽ dính hash và khác hoàn toàn quy ước `stem_gen.png`.
@@ -581,12 +638,16 @@ pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anh".into());
     let stem_low = stem.to_lowercase();
-    let stem_like = format!("{stem_low}_gen%");
+    let row_key_low = row_key.to_lowercase();
+    let stem_like = format!("{}\\_gen%", escape_sqlite_like(&stem_low));
+
+    let mut reg = version_registry().lock();
 
     let db_max: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM file_refs
-             WHERE (LOWER(row_key) = LOWER(?1) OR LOWER(file_name) LIKE LOWER(?2)) AND kind = ?3",
+            r#"SELECT COALESCE(MAX(version), 0) FROM file_refs
+               WHERE (LOWER(row_key) = LOWER(?1) OR LOWER(file_name) LIKE LOWER(?2) ESCAPE '\')
+                 AND kind = ?3"#,
             rusqlite::params![row_key, stem_like, kind],
             |r| r.get(0),
         )
@@ -622,13 +683,34 @@ pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str
     }
 
     let mut candidate = db_max.max(disk_max) + 1;
-    while out_dir
-        .join(versioned_file_name(&stem, candidate, ext))
-        .exists()
-    {
+    let (file_name, dest, path_key, db_key) = loop {
+        let fname = versioned_file_name(&stem, candidate, ext);
+        let d = out_dir.join(&fname);
+        let pk = normalize_reserved_path(&d);
+        let dk = (row_key_low.clone(), kind.to_string(), candidate);
+        if !d.exists()
+            && !reg.reserved_paths.contains(&pk)
+            && !reg.reserved_db_versions.contains(&dk)
+        {
+            break (fname, d, pk, dk);
+        }
         candidate += 1;
+    };
+
+    reg.reserved_paths.insert(path_key.clone());
+    reg.reserved_db_versions.insert(db_key.clone());
+
+    VersionReservation {
+        version: candidate,
+        file_name,
+        dest,
+        reserved_path_key: path_key,
+        reserved_db_key: db_key,
     }
-    candidate
+}
+
+pub fn next_version(conn: &Connection, out_dir: &Path, row_key: &str, kind: &str) -> i64 {
+    reserve_next_version(conn, out_dir, row_key, kind).version
 }
 
 fn write_atomic(dest: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -698,19 +780,22 @@ pub fn plan_row(
     engine_cfg: &EngineConfig,
     image_out: &Path,
     latest_current_image_in_db: Option<&str>,
+    same_image: usize,
 ) -> Option<RowPlan> {
     if row.is_example() || row.is_empty_content() || row.anh_tham_chieu.trim().is_empty() {
         return None;
     }
 
-    // `row_keys` đến từ UI = khoá dòng (tên ảnh#hash prompt); vẫn nhận cả dạng legacy
-    // (chỉ tên ảnh) để lời gọi cũ và CLI không bị bỏ qua im lặng.
+    // `row_keys` đến từ UI = khoá dòng (tên ảnh#hash prompt); chỉ cho phép khớp tên ảnh trần
+    // khi ảnh dùng cho ĐÚNG một dòng (`same_image == 1`), hoặc khớp chính xác `prev.row_key`.
     if !engine_cfg.row_keys.is_empty() {
         let current = row_key_low(row);
         let image = row.anh_tham_chieu.trim();
         let matched = engine_cfg.row_keys.iter().any(|k| {
             let k = k.trim();
-            k.eq_ignore_ascii_case(&current) || k.eq_ignore_ascii_case(image)
+            k.eq_ignore_ascii_case(&current)
+                || (same_image == 1 && k.eq_ignore_ascii_case(image))
+                || prev.is_some_and(|p| k.eq_ignore_ascii_case(&p.row_key))
         });
         if !matched {
             return None;
@@ -778,7 +863,7 @@ pub fn plan_row(
         ) && !row.anh_da_tao.is_empty()
             && image_out.join(&row.anh_da_tao).is_file();
 
-        return if has_valid_img {
+        return if has_valid_img || row.promt_tao_image.trim().is_empty() {
             Some(RowPlan {
                 steps: vec![Step::B3],
                 force_new_image: false,
@@ -805,7 +890,7 @@ pub fn plan_row(
 
     let steps = if base_status == RowStatus::LoiTamThoi {
         let has_valid_img = !row.anh_da_tao.is_empty() && image_out.join(&row.anh_da_tao).is_file();
-        if has_valid_img {
+        if has_valid_img || row.promt_tao_image.trim().is_empty() {
             vec![Step::B3]
         } else {
             vec![Step::B2, Step::B3]
@@ -831,7 +916,7 @@ pub fn plan_row(
             let same_vid_prompt = p.video_prompt_hash.as_deref() == Some(cur_vid_hash.as_str());
             let same_image_file = match latest_current_image_in_db {
                 Some(db_img) => db_img.eq_ignore_ascii_case(&row.anh_da_tao),
-                None => !row.anh_da_tao.is_empty(),
+                None => !row.anh_da_tao.is_empty() || row.promt_tao_image.trim().is_empty(),
             };
             if p.video_status != "xong" && same_vid_prompt && same_image_file {
                 resume_task_id = p.video_task_id.clone().filter(|s| !s.trim().is_empty());
@@ -1247,11 +1332,33 @@ pub fn sync_csv_if_unlocked(project_path: &Path) -> usize {
 
 // ━━ Engine chính (Hỗ trợ chạy đồng thời `concurrency = 1..=3` worker threads) ━━
 
+#[derive(Debug, Clone)]
 pub struct EngineOutcome {
     pub run_id: i64,
+    pub status: String,
     pub done: usize,
     pub errors: usize,
     pub stopped: bool,
+    pub duration_ms: i64,
+}
+
+pub fn build_run_finished_payload(outcome: &EngineOutcome) -> serde_json::Value {
+    serde_json::to_value(RunFinishedEvent {
+        run_id: outcome.run_id,
+        status: outcome.status.clone(),
+        done_count: outcome.done,
+        error_count: outcome.errors,
+        duration_ms: outcome.duration_ms,
+    })
+    .unwrap_or_else(|_| {
+        serde_json::json!({
+            "run_id": outcome.run_id,
+            "status": outcome.status,
+            "done_count": outcome.done,
+            "error_count": outcome.errors,
+            "duration_ms": outcome.duration_ms,
+        })
+    })
 }
 
 struct WorkerRowCtx<'a> {
@@ -1325,7 +1432,10 @@ pub fn run(
     let cb = |name: &str, payload: serde_json::Value| {
         let _ = app.emit(name, payload);
     };
-    run_with_emitter_and_hook(&cb, None, cfg, project_path, engine_cfg, stop_flag)
+    let outcome =
+        run_with_emitter_and_hook(&cb, None, cfg, project_path, engine_cfg, stop_flag)?;
+    let _ = app.emit("run_finished", build_run_finished_payload(&outcome));
+    Ok(outcome)
 }
 
 pub fn run_with_emitter(
@@ -1335,7 +1445,10 @@ pub fn run_with_emitter(
     engine_cfg: EngineConfig,
     stop_flag: &Arc<AtomicBool>,
 ) -> AppResult<EngineOutcome> {
-    run_with_emitter_and_hook(emitter, None, cfg, project_path, engine_cfg, stop_flag)
+    let outcome =
+        run_with_emitter_and_hook(emitter, None, cfg, project_path, engine_cfg, stop_flag)?;
+    emitter("run_finished", build_run_finished_payload(&outcome));
+    Ok(outcome)
 }
 
 fn initial_job_image_state(
@@ -1411,7 +1524,9 @@ pub fn run_with_emitter_and_hook(
             .or_else(|| prev.and_then(|p| media_map.get(&p.row_key.to_lowercase())))
             .or_else(|| map_lookup_legacy(&media_map, &rows, r))
             .and_then(|m| m.image_file.as_deref());
-        if let Some(plan) = plan_row(r, prev, cfg, &engine_cfg, &image_out, db_img) {
+        let legacy_img = r.anh_tham_chieu.trim().to_lowercase();
+        let same_image = img_counts.get(&legacy_img).copied().unwrap_or(0);
+        if let Some(plan) = plan_row(r, prev, cfg, &engine_cfg, &image_out, db_img, same_image) {
             planned_rows.push_back((r.clone(), plan));
         }
     }
@@ -1814,23 +1929,14 @@ pub fn run_with_emitter_and_hook(
         }
     }
 
-    emit(
-        emitter,
-        "run_finished",
-        &RunFinishedEvent {
-            run_id,
-            status: final_status.into(),
-            done_count: final_done,
-            error_count: final_errors,
-            duration_ms: run_start.elapsed().as_millis() as i64,
-        },
-    );
-
+    let duration_ms = run_start.elapsed().as_millis() as i64;
     Ok(EngineOutcome {
         run_id,
+        status: final_status.into(),
         done: final_done,
         errors: final_errors,
         stopped: was_stopped,
+        duration_ms,
     })
 }
 
@@ -1911,7 +2017,7 @@ fn run_b2(
             Ok(res) => break res.png_bytes,
             Err(fail) => {
                 let transient = is_transient_error(&fail);
-                let total_attempts = record_attempt(
+                let _ = record_attempt(
                     ctx.conn,
                     ctx.job_id,
                     AttemptRecord {
@@ -1927,7 +2033,7 @@ fn run_b2(
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if local_try >= max_attempts as u32 || total_attempts >= max_attempts {
+                        if local_try >= max_attempts as u32 {
                             return Err(fail);
                         }
                         let wait = compute_retry_wait_s(ctx.cfg, local_try, retry_after_s);
@@ -1945,14 +2051,10 @@ fn run_b2(
         }
     };
 
-    let img_name = crate::prompts_csv::row_key_image_name(&row_key);
-    let stem = Path::new(img_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "anh".into());
-    let ver = next_version(ctx.conn, ctx.image_out, &row_key, "anh");
-    let file_name = versioned_file_name(&stem, ver, "png");
-    let dest = ctx.image_out.join(&file_name);
+    let reservation = reserve_next_version(ctx.conn, ctx.image_out, &row_key, "anh");
+    let ver = reservation.version;
+    let file_name = reservation.file_name.clone();
+    let dest = reservation.dest.clone();
     write_atomic(&dest, &bytes).map_err(|e| ApiFail {
         kind: ApiFailKind::NghiepVu,
         http_status: None,
@@ -1969,17 +2071,6 @@ fn run_b2(
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu ảnh: {e}"),
     })?;
-    let prev_img = row.anh_da_tao.trim();
-    if !prev_img.is_empty() {
-        let _ = tx.execute(
-            "UPDATE file_refs
-             SET row_key = ?1
-             WHERE LOWER(row_key) IN (
-                 SELECT LOWER(row_key) FROM file_refs WHERE LOWER(file_name) = LOWER(?2)
-             )",
-            rusqlite::params![row_key, prev_img],
-        );
-    }
     tx.execute(
         "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'anh'",
         rusqlite::params![row_key, ctx.job_id],
@@ -2001,6 +2092,36 @@ fn run_b2(
         code: "DB_TX_FAIL".into(),
         message: format!("{e}"),
     })?;
+    let new_ref_id = tx.last_insert_rowid();
+    let prev_img = row.anh_da_tao.trim();
+    if !prev_img.is_empty() {
+        let old_keys = collect_file_ref_row_keys_by_name(&tx, prev_img).map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("{e}"),
+        })?;
+        for old_rk in old_keys {
+            crate::state_db::migrate_file_refs_row_key(&tx, &old_rk, &row_key, None).map_err(
+                |e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: format!("{e}"),
+                },
+            )?;
+        }
+        tx.execute(
+            "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'anh' AND id != ?2",
+            rusqlite::params![row_key, new_ref_id],
+        )
+        .map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("{e}"),
+        })?;
+    }
     tx.execute(
         "UPDATE jobs
          SET status = 'da_tao_image', image_status = 'xong',
@@ -2020,6 +2141,7 @@ fn run_b2(
         code: "DB_TX_FAIL".into(),
         message: format!("{e}"),
     })?;
+    drop(reservation);
 
     let now_str = chrono::Local::now().format("%d/%m/%Y %H:%M").to_string();
     row.anh_da_tao = file_name.clone();
@@ -2044,6 +2166,20 @@ fn run_b2(
     }
 
     Ok(RowStatus::DaTaoImage)
+}
+
+fn collect_file_ref_row_keys_by_name(
+    tx: &Connection,
+    file_name: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt =
+        tx.prepare("SELECT DISTINCT row_key FROM file_refs WHERE LOWER(file_name) = LOWER(?1)")?;
+    let mut rows = stmt.query(rusqlite::params![file_name])?;
+    let mut keys = Vec::new();
+    while let Some(r) = rows.next()? {
+        keys.push(r.get::<_, String>(0)?);
+    }
+    Ok(keys)
 }
 
 // ━━ B3: tạo video (5.1, 13.3, 13.6) + Idempotency-Key + First-Poll Delay ━━
@@ -2104,7 +2240,7 @@ fn create_video_task_with_retry(
             }
             Err(fail) => {
                 let transient = is_transient_error(&fail);
-                let total_attempts = record_attempt(
+                let _ = record_attempt(
                     ctx.conn,
                     ctx.job_id,
                     AttemptRecord {
@@ -2120,7 +2256,7 @@ fn create_video_task_with_retry(
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if local_try >= max_attempts as u32 || total_attempts >= max_attempts {
+                        if local_try >= max_attempts as u32 {
                             return Err(fail);
                         }
                         let wait = compute_retry_wait_s(ctx.cfg, local_try, retry_after_s);
@@ -2161,14 +2297,10 @@ fn download_and_commit_video(
         "Đang tải video về video_out/".to_string(),
     );
 
-    let img_name = crate::prompts_csv::row_key_image_name(&row_key);
-    let stem = Path::new(img_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "anh".into());
-    let ver = next_version(ctx.conn, ctx.video_out, &row_key, "video");
-    let file_name = versioned_file_name(&stem, ver, "mp4");
-    let dest = ctx.video_out.join(&file_name);
+    let reservation = reserve_next_version(ctx.conn, ctx.video_out, &row_key, "video");
+    let ver = reservation.version;
+    let file_name = reservation.file_name.clone();
+    let dest = reservation.dest.clone();
 
     let dl = adapters::download_video(ctx.cfg, url, &dest, task_id, ctx.stop_flag)?;
 
@@ -2183,18 +2315,6 @@ fn download_and_commit_video(
         code: "DB_TX_FAIL".into(),
         message: format!("Lỗi mở transaction lưu video: {e}"),
     })?;
-    for fname in [row.video_da_tao.trim(), row.anh_da_tao.trim()] {
-        if !fname.is_empty() {
-            let _ = tx.execute(
-                "UPDATE file_refs
-                 SET row_key = ?1
-                 WHERE LOWER(row_key) IN (
-                     SELECT LOWER(row_key) FROM file_refs WHERE LOWER(file_name) = LOWER(?2)
-                 )",
-                rusqlite::params![row_key, fname],
-            );
-        }
-    }
     tx.execute(
         "UPDATE file_refs SET is_current = 0 WHERE (LOWER(row_key) = LOWER(?1) OR job_id = ?2) AND kind = 'video'",
         rusqlite::params![row_key, ctx.job_id],
@@ -2216,6 +2336,40 @@ fn download_and_commit_video(
         code: "DB_TX_FAIL".into(),
         message: format!("{e}"),
     })?;
+    let new_ref_id = tx.last_insert_rowid();
+    let mut migrated_any = false;
+    for fname in [row.video_da_tao.trim(), row.anh_da_tao.trim()] {
+        if !fname.is_empty() {
+            let old_keys = collect_file_ref_row_keys_by_name(&tx, fname).map_err(|e| ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("{e}"),
+            })?;
+            for old_rk in old_keys {
+                migrated_any = true;
+                crate::state_db::migrate_file_refs_row_key(&tx, &old_rk, &row_key, None)
+                    .map_err(|e| ApiFail {
+                        kind: ApiFailKind::NghiepVu,
+                        http_status: None,
+                        code: "DB_TX_FAIL".into(),
+                        message: format!("{e}"),
+                    })?;
+            }
+        }
+    }
+    if migrated_any {
+        tx.execute(
+            "UPDATE file_refs SET is_current = 0 WHERE LOWER(row_key) = LOWER(?1) AND kind = 'video' AND id != ?2",
+            rusqlite::params![row_key, new_ref_id],
+        )
+        .map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("{e}"),
+        })?;
+    }
     tx.execute(
         "UPDATE jobs
          SET status = 'da_tao_video', image_status = 'xong', video_status = 'xong',
@@ -2235,6 +2389,7 @@ fn download_and_commit_video(
         code: "DB_TX_FAIL".into(),
         message: format!("{e}"),
     })?;
+    drop(reservation);
 
     let now_str = chrono::Local::now().format("%d/%m/%Y %H:%M").to_string();
     row.video_da_tao = file_name.clone();
@@ -3134,7 +3289,7 @@ fn run_b3(
                     message: format!("Endpoint báo task lỗi: {message}"),
                 };
                 let transient = is_transient_error(&fail);
-                let total_attempts = record_attempt(
+                let _ = record_attempt(
                     ctx.conn,
                     ctx.job_id,
                     AttemptRecord {
@@ -3151,7 +3306,7 @@ fn run_b3(
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
                         local_transient_try += 1;
-                        if local_transient_try >= max_attempts as u32 || total_attempts >= max_attempts {
+                        if local_transient_try >= max_attempts as u32 {
                             return Err(fail);
                         }
                         let wait =
@@ -3237,7 +3392,7 @@ fn run_b3(
             Err(fail) => {
                 local_transient_try += 1;
                 let transient = is_transient_error(&fail);
-                let total_attempts = record_attempt(
+                let _ = record_attempt(
                     ctx.conn,
                     ctx.job_id,
                     AttemptRecord {
@@ -3253,7 +3408,7 @@ fn run_b3(
                 match fail.kind {
                     ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return Err(fail),
                     ApiFailKind::TamThoi { retry_after_s } => {
-                        if local_transient_try >= max_attempts as u32 || total_attempts >= max_attempts {
+                        if local_transient_try >= max_attempts as u32 {
                             return Err(fail);
                         }
                         let wait =
@@ -3370,7 +3525,9 @@ pub fn dry_run(project_path: &Path, cfg: &Settings) -> AppResult<DryRunResult> {
                 }
             }
         }
-        if plan_row(&r_eff, prev, cfg, &default_engine_cfg, &image_out, db_img).is_some() {
+        let legacy_img = r.anh_tham_chieu.trim().to_lowercase();
+        let same_image = img_counts.get(&legacy_img).copied().unwrap_or(0);
+        if plan_row(&r_eff, prev, cfg, &default_engine_cfg, &image_out, db_img, same_image).is_some() {
             let eff_label = effective_status_label(&r_eff, prev);
             let group_label = if eff_label == "Đã tạo video" && is_prompt_modified(&r_eff, prev) {
                 "Đã sửa prompt (chạy lại)"
@@ -3460,17 +3617,17 @@ mod tests {
             video_download_url: None,
         };
 
-        assert!(plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png")).is_none());
+        assert!(plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png"), 1).is_none());
 
         row.promt_tao_video = "prompt video MOI".into();
-        let p_vid = plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png")).unwrap();
+        let p_vid = plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png"), 1).unwrap();
         assert_eq!(p_vid.steps, vec![Step::B3]);
         assert!(!p_vid.force_new_image);
         assert!(p_vid.force_new_video);
         assert_eq!(p_vid.carried_attempts, 0);
 
         row.promt_tao_image = "prompt anh MOI".into();
-        let p_img = plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png")).unwrap();
+        let p_img = plan_row(&row, Some(&prev), &cfg, &eng_cfg, &img_out, Some("hero_gen.png"), 1).unwrap();
         assert_eq!(p_img.steps, vec![Step::B2, Step::B3]);
         assert!(p_img.force_new_image);
         assert!(p_img.force_new_video);
@@ -3513,7 +3670,7 @@ mod tests {
             video_task_id: None,
             video_download_url: None,
         };
-        assert!(plan_row(&row, Some(&prev_skipped), &cfg, &single_or_batch_cfg, &img_out, None).is_none());
+        assert!(plan_row(&row, Some(&prev_skipped), &cfg, &single_or_batch_cfg, &img_out, None, 1).is_none());
 
         let prev_maxed = LatestJobInfo {
             status: "loi_tao_image".into(),
@@ -3521,7 +3678,7 @@ mod tests {
             ..prev_skipped.clone()
         };
         // Issue #6 [P0-6]: Bỏ khóa cứng, dòng 3/3 lỗi vẫn được plan để chạy lại (không bị chặn)
-        assert!(plan_row(&row, Some(&prev_maxed), &cfg, &single_or_batch_cfg, &img_out, None).is_some());
+        assert!(plan_row(&row, Some(&prev_maxed), &cfg, &single_or_batch_cfg, &img_out, None, 1).is_some());
 
         // rerun_error_rows (reset_error_attempts: true) mở khóa các dòng lỗi của lượt trước và reset carried_attempts = 0!
         let rerun_err_cfg = EngineConfig {
@@ -3530,7 +3687,7 @@ mod tests {
             force_step: None,
             reset_error_attempts: true,
         };
-        let unlocked = plan_row(&row, Some(&prev_maxed), &cfg, &rerun_err_cfg, &img_out, None)
+        let unlocked = plan_row(&row, Some(&prev_maxed), &cfg, &rerun_err_cfg, &img_out, None, 1)
             .expect("rerun_error_rows must plan error rows");
         assert_eq!(unlocked.carried_attempts, 0);
 
@@ -4364,7 +4521,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = plan_row(&row, None, &cfg, &eng_cfg, &img_out, Some("valid_gen.png"))
+        let plan = plan_row(&row, None, &cfg, &eng_cfg, &img_out, Some("valid_gen.png"), 1)
             .expect("must plan B3 for LoiTamThoi with valid image");
         assert_eq!(plan.steps, vec![Step::B3]);
         assert!(!plan.force_new_image);
@@ -4707,21 +4864,21 @@ mod tests {
         assert!(key1.starts_with("shared_product.png#"));
         assert!(key2.starts_with("shared_product.png#"));
 
-        // 1. Kiểm chứng lỗi chạy chùm (buggy legacy behavior):
-        // Nếu truyền `row.anh_tham_chieu` vào `row_keys`, CẢ HAI dòng đều bị khớp
-        let cfg_buggy = EngineConfig {
+        // 1. Khi same_image = 2 (nhiều dòng dùng chung ảnh), truyền tên ảnh trần (`row.anh_tham_chieu`)
+        // KHÔNG còn khớp nhầm sang các dòng anh em (triệt tiêu lỗi chạy chùm).
+        let cfg_bare_image = EngineConfig {
             kind: "lam_lai",
             row_keys: vec![row1.anh_tham_chieu.clone()],
             force_step: Some(Step::B3),
             reset_error_attempts: false,
         };
         assert!(
-            plan_row(&row1, None, &cfg, &cfg_buggy, &img_out, None).is_some(),
-            "Buggy config: row 1 matches"
+            plan_row(&row1, None, &cfg, &cfg_bare_image, &img_out, None, 2).is_none(),
+            "same_image=2 must block bare image matching on row 1"
         );
         assert!(
-            plan_row(&row2, None, &cfg, &cfg_buggy, &img_out, None).is_some(),
-            "Buggy config: row 2 also matches because row_keys had unhashed image name (chạy chùm!)"
+            plan_row(&row2, None, &cfg, &cfg_bare_image, &img_out, None, 2).is_none(),
+            "same_image=2 must block bare image matching on row 2"
         );
 
         // 2. Kiểm chứng sau khi sửa: rerun_row_step truyền `key_of_row` (chứa hash)
@@ -4733,14 +4890,14 @@ mod tests {
             reset_error_attempts: false,
         };
 
-        let plan1_b3 = plan_row(&row1, None, &cfg, &cfg_isolated_b3, &img_out, None);
+        let plan1_b3 = plan_row(&row1, None, &cfg, &cfg_isolated_b3, &img_out, None, 2);
         assert!(plan1_b3.is_some(), "Dòng 1 được chọn chính xác");
         let p1 = plan1_b3.unwrap();
         assert_eq!(p1.steps, vec![Step::B3]);
         assert!(!p1.force_new_image);
         assert!(p1.force_new_video);
 
-        let plan2_b3 = plan_row(&row2, None, &cfg, &cfg_isolated_b3, &img_out, None);
+        let plan2_b3 = plan_row(&row2, None, &cfg, &cfg_isolated_b3, &img_out, None, 2);
         assert!(
             plan2_b3.is_none(),
             "Dòng 2 KHÔNG được chạy khi người dùng bấm chạy lại dòng 1 (đã triệt tiêu lỗi chạy chùm!)"
@@ -4754,14 +4911,14 @@ mod tests {
             reset_error_attempts: false,
         };
 
-        let plan1_b2 = plan_row(&row1, None, &cfg, &cfg_isolated_b2, &img_out, None);
+        let plan1_b2 = plan_row(&row1, None, &cfg, &cfg_isolated_b2, &img_out, None, 2);
         assert!(plan1_b2.is_some(), "Dòng 1 được chọn chạy B2+B3");
         let p1_b2 = plan1_b2.unwrap();
         assert_eq!(p1_b2.steps, vec![Step::B2, Step::B3]);
         assert!(p1_b2.force_new_image);
         assert!(p1_b2.force_new_video);
 
-        let plan2_b2 = plan_row(&row2, None, &cfg, &cfg_isolated_b2, &img_out, None);
+        let plan2_b2 = plan_row(&row2, None, &cfg, &cfg_isolated_b2, &img_out, None, 2);
         assert!(
             plan2_b2.is_none(),
             "Dòng 2 KHÔNG được chạy khi người dùng bấm chạy lại B2 dòng 1"
@@ -4776,10 +4933,10 @@ mod tests {
         };
 
         assert!(
-            plan_row(&row1, None, &cfg, &cfg_target_row2, &img_out, None).is_none(),
+            plan_row(&row1, None, &cfg, &cfg_target_row2, &img_out, None, 2).is_none(),
             "Dòng 1 KHÔNG được chạy khi mục tiêu là dòng 2"
         );
-        let plan2 = plan_row(&row2, None, &cfg, &cfg_target_row2, &img_out, None);
+        let plan2 = plan_row(&row2, None, &cfg, &cfg_target_row2, &img_out, None, 2);
         assert!(plan2.is_some(), "Dòng 2 được chọn chính xác");
         assert_eq!(plan2.unwrap().steps, vec![Step::B3]);
 
@@ -4787,7 +4944,7 @@ mod tests {
         let all_rows = [row1.clone(), row2.clone()];
         let planned_for_key1: Vec<_> = all_rows
             .iter()
-            .filter_map(|r| plan_row(r, None, &cfg, &cfg_isolated_b3, &img_out, None))
+            .filter_map(|r| plan_row(r, None, &cfg, &cfg_isolated_b3, &img_out, None, 2))
             .collect();
         assert_eq!(
             planned_for_key1.len(),
@@ -4795,6 +4952,397 @@ mod tests {
             "Chỉ duy nhất 1 dòng được lên lịch thực thi khi rerun_row_step dùng key_of_row"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_next_version_escapes_sqlite_like_wildcards() {
+        let dir = make_temp_project("next_ver_like_escape");
+        let conn = crate::state_db::open(&dir).unwrap();
+        let img_out = dir.join("image_out");
+
+        conn.execute(
+            "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-18T00:00:00Z', 2)",
+            [],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO jobs(run_id, row_key, status) VALUES (?1, 'other.png', 'da_tao_image')",
+            rusqlite::params![run_id],
+        )
+        .unwrap();
+        let j1 = conn.last_insert_rowid();
+
+        // Các file có ký tự bình thường khớp wildcard '_' / '%' nếu không escape:
+        // 'a_1' không escape sẽ khớp 'ab1_gen_v5.png'; '100%_sale' không escape sẽ khớp '100x_sale_gen_v9.png'.
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'ab1.png', 'anh', 'ab1_gen_v5.png', 'image_out/ab1_gen_v5.png', 5, 1, '2026-11-18T00:01:00Z')",
+            rusqlite::params![j1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, '100x_sale.png', 'anh', '100x_sale_gen_v9.png', 'image_out/100x_sale_gen_v9.png', 9, 1, '2026-11-18T00:02:00Z')",
+            rusqlite::params![j1],
+        )
+        .unwrap();
+
+        assert_eq!(next_version(&conn, &img_out, "a_1.png", "anh"), 1);
+        assert_eq!(next_version(&conn, &img_out, "100%_sale.png", "anh"), 1);
+
+        // Nếu thực sự có 'a_1_gen.png' (version 1) trong DB, next_version cho 'a_1.png' trả về 2
+        conn.execute(
+            "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+             VALUES (?1, 'a_1.png', 'anh', 'a_1_gen.png', 'image_out/a_1_gen.png', 1, 1, '2026-11-18T00:03:00Z')",
+            rusqlite::params![j1],
+        )
+        .unwrap();
+        assert_eq!(next_version(&conn, &img_out, "a_1.png", "anh"), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reserve_next_version_concurrent_same_stem_no_collision() {
+        let dir = make_temp_project("reserve_concurrent");
+        let img_out = dir.join("image_out");
+        let _init_conn = crate::state_db::open(&dir).unwrap();
+
+        let workers = 4usize;
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        let reserved_versions = Arc::new(parking_lot::Mutex::new(Vec::<i64>::new()));
+
+        std::thread::scope(|scope| {
+            for idx in 0..workers {
+                let dir_ref = &dir;
+                let img_ref = &img_out;
+                let barrier_ref = barrier.clone();
+                let vers_ref = reserved_versions.clone();
+                scope.spawn(move || {
+                    let conn = crate::state_db::open(dir_ref).unwrap();
+                    let rk = format!("shared_stem.png#h{idx}");
+                    barrier_ref.wait();
+                    let res = reserve_next_version(&conn, img_ref, &rk, "anh");
+                    vers_ref.lock().push(res.version);
+                    // Giữ reservation qua giai đoạn I/O mô phỏng trước khi ghi file & commit DB
+                    std::thread::sleep(Duration::from_millis(25));
+                    std::fs::write(&res.dest, format!("img-{idx}").as_bytes()).unwrap();
+                    conn.execute(
+                        "INSERT INTO file_refs(job_id, row_key, kind, file_name, file_path, version, is_current, created_at)
+                         VALUES (NULL, ?1, 'anh', ?2, ?3, ?4, 1, '2026-11-18T00:00:00Z')",
+                        rusqlite::params![rk, res.file_name, format!("image_out/{}", res.file_name), res.version],
+                    )
+                    .unwrap();
+                    drop(res);
+                });
+            }
+        });
+
+        let mut got = reserved_versions.lock().clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4], "concurrent workers sharing same stem must get distinct versions");
+
+        // Kiểm tra Drop của VersionReservation nhả reservation khi không ghi đĩa/DB (nhánh lỗi)
+        let conn = crate::state_db::open(&dir).unwrap();
+        let aborted = reserve_next_version(&conn, &img_out, "shared_stem.png#abort", "anh");
+        assert_eq!(aborted.version, 5);
+        drop(aborted);
+        let retried = reserve_next_version(&conn, &img_out, "shared_stem.png#retry", "anh");
+        assert_eq!(retried.version, 5, "dropped reservation must release version 5 for reuse");
+        drop(retried);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_e2e_transient_retries_not_starved_when_carried_attempts_at_max() {
+        let dir = make_temp_project("e2e_transient_not_starved");
+        std::fs::write(dir.join("input").join("cup.png"), sample_png_bytes(15, 25, 35)).unwrap();
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[Row {
+                row_no: 2,
+                anh_tham_chieu: "cup.png".into(),
+                promt_tao_image: "cup img prompt".into(),
+                promt_tao_video: "cup vid prompt".into(),
+                trang_thai: "Đang chờ".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        // Pre-seed job với carried_attempts = 3 == max_attempts = 3
+        let cup_key = crate::prompts_csv::row_key_of("cup.png", "cup img prompt", "cup vid prompt");
+        {
+            let conn = crate::state_db::open(&dir).unwrap();
+            conn.execute(
+                "INSERT INTO runs(kind, status, started_at, total_rows) VALUES ('chung', 'hoan_tat', '2026-11-18T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+            let rid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status, image_prompt_hash, video_prompt_hash, attempts_count)
+                 VALUES (?1, ?2, 2, 'loi_tao_image', 'loi', 'chua_chay', ?3, ?4, 3)",
+                rusqlite::params![rid, cup_key, sha2hex("cup img prompt"), sha2hex("cup vid prompt")],
+            )
+            .unwrap();
+        }
+
+        let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"CUPV"))
+        });
+
+        let img_calls = Arc::new(AtomicUsize::new(0));
+        let vid_calls = Arc::new(AtomicUsize::new(0));
+        let img_calls_ref = img_calls.clone();
+        let vid_calls_ref = vid_calls.clone();
+
+        let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/images/edits" {
+                let n = img_calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= 2 {
+                    return RawHttpResp::json(502, "Bad Gateway", serde_json::json!({ "error": "transient b2" }));
+                }
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(10, 120, 220) }] }),
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/videos" {
+                let n = vid_calls_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= 2 {
+                    return RawHttpResp::json(502, "Bad Gateway", serde_json::json!({ "error": "transient b3" }));
+                }
+                return RawHttpResp::json(201, "Created", serde_json::json!({ "id": "task_cup_1" }));
+            }
+            if req.method == "GET" && req.path == "/v1/videos/task_cup_1" {
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "video_url": format!("http://127.0.0.1:{port_b}/cup.mp4")
+                    }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port_a}/v1");
+        adapters::register_test_api_key(&api_base, "sk-transient-test");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            max_attempts: 3,
+            backoff_s: [1, 1, 1],
+            poll_interval_s: 1,
+            poll_max_s: 20,
+            ..Settings::default()
+        };
+        let noop_emit = |_name: &str, _val: serde_json::Value| {};
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let eng_cfg = EngineConfig {
+            kind: "chung",
+            row_keys: Vec::new(),
+            force_step: None,
+            reset_error_attempts: false,
+        };
+
+        let out = run_with_emitter(&noop_emit, &cfg, &dir, eng_cfg, &stop_flag)
+            .expect("transient retries must not be starved when carried_attempts == max_attempts");
+        assert_eq!(out.done, 1);
+        assert_eq!(out.errors, 0);
+        assert_eq!(img_calls.load(Ordering::SeqCst), 3, "B2 must retry twice and succeed on 3rd try");
+        assert_eq!(vid_calls.load(Ordering::SeqCst), 3, "B3 must retry twice and succeed on 3rd try");
+        assert!(dir.join("image_out").join("cup_gen.png").is_file());
+        assert!(dir.join("video_out").join("cup_gen.mp4").is_file());
+
+        stop_a.store(true, Ordering::SeqCst);
+        stop_b.store(true, Ordering::SeqCst);
+        let _ = join_a.join();
+        let _ = join_b.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plan_row_legacy_key_same_image_and_empty_img_prompt_b3_resume() {
+        let dir = make_temp_project("plan_row_m7");
+        let img_out = dir.join("image_out");
+        let cfg = Settings::default();
+
+        let empty_img_row = Row {
+            row_no: 2,
+            anh_tham_chieu: "shared.png".into(),
+            promt_tao_image: "   ".into(),
+            promt_tao_video: "animate shared".into(),
+            anh_da_tao: "".into(),
+            trang_thai: "Lỗi tạm thời".into(),
+            ..Default::default()
+        };
+
+        // 1. same_image == 2 chặn bare image key, same_image == 1 cho phép, và khớp theo prev.row_key luôn hoạt động
+        let bare_cfg = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec!["shared.png".into()],
+            force_step: None,
+            reset_error_attempts: false,
+        };
+        assert!(plan_row(&empty_img_row, None, &cfg, &bare_cfg, &img_out, None, 2).is_none());
+        assert!(plan_row(&empty_img_row, None, &cfg, &bare_cfg, &img_out, None, 1).is_some());
+
+        let prev_resume = LatestJobInfo {
+            id: 10,
+            row_key: "shared.png#oldhash".into(),
+            status: "loi_tam_thoi".into(),
+            image_status: "xong".into(),
+            video_status: "loi".into(),
+            image_prompt_hash: Some(sha2hex("")),
+            video_prompt_hash: Some(sha2hex("animate shared")),
+            attempts_count: 1,
+            last_error: Some("502".into()),
+            video_task_id: Some("task_resume_99".into()),
+            video_download_url: Some("https://cdn.example.com/resumed.mp4".into()),
+        };
+
+        let prev_key_cfg = EngineConfig {
+            kind: "lam_lai",
+            row_keys: vec!["shared.png#oldhash".into()],
+            force_step: None,
+            reset_error_attempts: false,
+        };
+        let plan_resume = plan_row(
+            &empty_img_row,
+            Some(&prev_resume),
+            &cfg,
+            &prev_key_cfg,
+            &img_out,
+            None,
+            2,
+        )
+        .expect("empty promt_tao_image + LoiTamThoi + prev.row_key must plan B3 resume");
+        assert_eq!(plan_resume.steps, vec![Step::B3]);
+        assert_eq!(plan_resume.resume_task_id.as_deref(), Some("task_resume_99"));
+        assert_eq!(
+            plan_resume.resume_download_url.as_deref(),
+            Some("https://cdn.example.com/resumed.mp4")
+        );
+
+        // 2. Khi vid_changed với promt_tao_image rỗng và anh_da_tao rỗng -> vẫn chỉ chạy B3 (không chạy B2!)
+        let mut vid_edited_row = empty_img_row.clone();
+        vid_edited_row.promt_tao_video = "new video prompt".into();
+        let plan_vid_changed = plan_row(
+            &vid_edited_row,
+            Some(&prev_resume),
+            &cfg,
+            &EngineConfig::default(),
+            &img_out,
+            None,
+            1,
+        )
+        .expect("vid_changed with empty promt_tao_image must plan B3");
+        assert_eq!(plan_vid_changed.steps, vec![Step::B3]);
+        assert!(plan_vid_changed.force_new_video);
+        assert!(plan_vid_changed.resume_task_id.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_with_emitter_and_hook_defers_run_finished() {
+        let dir = make_temp_project("defer_run_finished");
+        std::fs::write(dir.join("input").join("solo.png"), sample_png_bytes(90, 80, 70)).unwrap();
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[Row {
+                row_no: 2,
+                anh_tham_chieu: "solo.png".into(),
+                promt_tao_image: "".into(),
+                promt_tao_video: "solo vid".into(),
+                trang_thai: "Đã tạo image".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"SOLO"))
+        });
+        let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/videos" {
+                return RawHttpResp::json(201, "Created", serde_json::json!({ "id": "task_solo" }));
+            }
+            if req.method == "GET" && req.path == "/v1/videos/task_solo" {
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "video_url": format!("http://127.0.0.1:{port_b}/solo.mp4")
+                    }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port_a}/v1");
+        adapters::register_test_api_key(&api_base, "sk-defer-test");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            poll_interval_s: 1,
+            poll_max_s: 20,
+            ..Settings::default()
+        };
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let events_ref = events.clone();
+        let emitter = move |name: &str, _val: serde_json::Value| {
+            events_ref.lock().push(name.to_string());
+        };
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let outcome = run_with_emitter_and_hook(
+            &emitter,
+            None,
+            &cfg,
+            &dir,
+            EngineConfig::default(),
+            &stop_flag,
+        )
+        .expect("run_with_emitter_and_hook must succeed");
+
+        let hook_events = events.lock().clone();
+        assert!(hook_events.iter().any(|e| e == "run_started"));
+        assert!(
+            !hook_events.iter().any(|e| e == "run_finished"),
+            "run_with_emitter_and_hook MUST NOT emit run_finished before caller clears running flag"
+        );
+        assert_eq!(outcome.status, "hoan_tat");
+        assert_eq!(outcome.done, 1);
+        assert_eq!(outcome.errors, 0);
+        assert!(!outcome.stopped);
+        assert!(outcome.duration_ms >= 0);
+
+        let payload = build_run_finished_payload(&outcome);
+        assert_eq!(payload.get("run_id").and_then(|v| v.as_i64()), Some(outcome.run_id));
+        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("hoan_tat"));
+        assert_eq!(payload.get("done_count").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(payload.get("error_count").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            payload.get("duration_ms").and_then(|v| v.as_i64()),
+            Some(outcome.duration_ms)
+        );
+
+        stop_a.store(true, Ordering::SeqCst);
+        stop_b.store(true, Ordering::SeqCst);
+        let _ = join_a.join();
+        let _ = join_b.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

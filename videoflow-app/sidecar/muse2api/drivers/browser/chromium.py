@@ -7,6 +7,7 @@ import contextlib
 import logging
 import os
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 
@@ -38,6 +39,18 @@ def find_chromium(configured: str = "") -> str:
     raise FileNotFoundError(
         "Chromium/Chrome not found; install it or set MUSE2API_CHROMIUM_PATH"
     )
+
+
+def _is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _build_wmi_filter(profile_dir: Path, port: int | None = None) -> str:
@@ -112,11 +125,7 @@ class ChromiumProcess:
             return None
 
     async def start(self) -> str:
-        """Start (or attach to an already running) Chromium; return the browser ws URL."""
-        if url := await self.browser_ws_url():
-            log.info("attached to existing Chromium on port %s", self.port)
-            return url
-
+        """Start a new Chromium process for this profile; return the browser ws URL."""
         # A stale Edge/Chrome still holding this profile makes the new launch hand
         # off and exit before opening the DevTools port — reap it, then retry.
         # Attempt 3 wipes the profile directory outright: it only holds the browser
@@ -125,6 +134,15 @@ class ChromiumProcess:
             killed = await asyncio.to_thread(_kill_stale_browsers, self.profile_dir, self.port)
             if killed:
                 await asyncio.sleep(1.5)
+            if await asyncio.to_thread(_is_port_in_use, self.port):
+                new_port = _find_free_port()
+                log.warning(
+                    "CDP port %d is still occupied by another process after stale cleanup; "
+                    "re-allocating port %d",
+                    self.port,
+                    new_port,
+                )
+                self.port = new_port
             if attempt == 3:
                 log.warning("resetting browser profile %s after repeated CDP failures",
                             self.profile_dir)
@@ -158,24 +176,24 @@ class ChromiumProcess:
             "--window-size=1440,2200",
             "about:blank",
         ]
-        if self.proxy:
-            if needs_proxy_relay(self.proxy):
-                if self._proxy_relay is not None:
-                    await self._proxy_relay.stop()
-                self._proxy_relay = LocalProxyRelay(self.proxy)
-                effective_proxy = await self._proxy_relay.start()
-            else:
-                effective_proxy = self.proxy
-            args.insert(1, f"--proxy-server={effective_proxy}")
-        if self.headless:
-            args[1:1] = ["--headless=new", "--disable-gpu"]
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            args.insert(1, "--no-sandbox")
-
-        log.info("launching Chromium: %s (profile=%s)", self.executable, self.profile_dir)
-        # Keep stderr isolated per profile so concurrent account launches never collide on Windows.
-        self._stderr_path = self.profile_dir / "chromium-stderr.log"
         try:
+            if self.proxy:
+                if needs_proxy_relay(self.proxy):
+                    if self._proxy_relay is not None:
+                        await self._proxy_relay.stop()
+                    self._proxy_relay = LocalProxyRelay(self.proxy)
+                    effective_proxy = await self._proxy_relay.start()
+                else:
+                    effective_proxy = self.proxy
+                args.insert(1, f"--proxy-server={effective_proxy}")
+            if self.headless:
+                args[1:1] = ["--headless=new", "--disable-gpu"]
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                args.insert(1, "--no-sandbox")
+
+            log.info("launching Chromium: %s (profile=%s)", self.executable, self.profile_dir)
+            # Keep stderr isolated per profile so concurrent account launches never collide on Windows.
+            self._stderr_path = self.profile_dir / "chromium-stderr.log"
             stderr_sink = open(self._stderr_path, "wb")
             try:
                 self.proc = await asyncio.create_subprocess_exec(
@@ -183,23 +201,22 @@ class ChromiumProcess:
                 )
             finally:
                 stderr_sink.close()
-        except Exception:
-            if self._proxy_relay is not None:
-                await self._proxy_relay.stop()
-                self._proxy_relay = None
+
+            for _ in range(120):  # 60s: cold start on Windows + AV scanning can be slow
+                if self.proc.returncode is not None:
+                    tail = ""
+                    with contextlib.suppress(OSError):
+                        tail = self._stderr_path.read_text(encoding="utf-8", errors="replace")[-800:]
+                    log.warning("Chromium exited early with code %s; stderr: %s",
+                                self.proc.returncode, tail or "(empty)")
+                    break
+                if url := await self.browser_ws_url():
+                    return url
+                await asyncio.sleep(0.5)
+            return None
+        except BaseException:
+            await self.stop()
             raise
-        for _ in range(120):  # 60s: cold start on Windows + AV scanning can be slow
-            if url := await self.browser_ws_url():
-                return url
-            if self.proc.returncode is not None:
-                tail = ""
-                with contextlib.suppress(OSError):
-                    tail = self._stderr_path.read_text(encoding="utf-8", errors="replace")[-800:]
-                log.warning("Chromium exited early with code %s; stderr: %s",
-                            self.proc.returncode, tail or "(empty)")
-                break
-            await asyncio.sleep(0.5)
-        return None
 
     async def stop(self) -> None:
         if self.proc and self.proc.returncode is None:

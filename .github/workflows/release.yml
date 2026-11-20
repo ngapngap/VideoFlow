@@ -206,8 +206,11 @@ jobs:
             foreach ($i in 1..180) {
               Start-Sleep -Milliseconds 500
               if ($p.HasExited) {
-                $err = Get-Content "$dataDir\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
-                $ce = Get-Content "$dataDir\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
+                $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                $ce = if (Test-Path -LiteralPath $dataDir) {
+                  (Get-ChildItem -LiteralPath $dataDir -Filter "chromium-stderr.log" -Recurse -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { "=== $($_.FullName) ===`n" + (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) }) -join "`n"
+                } else { "" }
                 throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
               }
               try {
@@ -244,7 +247,7 @@ jobs:
             foreach ($i in 1..120) {
               Start-Sleep -Milliseconds 500
               if ($p.HasExited) {
-                $err = Get-Content "$dataDir\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
+                $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
                 throw "engine mock thoát sớm (exit $($p.ExitCode))`n$err"
               }
               try {

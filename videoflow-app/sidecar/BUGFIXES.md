@@ -3,7 +3,7 @@
 Thư mục này chứa bản sao source `muse2api` v0.4.0 (upstream: https://github.com/www222fff/muse2api)
 được đóng gói thành engine onefile `videoflow-muse.exe` (tên file dev: `videoflow-muse-x86_64-pc-windows-msvc.exe`) cho VideoFlow Desktop.
 
-Bản sao này **không giống 100% upstream** — nó có 3 bản vá lỗi bên dưới. Khi cập nhật
+Bản sao này **không giống 100% upstream** — nó gồm các bản vá lỗi bên dưới (cùng các gia cố proxy relay/SSRF/lifecycle cho VideoFlow Desktop). Khi cập nhật
 muse2api từ upstream, phải áp lại (hoặc re-apply) các vá này.
 
 ## Fix 1 — Báo đúng lỗi khi muse.ai cắt VM (workspace bị ngắt)
@@ -70,7 +70,7 @@ port DevTools không bao giờ mở → `RuntimeError: Chromium did not expose a
   người dùng hay cắt nhầm giữa `browser-profile-acc_1` và `browser-profile-acc_10`. Chờ 1.5s cho Windows nhả singleton mutex.
 - `start()`: 3 lần thử — lần 1 dọn stale + xoá lock; lần 3 **xoá hẳn profile** (cookie
   nằm ở `accounts.json` riêng, profile chỉ là cache của browser); mỗi lần chờ CDP 60s.
-- stderr của Edge giờ ghi ra `<data>/chromium-stderr.log` và **log 800 ký tự cuối khi
+- stderr của Edge giờ ghi ra `<data>/browser-profile/chromium-stderr.log` (hoặc `<data>/profiles/<account_id>/chromium-stderr.log` theo profile) và **log 800 ký tự cuối khi
   Edge thoát sớm** — trước đây nuốt vào DEVNULL nên không biết nguyên nhân.
 - Rust: `start()` tự thử lại **1 lần** (dọn orphan + chờ 1.5s) trước khi báo lỗi; thông
   báo lỗi gắn thêm dòng cuối của `chromium-stderr.log` / `engine-stderr.log` để user
@@ -136,8 +136,8 @@ Fix 3 chỉ chặn ở `POST /admin/accounts` và `/accounts/import`; `PATCH` (�
 account đã có) vẫn cho gán `hatch_sess` của account khác → hai account tranh nhau cookie
 rotation và cùng chết. Nay PATCH kiểm tra cùng logic, có cờ `?allow_duplicate_session=true`.
 
-**Test:** `tests/test_engine_fixes.py` (pytest, chạy trong CI) — 19 test phủ quota
-enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `UpstreamVmDisabled`.
+**Test:** `tests/test_engine_fixes.py` (pytest, chạy trong CI) — 27 test phủ quota
+enforcement, parse `resets_at`/`extra_left`, trùng session ở POST/PATCH, `UpstreamVmDisabled` và prewarm.
 
 ## Build & phát hành
 

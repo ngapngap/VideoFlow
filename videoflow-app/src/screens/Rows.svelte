@@ -31,6 +31,7 @@
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
+  import { createSeqGuard } from "../lib/asyncGuard";
 
   const filterChips: { key: string; label: string }[] = [
     { key: "Tất cả", label: "Tất cả" },
@@ -192,6 +193,8 @@
     : "";
 
   // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
+  const videoModalGuard = createSeqGuard();
+  let destroyed = false;
   let videoModalOpen = false;
   let videoModalDetail: RowDetail | null = null;
   let videoModalAbsPath: string | null = null;
@@ -297,6 +300,10 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
+    videoModalGuard.invalidate();
+    ++detailReqSeq;
+    ++loadSeq;
     if (searchTimer) clearTimeout(searchTimer);
     if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
     if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
@@ -327,6 +334,9 @@
       viewMode = resetUi.viewMode || viewMode;
       updateSelection(new Set());
       forceCloseDrawer();
+      closeVideoModal();
+      videoModalDetail = null;
+      videoModalAbsPath = null;
       brokenThumbs = {};
       if (curPath) {
         void load();
@@ -862,6 +872,9 @@
       if (detail && detail.row.row_key === keyToDelete) {
         forceCloseDrawer();
       }
+      if (videoModalDetail?.row.row_key === keyToDelete) {
+        closeVideoModal();
+      }
       const next = new Set(selected);
       next.delete(keyToDelete);
       updateSelection(next);
@@ -1102,6 +1115,7 @@
 
   function openVideoModal(d: RowDetail | null | undefined): void {
     if (!d) return;
+    videoModalGuard.invalidate();
     videoModalDetail = d;
     const sameDetail = detail?.row.row_key === d.row.row_key;
     videoModalAbsPath =
@@ -1132,15 +1146,31 @@
       openVideoModal(detail);
       return;
     }
+    const seq = videoModalGuard.next();
+    const expectedProjectPath = $project?.path ?? null;
     try {
       const d = await api.get_row_detail(rowKey);
+      if (
+        destroyed ||
+        !videoModalGuard.isCurrent(seq) ||
+        ($project?.path ?? null) !== expectedProjectPath
+      ) {
+        return;
+      }
       openVideoModal(d);
     } catch (e) {
-      showToast("error", formatApiError(e));
+      if (
+        !destroyed &&
+        videoModalGuard.isCurrent(seq) &&
+        ($project?.path ?? null) === expectedProjectPath
+      ) {
+        showToast("error", formatApiError(e));
+      }
     }
   }
 
   function closeVideoModal(): void {
+    videoModalGuard.invalidate();
     if (videoPlayerEl) {
       try {
         videoPlayerEl.pause();

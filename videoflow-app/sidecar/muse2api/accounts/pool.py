@@ -10,13 +10,14 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from ..errors import (
     NoAccountAvailable,
@@ -30,6 +31,7 @@ from .model import Account, AccountStatus
 from .store import AccountStore
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 WAKE_BLOCK_KIND = "video"
 WAKE_BLOCK_SECONDS = 600
@@ -144,6 +146,7 @@ class AccountPool:
         self._accounts: dict[str, Account] = {}
         self._inflight: dict[str, int] = defaultdict(int)
         self._cond = asyncio.Condition()
+        self._persist_lock = asyncio.Lock()
 
     def is_inflight(self, account_id: str) -> bool:
         return self._inflight.get(account_id, 0) > 0
@@ -154,13 +157,38 @@ class AccountPool:
         log.info("loaded %d account(s)", len(self._accounts))
 
     async def persist(self) -> None:
-        await self.store.save(list(self._accounts.values()))
+        lock = getattr(self, "_persist_lock", None)
+        async with (lock if lock is not None else contextlib.nullcontext()):
+            async with self._cond:
+                snapshot = [a.model_copy(deep=True) for a in self._accounts.values()]
+            await self.store.save(snapshot)
 
     def all(self) -> list[Account]:
         return list(self._accounts.values())
 
     def get(self, account_id: str) -> Account | None:
         return self._accounts.get(account_id)
+
+    async def snapshot(self, account_id: str) -> Account | None:
+        async with self._cond:
+            acc = self._accounts.get(account_id)
+            return acc.model_copy(deep=True) if acc is not None else None
+
+    async def try_update(
+        self,
+        account_id: str,
+        fn: Callable[[Account], tuple[bool, T]],
+    ) -> tuple[bool, T | None]:
+        async with self._cond:
+            acc = self._accounts.get(account_id)
+            if acc is None:
+                return False, None
+            changed, result = fn(acc)
+            if changed:
+                self._cond.notify_all()
+        if changed:
+            await self.persist()
+        return True, result
 
     async def upsert(self, account: Account) -> Account:
         async with self._cond:
@@ -172,6 +200,8 @@ class AccountPool:
     async def remove(self, account_id: str) -> bool:
         async with self._cond:
             removed = self._accounts.pop(account_id, None) is not None
+            if removed:
+                self._cond.notify_all()
         if removed:
             await self.persist()
         return removed
@@ -298,7 +328,10 @@ class AccountPool:
     async def release(self, account: Account, error: BaseException | None = None) -> None:
         async with self._cond:
             self._inflight[account.id] = max(0, self._inflight[account.id] - 1)
-            self._apply_result(account, error)
+            target = self._accounts.get(account.id, account)
+            self._apply_result(target, error)
+            if target is not account:
+                self._apply_result(account, error)
             self._cond.notify_all()
         await self.persist()
 

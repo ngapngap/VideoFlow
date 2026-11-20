@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -96,9 +97,6 @@ class Account(BaseModel):
         return data
 
 
-_PROXY_CREDS_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]+@")
-
-
 def mask_proxy_url(proxy: str | None) -> str | None:
     """Redact user:pass@ credentials from a proxy URL while keeping host:port intact."""
     if proxy is None:
@@ -106,7 +104,32 @@ def mask_proxy_url(proxy: str | None) -> str | None:
     raw = proxy.strip()
     if not raw:
         return None
-    return _PROXY_CREDS_RE.sub(r"\1***@", raw)
+    try:
+        parsed = urlsplit(raw)
+        scheme = (parsed.scheme or "").lower()
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return "***"
+    if not scheme or not host:
+        return "***"
+
+    authority = parsed.netloc.rpartition("@")[2]
+    if authority.startswith("["):
+        end_bracket = authority.find("]")
+        raw_host = authority[1:end_bracket] if end_bracket != -1 else host
+    else:
+        raw_host = authority.split(":", 1)[0]
+    display_host = raw_host if raw_host.lower() == host else host
+    formatted_host = f"[{display_host}]" if ":" in display_host else display_host
+    port_part = f":{port}" if port is not None else ""
+    has_creds = (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    )
+    auth_part = "***@" if has_creds else ""
+    return f"{scheme}://{auth_part}{formatted_host}{port_part}{parsed.path}"
 
 
 def _mask(value: str) -> str:

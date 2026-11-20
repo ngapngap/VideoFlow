@@ -8,7 +8,6 @@ select = ["E", "F", "W", "I", "UP", "B"]
 ignore = [
   "E501",  # line length do formatter lo
   "B008",  # FastAPI Depends() trong default arg là pattern chuẩn
-  "UP038", # isinstance tuple vs | giữ nguyên cho dễ đọc
 ]
 
 [lint.per-file-ignores]

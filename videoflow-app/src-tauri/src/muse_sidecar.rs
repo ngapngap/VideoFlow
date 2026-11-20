@@ -163,19 +163,23 @@ fn generate_api_key() -> String {
     format!("vf_{hex}")
 }
 
-/// Tìm port trống: thử port ưa thích trước (nếu khác `exclude`), bận thì xin OS một port ngẫu nhiên.
-fn find_free_port_excluding(preferred: u16, exclude: Option<u16>) -> AppResult<u16> {
-    if Some(preferred) != exclude && TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+/// Tìm port trống: thử port ưa thích trước (nếu không nằm trong `exclude`),
+/// bận thì xin OS một port ngẫu nhiên không nằm trong `exclude`.
+fn find_free_port_excluding_any(preferred: u16, exclude: &[u16]) -> AppResult<u16> {
+    if preferred > 0
+        && !exclude.contains(&preferred)
+        && TcpListener::bind(("127.0.0.1", preferred)).is_ok()
+    {
         return Ok(preferred);
     }
-    for _ in 0..16 {
+    for _ in 0..32 {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không xin được port trống: {e}")))?;
         let port = listener
             .local_addr()
             .map(|a| a.port())
             .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không đọc được port: {e}")))?;
-        if Some(port) != exclude {
+        if !exclude.contains(&port) {
             return Ok(port);
         }
     }
@@ -183,6 +187,15 @@ fn find_free_port_excluding(preferred: u16, exclude: Option<u16>) -> AppResult<u
         "MUSE_PORT_FAIL",
         "Không tìm được port trống không trùng.",
     ))
+}
+
+/// Tìm port trống: thử port ưa thích trước (nếu khác `exclude`), bận thì xin OS một port ngẫu nhiên.
+#[cfg(test)]
+fn find_free_port_excluding(preferred: u16, exclude: Option<u16>) -> AppResult<u16> {
+    match exclude {
+        Some(p) => find_free_port_excluding_any(preferred, &[p]),
+        None => find_free_port_excluding_any(preferred, &[]),
+    }
 }
 
 #[cfg(test)]
@@ -284,7 +297,7 @@ fn parse_admin_response(resp: reqwest::blocking::Response) -> AppResult<serde_js
             .unwrap_or("MUSE_ADMIN_FAIL");
         return Err(AppError::new(
             &format!("MUSE_{}", sidecar_code.to_uppercase()),
-            format!("Sidecar trả lỗi {status}: {sidecar_msg}"),
+            crate::settings::redact_secrets(&format!("Sidecar trả lỗi {status}: {sidecar_msg}")),
         ));
     }
     Ok(json)
@@ -362,6 +375,139 @@ fn start_lock() -> &'static parking_lot::Mutex<()> {
     START_LOCK.get_or_init(|| parking_lot::Mutex::new(()))
 }
 
+/// Đồng bộ cấu hình proxy từ `proxies.db` xuống sidecar vừa khởi động (best-effort, không chặn `start()`).
+fn sync_proxies_to_sidecar(port: u16, api_key: &str) {
+    let conn = match crate::proxies::open_db() {
+        Ok(c) => c,
+        Err(e) => {
+            log_info(&format!(
+                "Bỏ qua đồng bộ proxy khi khởi động sidecar (không mở được proxies.db): {}",
+                e.message
+            ));
+            return;
+        }
+    };
+    sync_proxies_to_sidecar_with_conn(port, api_key, &conn);
+}
+
+/// Đồng bộ proxy từ kết nối `proxies.db` cho sẵn xuống sidecar qua `/admin/accounts`.
+/// - Luôn gửi URL đầy đủ cho account được gán (xử lý cả trường hợp chỉ đổi password/username khi sidecar dừng).
+/// - Xóa proxy trên sidecar (`{"proxy": ""}`) nếu account không còn được gán/proxy đã xóa.
+/// - Bỏ qua account đang `busy == true`, hoặc log và tiếp tục nếu gặp lỗi từng account (vd HTTP 409 AccountBusy).
+pub(crate) fn sync_proxies_to_sidecar_with_conn(
+    port: u16,
+    api_key: &str,
+    conn: &rusqlite::Connection,
+) {
+    let acc_to_proxy = match crate::proxies::load_account_to_proxy_map(conn) {
+        Ok(m) => m,
+        Err(e) => {
+            log_info(&format!(
+                "Bỏ qua đồng bộ proxy khi khởi động sidecar (đọc account_proxies lỗi): {}",
+                e.message
+            ));
+            return;
+        }
+    };
+    let proxy_urls_map = match crate::proxies::resolve_proxy_urls_map_in(conn) {
+        Ok(m) => m,
+        Err(e) => {
+            log_info(&format!(
+                "Bỏ qua đồng bộ proxy khi khởi động sidecar (resolve proxy URL lỗi): {}",
+                e.message
+            ));
+            return;
+        }
+    };
+
+    let res = match admin_get(port, api_key, "/admin/accounts") {
+        Ok(v) => v,
+        Err(e) => {
+            log_info(&format!(
+                "Bỏ qua đồng bộ proxy khi khởi động sidecar (GET /admin/accounts lỗi): {}",
+                e.message
+            ));
+            return;
+        }
+    };
+
+    let Some(accounts) = res.get("data").and_then(|d| d.as_array()) else {
+        return;
+    };
+
+    for obj in accounts {
+        let Some(acc_id) = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let safe_id = match crate::adapters::sanitize_url_segment(acc_id, false) {
+            Ok(s) => s,
+            Err(e) => {
+                log_info(&format!(
+                    "Bỏ qua đồng bộ proxy cho account id không hợp lệ '{acc_id}': {}",
+                    e.message
+                ));
+                continue;
+            }
+        };
+
+        let is_busy = obj.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+        let current_masked = obj
+            .get("proxy")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let desired_url = acc_to_proxy
+            .get(acc_id)
+            .and_then(|pid| proxy_urls_map.get(pid));
+
+        if let Some(full_url) = desired_url {
+            if is_busy {
+                log_info(&format!(
+                    "Cảnh báo: account '{acc_id}' đang bận khi khởi động sidecar — bỏ qua đồng bộ proxy."
+                ));
+                continue;
+            }
+            if let Err(e) = admin_send(
+                port,
+                api_key,
+                "PATCH",
+                &format!("/admin/accounts/{safe_id}"),
+                Some(&serde_json::json!({ "proxy": full_url })),
+            ) {
+                log_info(&format!(
+                    "Cảnh báo: không đồng bộ được proxy cho account '{acc_id}' khi khởi động ({}): {}",
+                    e.code, e.message
+                ));
+            }
+        } else if current_masked.is_some() {
+            if is_busy {
+                log_info(&format!(
+                    "Cảnh báo: account '{acc_id}' đang bận khi khởi động sidecar — bỏ qua xóa proxy cũ."
+                ));
+                continue;
+            }
+            if let Err(e) = admin_send(
+                port,
+                api_key,
+                "PATCH",
+                &format!("/admin/accounts/{safe_id}"),
+                Some(&serde_json::json!({ "proxy": "" })),
+            ) {
+                log_info(&format!(
+                    "Cảnh báo: không xóa được proxy cũ cho account '{acc_id}' khi khởi động ({}): {}",
+                    e.code, e.message
+                ));
+            }
+        }
+    }
+}
+
 /// Khởi động sidecar với driver browser; chờ /healthz sẵn sàng.
 /// Cold start gồm PyInstaller onefile giải nén + khởi động Edge + CDP (~30-60s) nên
 /// deadline là 90 giây; quá hạn thì kill luôn process con để không để lại engine mồ côi.
@@ -380,8 +526,6 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     kill_orphan_sidecars();
     kill_orphan_edges(&data_dir);
 
-    let port = find_free_port_excluding(cfg.muse_sidecar_port, None)?;
-    let cdp_port = find_free_port_excluding(19210, Some(port))?;
     let api_key = generate_api_key();
     crate::settings::register_secret_for_redaction(&api_key);
 
@@ -389,9 +533,10 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     let stdout_path = data_dir.join("engine-stdout.log");
     let stderr_path = data_dir.join("engine-stderr.log");
 
-    // Hai lần thử: engine chết ngay (exit code 3) hầu như luôn do Edge kẹt profile.
-    // Lần 2 spawn mới sau khi dọn orphan + xoá state khoá, không cần user bấm lại.
+    // Hai lần thử: engine chết ngay (exit code 3) hầu như luôn do Edge kẹt profile hoặc tranh port.
+    // Lần 2 spawn mới với port mới sau khi dọn orphan, không cần user bấm lại.
     let mut last_err: Option<AppError> = None;
+    let mut failed_ports: Vec<u16> = Vec::new();
     for attempt in 1..=2 {
         if attempt == 2 {
             log_info("engine thoát ngay lần 1 — dọn Edge mồ côi và profile rồi thử lại");
@@ -399,6 +544,11 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
             kill_orphan_edges(&data_dir);
             std::thread::sleep(Duration::from_millis(1500));
         }
+
+        let port = find_free_port_excluding_any(cfg.muse_sidecar_port, &failed_ports)?;
+        let mut cdp_exclude = failed_ports.clone();
+        cdp_exclude.push(port);
+        let cdp_port = find_free_port_excluding_any(19210, &cdp_exclude)?;
 
         let stdout_file = open_sidecar_log_file(&stdout_path, "stdout")?;
         let stderr_file = open_sidecar_log_file(&stderr_path, "stderr")?;
@@ -425,6 +575,8 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                failed_ports.push(port);
+                failed_ports.push(cdp_port);
                 last_err = Some(AppError::new(
                     "MUSE_SIDECAR_FAIL",
                     format!("Không chạy được engine: {e}"),
@@ -434,6 +586,8 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
         };
         match wait_health(port, &mut child, 90) {
             Ok(()) => {
+                // Đồng bộ proxy TRƯỚC khi công bố SidecarHandle để ensure_running() không chạy trước proxy sync.
+                sync_proxies_to_sidecar(port, &api_key);
                 *sidecar_cell().write() = Some(SidecarHandle {
                     child,
                     port,
@@ -452,6 +606,8 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
             Err(e) => {
                 // Engine không lên được: kill cây process để không để lại engine mồ côi.
                 kill_child_tree(&mut child);
+                failed_ports.push(port);
+                failed_ports.push(cdp_port);
                 last_err = Some(e.with_engine_hint(&data_dir));
             }
         }
@@ -461,34 +617,101 @@ pub fn start(cfg: &Settings) -> AppResult<SidecarStatus> {
     }))
 }
 
-/// Gắn thêm 2 dòng cuối log engine để thông báo lỗi có nội dung thật (thay vì chỉ
-/// "exit code 3") — người dùng thấy ngay nguyên nhân thay vì phải tự mở file log.
+/// Gắn thêm các dòng lỗi cuối từ log engine & Chromium để thông báo lỗi có nội dung thật
+/// (thay vì chỉ "exit code 3") — người dùng thấy ngay nguyên nhân thay vì phải tự mở file log.
 trait EngineErrorHint {
     fn with_engine_hint(self, data_dir: &std::path::Path) -> AppError;
+}
+
+fn read_tail_lossy(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let seeked = len > max_bytes;
+    if seeked {
+        file.seek(SeekFrom::End(-(max_bytes as i64)))?;
+    }
+    let mut buf = Vec::with_capacity(len.min(max_bytes) as usize);
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if seeked {
+        if let Some(pos) = text.find('\n') {
+            return Ok(text[pos + 1..].to_string());
+        }
+    }
+    Ok(text)
+}
+
+fn extract_interesting_stderr_line(path: &std::path::Path) -> Option<String> {
+    const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024;
+    let text = read_tail_lossy(path, MAX_LOG_TAIL_BYTES).ok()?;
+    text.lines()
+        .filter(|l| {
+            let low = l.to_lowercase();
+            low.contains("error")
+                || low.contains("exited early")
+                || low.contains("runtimeerror")
+                || low.contains("devtools")
+        })
+        .rfind(|l| !l.trim().is_empty())
+        .map(|last| last.trim().chars().take(300).collect::<String>())
+}
+
+fn read_engine_error_hint(data_dir: &std::path::Path) -> Vec<String> {
+    const MAX_PROFILE_ENTRIES: usize = 64;
+    const MAX_PROFILE_LOGS: usize = 2;
+
+    let mut candidates: Vec<(String, PathBuf)> = vec![
+        (
+            "browser-profile/chromium-stderr.log".to_string(),
+            data_dir.join("browser-profile").join("chromium-stderr.log"),
+        ),
+        (
+            "chromium-stderr.log".to_string(),
+            data_dir.join("chromium-stderr.log"),
+        ),
+    ];
+
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("profiles")) {
+        let mut profile_logs: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+        for entry in entries.take(MAX_PROFILE_ENTRIES).flatten() {
+            let log_path = entry.path().join("chromium-stderr.log");
+            if let Ok(meta) = std::fs::metadata(&log_path) {
+                if meta.is_file() {
+                    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    let dir_name = entry.file_name().to_string_lossy().into_owned();
+                    profile_logs.push((
+                        modified,
+                        format!("profiles/{dir_name}/chromium-stderr.log"),
+                        log_path,
+                    ));
+                }
+            }
+        }
+        profile_logs.sort_by_key(|a| std::cmp::Reverse(a.0));
+        for (_, label, path) in profile_logs.into_iter().take(MAX_PROFILE_LOGS) {
+            candidates.push((label, path));
+        }
+    }
+
+    candidates.push((
+        "engine-stderr.log".to_string(),
+        data_dir.join("engine-stderr.log"),
+    ));
+
+    let mut hints = Vec::new();
+    for (label, path) in candidates {
+        if let Some(line) = extract_interesting_stderr_line(&path) {
+            hints.push(format!("{label}: {line}"));
+        }
+    }
+    hints
 }
 
 impl EngineErrorHint for AppError {
     fn with_engine_hint(self, data_dir: &std::path::Path) -> AppError {
         let mut parts = vec![self.message];
-        for name in ["chromium-stderr.log", "engine-stderr.log"] {
-            let path = data_dir.join(name);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let interesting: Vec<&str> = text
-                    .lines()
-                    .filter(|l| {
-                        let low = l.to_lowercase();
-                        low.contains("error")
-                            || low.contains("exited early")
-                            || low.contains("runtimeerror")
-                            || low.contains("devtools")
-                    })
-                    .filter(|l| !l.trim().is_empty())
-                    .collect();
-                if let Some(last) = interesting.last() {
-                    parts.push(format!("{name}: {}", last.trim().chars().take(300).collect::<String>()));
-                }
-            }
-        }
+        parts.extend(read_engine_error_hint(data_dir));
         AppError::new(
             &self.code,
             crate::settings::redact_secrets(&parts.join(" — ")),
@@ -587,18 +810,34 @@ fn kill_child_tree(child: &mut Child) {
 }
 
 /// Dừng sidecar (taskkill /T /F để chết cả Chromium con do sidecar mở).
+/// Ngay cả khi handle trong RAM là `None` (vd sau khi sidecar tự thoát hoặc crash),
+/// vẫn dọn tiến trình sidecar/Edge mồ côi bám trên `data_dir`.
 pub fn stop() -> AppResult<()> {
+    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    stop_with(&data_dir, kill_orphan_sidecars, kill_orphan_edges)
+}
+
+fn stop_with<F1, F2>(
+    data_dir: &std::path::Path,
+    kill_sidecars: F1,
+    kill_edges: F2,
+) -> AppResult<()>
+where
+    F1: FnOnce(),
+    F2: FnOnce(&std::path::Path),
+{
     let _spawn_guard = start_lock().lock();
     let handle = sidecar_cell().write().take();
-    let Some(mut h) = handle else {
-        return Ok(());
-    };
-    kill_child_tree(&mut h.child);
-    // Crashpad/utility của Edge có thể sống sót sau taskkill /T và giữ profile —
-    // dọn luôn toàn bộ profile trong `data_dir` để lần khởi động sau không bị kẹt.
-    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
-    kill_orphan_edges(&data_dir);
-    log_info("VideoFlow Muse engine đã dừng");
+    if let Some(mut h) = handle {
+        kill_child_tree(&mut h.child);
+        kill_sidecars();
+        kill_edges(data_dir);
+        log_info("VideoFlow Muse engine đã dừng");
+    } else {
+        kill_sidecars();
+        kill_edges(data_dir);
+        log_info("VideoFlow Muse engine không có handle — đã dọn tiến trình mồ côi");
+    }
     Ok(())
 }
 
@@ -850,5 +1089,225 @@ mod tests {
             result.is_ok(),
             "start() khi sidecar_cell() đang Some bị deadlock quá 5 giây!"
         );
+    }
+
+    #[test]
+    fn sync_proxies_to_sidecar_updates_assigned_clears_unassigned_and_skips_busy() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_sync_proxies_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let db_path = tmp_dir.join("proxies.db");
+        let conn = crate::proxies::open_db_at(&db_path).expect("open temp proxies.db");
+
+        let mk_proxy = |name: &str, host: &str, port: u16, user: &str, pass: &str| {
+            let input: crate::proxies::ProxyInput = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "kind": "http",
+                "host": host,
+                "port": port,
+                "username": user,
+                "password": pass,
+                "note": null
+            }))
+            .expect("deserialize ProxyInput");
+            crate::proxies::create_proxy_in(&conn, &input).expect("create proxy")
+        };
+
+        let p1 = mk_proxy("P1", "10.0.0.1", 8080, "u1", "new_pass");
+        let p3 = mk_proxy("P3", "10.0.0.3", 8080, "u3", "p3");
+        let p4 = mk_proxy("P4", "10.0.0.4", 8080, "u4", "p4");
+        let p5 = mk_proxy("P5", "10.0.0.5", 8080, "u5", "p5");
+
+        crate::proxies::set_account_proxy_in(&conn, "acc_assigned", Some(&p1.id)).unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_busy", Some(&p3.id)).unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_409", Some(&p4.id)).unwrap();
+        crate::proxies::set_account_proxy_in(&conn, "acc_after_409", Some(&p5.id)).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sidecar");
+        let port = listener.local_addr().unwrap().port();
+        let recorded_patches: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let patches_clone = Arc::clone(&recorded_patches);
+
+        // Expect 1 GET /admin/accounts + 4 PATCHes (acc_assigned, acc_unassigned, acc_409, acc_after_409).
+        let server = std::thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+
+                if method == "GET" && path == "/admin/accounts" {
+                    let body = serde_json::json!({
+                        "data": [
+                            { "id": "acc_assigned", "busy": false, "proxy": "http://***@10.0.0.1:8080" },
+                            { "id": "acc_unassigned", "busy": false, "proxy": "http://***@10.0.0.2:8080" },
+                            { "id": "acc_busy", "busy": true, "proxy": "http://***@10.0.0.3:8080" },
+                            { "id": "acc_409", "busy": false, "proxy": "http://***@10.0.0.4:8080" },
+                            { "id": "acc_after_409", "busy": false, "proxy": "http://***@10.0.0.5:8080" }
+                        ]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if method == "PATCH" {
+                    let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let body_json: serde_json::Value =
+                        serde_json::from_str(body_str.trim()).unwrap_or(serde_json::Value::Null);
+                    patches_clone
+                        .lock()
+                        .unwrap()
+                        .push((path.to_string(), body_json));
+
+                    let (status_line, resp_body) = if path == "/admin/accounts/acc_409" {
+                        (
+                            "409 Conflict",
+                            r#"{"error":{"code":"account_busy","message":"Account is busy"}}"#,
+                        )
+                    } else {
+                        ("200 OK", r#"{"ok":true}"#)
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        sync_proxies_to_sidecar_with_conn(port, "vf_test_sync", &conn);
+        server.join().expect("mock sidecar thread");
+
+        let patches = recorded_patches.lock().unwrap();
+        assert_eq!(patches.len(), 4, "busy account must be skipped; all 4 non-busy must be patched");
+        assert!(patches.iter().any(|(p, b)| {
+            p == "/admin/accounts/acc_assigned"
+                && b.get("proxy").and_then(|v| v.as_str()) == Some("http://u1:new_pass@10.0.0.1:8080")
+        }));
+        assert!(patches.iter().any(|(p, b)| {
+            p == "/admin/accounts/acc_unassigned"
+                && b.get("proxy").and_then(|v| v.as_str()) == Some("")
+        }));
+        assert!(!patches.iter().any(|(p, _)| p.contains("acc_busy")));
+        assert!(patches.iter().any(|(p, _)| p == "/admin/accounts/acc_409"));
+        assert!(patches.iter().any(|(p, b)| {
+            p == "/admin/accounts/acc_after_409"
+                && b.get("proxy").and_then(|v| v.as_str()) == Some("http://u5:p5@10.0.0.5:8080")
+        }));
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn engine_error_hint_scans_profile_subdirs_and_redacts() {
+        crate::settings::register_secret_for_redaction("hint_secret_tok_987");
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_hint_test_{}_{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let bp_dir = tmp_dir.join("browser-profile");
+        let acc_dir = tmp_dir.join("profiles").join("acc_1");
+        std::fs::create_dir_all(&bp_dir).unwrap();
+        std::fs::create_dir_all(&acc_dir).unwrap();
+
+        let long_pad = "x".repeat(400);
+        std::fs::write(
+            bp_dir.join("chromium-stderr.log"),
+            format!("INFO startup\nERROR: failed with Bearer hint_secret_tok_987 {long_pad}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            acc_dir.join("chromium-stderr.log"),
+            "DevTools listening failed: sk-hint_sk_123\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp_dir.join("engine-stderr.log"),
+            "RuntimeError: boom hint_secret_tok_987\n",
+        )
+        .unwrap();
+
+        let hinted = AppError::new("MUSE_SIDECAR_EXITED", "exit 3").with_engine_hint(&tmp_dir);
+        assert!(hinted.message.contains("browser-profile/chromium-stderr.log:"));
+        assert!(hinted.message.contains("profiles/acc_1/chromium-stderr.log:"));
+        assert!(hinted.message.contains("engine-stderr.log:"));
+        assert!(!hinted.message.contains("hint_secret_tok_987"));
+        assert!(!hinted.message.contains("hint_sk_123"));
+        assert!(hinted.message.contains("[REDACTED]"));
+
+        // Ensure per-file snippet is capped at 300 chars.
+        let bp_seg = hinted
+            .message
+            .split(" — ")
+            .find(|s| s.starts_with("browser-profile/chromium-stderr.log: "))
+            .expect("browser-profile hint segment");
+        let bp_body = bp_seg.trim_start_matches("browser-profile/chromium-stderr.log: ");
+        assert!(bp_body.chars().count() <= 300);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn stop_with_none_handle_runs_orphan_cleanup() {
+        let _serial = test_sidecar_guard();
+        if let Some(mut h) = sidecar_cell().write().take() {
+            let _ = h.child.kill();
+            let _ = h.child.wait();
+        }
+        let temp_data_dir = std::env::temp_dir().join("vf_stop_none_handle_test");
+        let mut sidecars_called = false;
+        let mut edges_called = false;
+        let mut seen_dir: Option<PathBuf> = None;
+
+        stop_with(
+            &temp_data_dir,
+            || {
+                sidecars_called = true;
+            },
+            |d| {
+                edges_called = true;
+                seen_dir = Some(d.to_path_buf());
+            },
+        )
+        .expect("stop_with succeeds");
+
+        assert!(sidecars_called, "kill_orphan_sidecars must run when handle is None");
+        assert!(edges_called, "kill_orphan_edges must run when handle is None");
+        assert_eq!(seen_dir.as_deref(), Some(temp_data_dir.as_path()));
+    }
+
+    #[test]
+    fn find_free_port_excluding_any_rotates_past_failed_ports() {
+        let l1 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p1 = l1.local_addr().unwrap().port();
+        drop(l1);
+
+        let l2 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let p2 = l2.local_addr().unwrap().port();
+        drop(l2);
+
+        let chosen = find_free_port_excluding_any(p1, &[p1, p2])
+            .expect("must pick a free port excluding failed ports");
+        assert!(chosen > 0);
+        assert_ne!(chosen, p1);
+        assert_ne!(chosen, p2);
     }
 }

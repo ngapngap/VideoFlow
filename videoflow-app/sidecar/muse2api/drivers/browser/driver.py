@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ...accounts.model import Account, mask_proxy_url
+from ...accounts.model import Account, AccountStatus, mask_proxy_url
 from ...config import Settings
 from ...core.prompt import followup_text
 from ...errors import (
@@ -154,15 +154,51 @@ def verify_magic_bytes(data: bytes, kind: str) -> bool:
         # WebP: 52 49 46 46 (RIFF) + WEBP at offset 8..12
         if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
             return True
+        # GIF: GIF87a / GIF89a
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return True
+        # AVIF: ISO BMFF ftyp box with avif/avis/mif1 major brand or avif/avis compatible brand
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            if data[8:12] in (b"avif", b"avis", b"mif1"):
+                return True
+            box_size = int.from_bytes(data[:4], "big")
+            compat_end = min(len(data), box_size) if box_size >= 16 else min(len(data), 64)
+            compat_end = min(compat_end, 64)
+            if any(data[i : i + 4] in (b"avif", b"avis") for i in range(16, compat_end - 3, 4)):
+                return True
         return False
     elif kind == "video":
-        # MP4: 00 00 00 ... ftyp
+        # MP4/MOV/M4V: 00 00 00 ... ftyp
         if len(data) >= 8 and data[4:8] == b"ftyp":
             return True
         if len(data) >= 12 and data.startswith(b"\x00\x00\x00") and b"ftyp" in data[:16]:
             return True
+        # WebM / Matroska (EBML header: 1A 45 DF A3)
+        if data.startswith(b"\x1a\x45\xdf\xa3"):
+            return True
         return False
     return True
+
+
+def _infer_mime_from_bytes(data: bytes, kind: str) -> str:
+    """Infer MIME type from verified magic bytes when upstream MIME is absent/generic."""
+    if kind == "image":
+        if data.startswith(b"\x89PNG"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+            return "image/webp"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return "image/avif"
+        return "image/png"
+    if kind == "video":
+        if data.startswith(b"\x1a\x45\xdf\xa3"):
+            return "video/webm"
+        return "video/mp4"
+    return "application/octet-stream"
 
 
 async def verify_and_save_download(data: bytes, kind: str) -> bytes:
@@ -170,8 +206,8 @@ async def verify_and_save_download(data: bytes, kind: str) -> bytes:
 
     1. Check 0-bytes / empty data.
     2. Write temporary .partial file.
-    3. Verify magic bytes: PNG (89 50 4E 47), JPEG (FF D8 FF), WebP (52 49 46 46), MP4 (00 00 00 ... ftyp).
-    4. For video (.mp4): run ffmpeg -v error -i file.partial -f null -
+    3. Verify magic bytes: PNG, JPEG, WebP, GIF, AVIF, MP4, WebM.
+    4. For video: run ffmpeg -v error -i file.partial -f null -
        If FFmpeg is not available, fallback to minimum size (>= 16 bytes) and valid magic bytes.
     5. If decode succeeds: atomic rename to verified file.
     6. If error: delete temporary file, raise UpstreamError to trigger automatic retry.
@@ -216,40 +252,23 @@ async def verify_and_save_download(data: bytes, kind: str) -> bytes:
                 if len(data) < 16 or not verify_magic_bytes(data, "video"):
                     raise UpstreamError("video failed fallback integrity check: file too small or invalid magic bytes") from exc
             except asyncio.TimeoutError as exc:
+                raise UpstreamError("FFmpeg decode verification timed out") from exc
+            finally:
                 if proc is not None and proc.returncode is None:
                     with contextlib.suppress(ProcessLookupError, OSError):
                         proc.kill()
                     with contextlib.suppress(Exception):
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
-                raise UpstreamError("FFmpeg decode verification timed out") from exc
 
         # Atomic rename to official verified file
         await asyncio.to_thread(partial_path.replace, verified_path)
         verified_data = await asyncio.to_thread(verified_path.read_bytes)
         return verified_data
-    except Exception:
-        if partial_path.is_file():
-            try:
-                partial_path.unlink()
-            except OSError:
-                pass
-        if verified_path.is_file():
-            try:
-                verified_path.unlink()
-            except OSError:
-                pass
-        raise
     finally:
-        if partial_path.is_file():
-            try:
-                partial_path.unlink()
-            except OSError:
-                pass
-        if verified_path.is_file():
-            try:
-                verified_path.unlink()
-            except OSError:
-                pass
+        with contextlib.suppress(OSError):
+            partial_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            verified_path.unlink(missing_ok=True)
 
 
 @dataclass
@@ -1083,6 +1102,7 @@ class BrowserDriver(MuseDriver):
         started = time.monotonic()
         emitted, last, stable, got_first = "", None, 0, False
         finished = False
+        errored = False
         try:
             while True:
                 if req.cancel and req.cancel.is_set():
@@ -1116,8 +1136,12 @@ class BrowserDriver(MuseDriver):
                         finished = True
                         return
         except CDPError as exc:
+            errored = True
             await self._close_tab(tab)
             raise UpstreamError(f"browser error: {exc}") from exc
+        except BaseException:
+            errored = True
+            raise
         finally:
             # Only a named conversation is kept: an anonymous one can never be
             # continued, so holding it would just keep the tab from counting as fresh.
@@ -1136,32 +1160,44 @@ class BrowserDriver(MuseDriver):
             else:
                 self._forget(tab)
             await self._checkin(tab)
-            self.prewarm(account)
+            if finished and not errored:
+                self.prewarm(account)
 
     # ------------------------------------------------------------ warm threads
     _WARM_REPLY_TIMEOUT = 90.0
     _WARM_RETRY_DELAY = 60.0
     _WARM_MAX_FAILED_ROUNDS = 3
 
+    @staticmethod
+    def _is_prewarm_eligible(account: Account) -> bool:
+        return (
+            account.enabled
+            and account.status == AccountStatus.ACTIVE
+            and not account.quota_exhausted()
+            and not muse.missing_session_cookies(account.cookies)
+        )
+
     def prewarm(self, account: Account) -> None:
         """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
-        if self._closed or self.settings.warm_threads <= 0:
+        if self._closed or self.settings.warm_threads <= 0 or not self._is_prewarm_eligible(account):
             return
         if self.account is None:
             existing = self._prewarm_tasks.get(account.id)
             if existing and not existing.done():
                 return
             async def _kick() -> None:
-                if self._closed:
+                if self._closed or not self._is_prewarm_eligible(account):
                     return
                 drv = await self._ensure_account_driver(account)
-                if drv._closed:
+                if drv._closed or not self._is_prewarm_eligible(account):
                     return
                 if not drv.browser_alive:
                     async with drv._recovery_lock:
                         if not drv._closed and not drv.browser_alive:
+                            if not self._is_prewarm_eligible(account):
+                                return
                             await drv.startup()
-                if not drv._closed:
+                if not drv._closed and self._is_prewarm_eligible(account):
                     drv.prewarm(account)
             self._prewarm_tasks[account.id] = asyncio.create_task(_kick())
             return
@@ -1177,24 +1213,41 @@ class BrowserDriver(MuseDriver):
         enough. A failed round (a cold page load often times out) is retried after a
         pause, up to ``_WARM_MAX_FAILED_ROUNDS`` in a row."""
         failed = 0
-        while True:
+        while not self._closed and self._is_prewarm_eligible(account):
             batch: list[_Tab] = []
-            while (tab := await self._checkout_for_warming(account, len(batch))) is not None:
-                batch.append(tab)
+            try:
+                while not self._closed and self._is_prewarm_eligible(account):
+                    tab = await self._checkout_for_warming(account, len(batch))
+                    if tab is None:
+                        break
+                    batch.append(tab)
+            except (UpstreamAuthError, UpstreamVmDisabled, UpstreamQuotaError) as exc:
+                for t in batch:
+                    await self._checkin(t)
+                log.warning("prewarm checkout aborted for %s: %s", account.id, exc)
+                return
             if not batch:
                 return
             results = await asyncio.gather(*(self._warm_one(account, t) for t in batch))
+            if any(r is None for r in results):
+                return
             if all(results):
                 failed = 0
                 continue
             failed += 1
             if failed >= self._WARM_MAX_FAILED_ROUNDS:
                 return
+            if self._closed or not self._is_prewarm_eligible(account):
+                return
             await asyncio.sleep(self._WARM_RETRY_DELAY)
 
-    async def _warm_one(self, account: Account, tab: _Tab) -> bool:
+    async def _warm_one(self, account: Account, tab: _Tab) -> bool | None:
         try:
             await self._warm_up(tab)
+        except (UpstreamAuthError, UpstreamVmDisabled, UpstreamQuotaError) as exc:
+            self._forget(tab)
+            log.warning("warming a thread for %s aborted (non-transient): %s", account.id, exc)
+            return None
         except Exception as exc:  # noqa: BLE001
             self._forget(tab)
             if isinstance(exc, CDPError):
@@ -1441,7 +1494,11 @@ class BrowserDriver(MuseDriver):
             raise UpstreamError(f"corrupt base64 data for {kind}: {exc}") from exc
 
         verified_data = await verify_and_save_download(raw_bytes, kind)
-        mime = res.get("mime") or ("video/mp4" if kind == "video" else "image/png")
+        raw_mime = (res.get("mime") or "").strip()
+        if not raw_mime or raw_mime.lower() == "application/octet-stream":
+            mime = _infer_mime_from_bytes(verified_data, kind)
+        else:
+            mime = raw_mime
         return MediaResult(data=verified_data, mime=mime, kind=kind,
                            width=att.get("w") or None, height=att.get("h") or None)
 
@@ -1473,15 +1530,93 @@ class BrowserDriver(MuseDriver):
             results.append(r)
         return results
 
+    @staticmethod
+    async def _acquire_video_lock(
+        lock: asyncio.Lock,
+        *,
+        deadline: float,
+        cancel: asyncio.Event | None,
+    ) -> None:
+        if cancel and cancel.is_set():
+            raise asyncio.CancelledError
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UpstreamTimeout("video generation timed out while waiting for account video lock")
+        acquire_task = asyncio.create_task(lock.acquire())
+        cancel_task = asyncio.create_task(cancel.wait()) if cancel is not None else None
+        wait_tasks: set[asyncio.Task[Any]] = {acquire_task}
+        if cancel_task is not None:
+            wait_tasks.add(cancel_task)
+        try:
+            done, _pending = await asyncio.wait(
+                wait_tasks,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire_task in done and not acquire_task.cancelled():
+                acquire_task.result()
+                if cancel and cancel.is_set():
+                    raise asyncio.CancelledError
+                return
+            if cancel_task is not None and cancel_task in done:
+                raise asyncio.CancelledError
+            raise UpstreamTimeout("video generation timed out while waiting for account video lock")
+        except BaseException:
+            if not acquire_task.done():
+                acquire_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await acquire_task
+            if (
+                acquire_task.done()
+                and not acquire_task.cancelled()
+                and acquire_task.exception() is None
+            ):
+                lock.release()
+            raise
+        finally:
+            if cancel_task is not None and not cancel_task.done():
+                cancel_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await cancel_task
+
+    def _check_video_account_ready(self, account: Account) -> None:
+        if self._closed:
+            raise UpstreamError("browser driver is closed")
+        if account.status == AccountStatus.VIDEO_LOCKED:
+            raise UpstreamVideoLocked(f"account '{account.id}' video generation is locked")
+        if account.status == AccountStatus.INVALID:
+            raise UpstreamAuthError(f"account '{account.id}' is invalid")
+        if not account.enabled:
+            raise UpstreamError(f"account '{account.id}' is disabled")
+        if account.quota_exhausted():
+            raise UpstreamQuotaError(f"account '{account.id}' is out of quota")
+        if account.status == AccountStatus.COOLING and not account.is_available():
+            raise UpstreamTimeout(f"account '{account.id}' is cooling down")
+        if missing := muse.missing_session_cookies(account.cookies):
+            raise UpstreamAuthError(
+                f"account '{account.id}' is missing session cookies: {', '.join(missing)}"
+            )
+
     async def generate_video(self, account: Account, req: VideoRequest) -> MediaResult:
+        if req.cancel and req.cancel.is_set():
+            raise asyncio.CancelledError
         if self.account is None:
             drv = await self._ensure_account_driver(account)
             return await drv.generate_video(account, req)
         prompt = self._media_prompt(req.prompt, "video", req.size, req.duration)
         images = [req.first_frame] if req.first_frame else []
-        async with self._video_locks.setdefault(account.id, asyncio.Lock()):
-            return await self._generate(account, prompt, images, "video", req.timeout,
+        deadline = time.monotonic() + max(0.0, req.timeout)
+        lock = self._video_locks.setdefault(account.id, asyncio.Lock())
+        await self._acquire_video_lock(lock, deadline=deadline, cancel=req.cancel)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UpstreamTimeout("video generation timed out while waiting for account video lock")
+            self._check_video_account_ready(account)
+            return await self._generate(account, prompt, images, "video", remaining,
                                         req.on_progress, req.cancel)
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------ session
     async def renew_session(self, account: Account) -> SessionInfo:

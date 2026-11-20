@@ -7,7 +7,9 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import socket
+import subprocess
 import time
 import urllib.parse
 from pathlib import Path
@@ -20,6 +22,7 @@ from ...accounts.pool import AccountPool
 from ...config import Settings
 from .cdp import CDPSession
 from .chromium import find_chromium
+from .driver import AccountBusy
 from .proxy_relay import LocalProxyRelay, needs_proxy_relay
 
 log = logging.getLogger(__name__)
@@ -143,13 +146,43 @@ async def _inject_cookies(cdp: CDPSession, account: Account) -> None:
             await cdp.send("Network.setCookie", param)
 
 
+async def _shield_quiet(coro: Any) -> None:
+    async def _runner() -> None:
+        with contextlib.suppress(Exception):
+            await coro
+
+    await asyncio.shield(_runner())
+
+
 async def _terminate_proc(proc: asyncio.subprocess.Process | None) -> None:
     if proc is None or proc.returncode is not None:
         return
-    with contextlib.suppress(Exception):
-        proc.terminate()
+    killed_via_taskkill = False
+    if os.name == "nt" and getattr(proc, "pid", None):
+        try:
+            res = await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
+            killed_via_taskkill = getattr(res, "returncode", 1) == 0
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+    if not killed_via_taskkill:
+        with contextlib.suppress(Exception):
+            proc.terminate()
     try:
         await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            proc.kill()
+        raise
     except (asyncio.TimeoutError, Exception):  # noqa: BLE001
         with contextlib.suppress(Exception):
             proc.kill()
@@ -189,27 +222,65 @@ class InteractiveBrowserManager:
         sess = self._sessions.get(account_id)
         return sess is not None and sess.task is not None and not sess.task.done()
 
-    async def open_login(self, account: Account) -> dict[str, Any]:
+    async def _open_session(self, account: Account, kind: str) -> dict[str, Any]:
+        already_msg = (
+            "Trình duyệt đăng nhập đã đang mở"
+            if kind == "login"
+            else "Trình duyệt xem hội thoại đã đang mở"
+        )
+        opening_msg = (
+            "Đang mở trình duyệt để đăng nhập"
+            if kind == "login"
+            else "Đang mở trình duyệt xem hội thoại"
+        )
+        cond = getattr(self.pool, "_cond", None)
         async with self._lock:
             if self._closed:
                 return {"ok": False, "message": "Hệ thống đang đóng", "status": "closed"}
-            if self.is_session_active(account.id):
-                return {"ok": True, "message": "Trình duyệt đăng nhập đã đang mở", "status": "already_open"}
-            sess = InteractiveSession(account.id, "login")
-            sess.task = asyncio.create_task(self._run_login_session(account, sess))
-            self._sessions[account.id] = sess
-            return {"ok": True, "message": "Đang mở trình duyệt để đăng nhập", "status": "opening"}
+            async with (cond if cond is not None else contextlib.nullcontext()):
+                if self.is_session_active(account.id):
+                    return {"ok": True, "message": already_msg, "status": "already_open"}
+                if self.is_account_busy(account.id):
+                    raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
+                latest = self.pool.get(account.id) if hasattr(self.pool, "get") else None
+                snap = (latest or account).model_copy(deep=True)
+                sess = InteractiveSession(snap.id, kind)
+                coro = (
+                    self._run_login_session(snap, sess)
+                    if kind == "login"
+                    else self._run_view_session(snap, sess)
+                )
+                sess.task = asyncio.create_task(coro)
+                self._sessions[snap.id] = sess
+                if cond is not None:
+                    cond.notify_all()
+                return {"ok": True, "message": opening_msg, "status": "opening"}
+
+    async def open_login(self, account: Account) -> dict[str, Any]:
+        return await self._open_session(account, "login")
 
     async def open_view(self, account: Account) -> dict[str, Any]:
+        return await self._open_session(account, "view")
+
+    async def stop_session(self, account_id: str) -> bool:
         async with self._lock:
-            if self._closed:
-                return {"ok": False, "message": "Hệ thống đang đóng", "status": "closed"}
-            if self.is_session_active(account.id):
-                return {"ok": True, "message": "Trình duyệt xem hội thoại đã đang mở", "status": "already_open"}
-            sess = InteractiveSession(account.id, "view")
-            sess.task = asyncio.create_task(self._run_view_session(account, sess))
-            self._sessions[account.id] = sess
-            return {"ok": True, "message": "Đang mở trình duyệt xem hội thoại", "status": "opening"}
+            sess = self._sessions.get(account_id)
+            if sess is None:
+                return False
+        if sess.task is not None and inspect.isawaitable(sess.task) and not sess.task.done():
+            sess.task.cancel()
+        await _terminate_proc(sess.proc)
+        if sess.task is not None and inspect.isawaitable(sess.task):
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(sess.task), timeout=10.0)
+        async with self._lock:
+            if self._sessions.get(account_id) is sess:
+                self._sessions.pop(account_id, None)
+        cond = getattr(self.pool, "_cond", None)
+        if cond is not None:
+            async with cond:
+                cond.notify_all()
+        return True
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -218,102 +289,164 @@ class InteractiveBrowserManager:
             self._sessions.clear()
         tasks = []
         for s in sessions:
-            await _terminate_proc(s.proc)
-            if s.task and not s.task.done():
+            if s.task and inspect.isawaitable(s.task) and not s.task.done():
                 s.task.cancel()
                 tasks.append(s.task)
+            await _terminate_proc(s.proc)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _cleanup_session(
+        self,
+        account_id: str,
+        sess: InteractiveSession,
+        cdp: CDPSession | None,
+        proxy_relay: LocalProxyRelay | None,
+        *,
+        fallback_stale_tabs: bool = False,
+    ) -> None:
+        cancelled_exc: asyncio.CancelledError | None = None
+
+        if cdp is not None:
+            try:
+                await _shield_quiet(cdp.close())
+            except asyncio.CancelledError as exc:
+                cancelled_exc = exc
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            await _terminate_proc(sess.proc)
+        except asyncio.CancelledError as exc:
+            cancelled_exc = exc
+        except Exception:  # noqa: BLE001
+            pass
+
+        if proxy_relay is not None:
+            try:
+                await _shield_quiet(proxy_relay.stop())
+            except asyncio.CancelledError as exc:
+                cancelled_exc = exc
+            except Exception:  # noqa: BLE001
+                pass
+
+        if hasattr(self.driver, "mark_account_stale"):
+            try:
+                res_stale = self.driver.mark_account_stale(account_id)
+                if inspect.isawaitable(res_stale):
+                    await _shield_quiet(res_stale)
+            except asyncio.CancelledError as exc:
+                cancelled_exc = exc
+            except Exception:  # noqa: BLE001
+                pass
+        elif fallback_stale_tabs and hasattr(self.driver, "_tabs"):
+            for t in self.driver._tabs.get(account_id, []):
+                t.stale = True
+
+        if self._sessions.get(account_id) is sess:
+            self._sessions.pop(account_id, None)
+
+        cond = getattr(self.pool, "_cond", None)
+        if cond is not None:
+            try:
+                async with cond:
+                    cond.notify_all()
+            except asyncio.CancelledError as exc:
+                cancelled_exc = exc
+            except Exception:  # noqa: BLE001
+                pass
+
+        if cancelled_exc is not None:
+            raise cancelled_exc
 
     def _get_profile_dir(self, account_id: str) -> Path:
         return self.settings.account_profile_dir(account_id)
 
     async def _run_login_session(self, account: Account, sess: InteractiveSession) -> None:
         account_id = account.id
-        if hasattr(self.driver, "release_account_driver"):
-            with contextlib.suppress(Exception):
-                await self.driver.release_account_driver(account_id)
-
-        profile_dir = self._get_profile_dir(account_id)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
-        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
-            with contextlib.suppress(FileNotFoundError, OSError):
-                (profile_dir / lock).unlink()
-
-        try:
-            exe = find_chromium(self.settings.chromium_path)
-        except Exception as exc:
-            log.error("cannot find chromium for interactive login: %s", exc)
-            return
-
-        port = find_free_port()
-        proxy = account.proxy or self.settings.browser_proxy or ""
         proxy_relay: LocalProxyRelay | None = None
-
-        target_url = "https://muse.ai/"
-        args = [
-            exe,
-            f"--remote-debugging-port={port}",
-            "--remote-debugging-address=127.0.0.1",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--autoplay-policy=no-user-gesture-required",
-            "--window-size=1280,820",
-            target_url,
-        ]
-        if proxy:
-            if needs_proxy_relay(proxy):
-                proxy_relay = LocalProxyRelay(proxy)
-                effective_proxy = await proxy_relay.start()
-            else:
-                effective_proxy = proxy
-            args.insert(1, f"--proxy-server={effective_proxy}")
-
-        log.info("launching headed browser for account %s login on port %d", account_id, port)
-        try:
-            sess.proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-            )
-        except Exception as exc:
-            log.error("failed to launch headed browser: %s", exc)
-            if proxy_relay is not None:
-                await proxy_relay.stop()
-            return
-
-        ws_url = await _resolve_page_ws_url(port, sess.proc, attempts=60)
         cdp: CDPSession | None = None
-        if ws_url:
-            try:
-                cdp = await CDPSession.connect(ws_url)
-                if account.cookies:
-                    await _inject_cookies(cdp, account)
-                await cdp.send("Network.enable")
-                await cdp.send("Page.enable")
-            except Exception as exc:
-                log.warning("failed to connect CDP to interactive browser: %s", exc)
-                if cdp is not None:
-                    with contextlib.suppress(Exception):
-                        await cdp.close()
-                    cdp = None
-
-        captured_auth_headers: dict[str, str] = {}
-        if cdp:
-            def on_request(params: dict) -> None:
-                req = params.get("request", {})
-                url = str(req.get("url", ""))
-                if _is_muse_hostname(url):
-                    headers = req.get("headers", {})
-                    for hk, hv in headers.items():
-                        hk_low = hk.lower()
-                        if hk_low in ("authorization", "x-auth-token", "x-session-token", "x-csrf-token"):
-                            captured_auth_headers[hk_low] = hv
-            cdp.on("Network.requestWillBeSent", on_request)
-
-        last_snapshot: tuple[Any, ...] | None = None
         try:
+            if hasattr(self.driver, "release_account_driver"):
+                with contextlib.suppress(Exception):
+                    await self.driver.release_account_driver(account_id)
+
+            profile_dir = self._get_profile_dir(account_id)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
+            for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    (profile_dir / lock).unlink()
+
+            try:
+                exe = find_chromium(self.settings.chromium_path)
+            except Exception as exc:
+                log.error("cannot find chromium for interactive login: %s", exc)
+                return
+
+            port = find_free_port()
+            proxy = account.proxy or self.settings.browser_proxy or ""
+
+            target_url = "https://muse.ai/"
+            args = [
+                exe,
+                f"--remote-debugging-port={port}",
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",
+                "--autoplay-policy=no-user-gesture-required",
+                "--window-size=1280,820",
+                "about:blank",
+            ]
+            if proxy:
+                if needs_proxy_relay(proxy):
+                    proxy_relay = LocalProxyRelay(proxy)
+                    effective_proxy = await proxy_relay.start()
+                else:
+                    effective_proxy = proxy
+                args.insert(1, f"--proxy-server={effective_proxy}")
+
+            log.info("launching headed browser for account %s login on port %d", account_id, port)
+            try:
+                sess.proc = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+            except Exception as exc:
+                log.error("failed to launch headed browser: %s", exc)
+                return
+
+            captured_auth_headers: dict[str, str] = {}
+            ws_url = await _resolve_page_ws_url(port, sess.proc, attempts=60)
+            if ws_url:
+                try:
+                    cdp = await CDPSession.connect(ws_url)
+                    if account.cookies:
+                        await _inject_cookies(cdp, account)
+                    await cdp.send("Network.enable")
+                    await cdp.send("Page.enable")
+
+                    def on_request(params: dict) -> None:
+                        req = params.get("request", {})
+                        url = str(req.get("url", ""))
+                        if _is_muse_hostname(url):
+                            headers = req.get("headers", {})
+                            for hk, hv in headers.items():
+                                hk_low = hk.lower()
+                                if hk_low in ("authorization", "x-auth-token", "x-session-token", "x-csrf-token"):
+                                    captured_auth_headers[hk_low] = hv
+
+                    cdp.on("Network.requestWillBeSent", on_request)
+                    await cdp.send("Page.navigate", {"url": target_url})
+                except Exception as exc:
+                    log.warning("failed to connect CDP to interactive browser: %s", exc)
+                    if cdp is not None:
+                        with contextlib.suppress(Exception):
+                            await cdp.close()
+                        cdp = None
+
+            last_snapshot: tuple[Any, ...] | None = None
             while sess.proc.returncode is None:
                 if cdp and not cdp.closed:
                     try:
@@ -391,110 +524,97 @@ class InteractiveBrowserManager:
 
                 await asyncio.sleep(1.0)
         finally:
-            if cdp:
-                with contextlib.suppress(Exception):
-                    await cdp.close()
-            await _terminate_proc(sess.proc)
-            if proxy_relay is not None:
-                with contextlib.suppress(Exception):
-                    await proxy_relay.stop()
-            if hasattr(self.driver, "mark_account_stale"):
-                with contextlib.suppress(Exception):
-                    res_stale = self.driver.mark_account_stale(account_id)
-                    if inspect.isawaitable(res_stale):
-                        await res_stale
-            elif hasattr(self.driver, "_tabs"):
-                for t in self.driver._tabs.get(account_id, []):
-                    t.stale = True
-            if self._sessions.get(account_id) is sess:
-                self._sessions.pop(account_id, None)
+            await self._cleanup_session(
+                account_id,
+                sess,
+                cdp,
+                proxy_relay,
+                fallback_stale_tabs=True,
+            )
             log.info("headed login session ended for account %s (harvested: %s)", account_id, sess.harvested)
 
     async def _run_view_session(self, account: Account, sess: InteractiveSession) -> None:
         account_id = account.id
-        if hasattr(self.driver, "release_account_driver"):
-            with contextlib.suppress(Exception):
-                await self.driver.release_account_driver(account_id)
-
-        profile_dir = self._get_profile_dir(account_id)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
-        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
-            with contextlib.suppress(FileNotFoundError, OSError):
-                (profile_dir / lock).unlink()
-
-        try:
-            exe = find_chromium(self.settings.chromium_path)
-        except Exception as exc:
-            log.error("cannot find chromium for interactive view: %s", exc)
-            return
-
-        port = find_free_port()
-        proxy = account.proxy or self.settings.browser_proxy or ""
         proxy_relay: LocalProxyRelay | None = None
-
-        raw_url = (
-            (account.meta.get("hot_page") or {}).get("url")
-            or account.meta.get("last_thread_url")
-            or "https://muse.ai/"
-        )
-        target_url = _sanitize_view_url(raw_url)
-        args = [
-            exe,
-            f"--remote-debugging-port={port}",
-            "--remote-debugging-address=127.0.0.1",
-            f"--user-data-dir={profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--autoplay-policy=no-user-gesture-required",
-            "--window-size=1280,820",
-            target_url,
-        ]
-        if proxy:
-            if needs_proxy_relay(proxy):
-                proxy_relay = LocalProxyRelay(proxy)
-                effective_proxy = await proxy_relay.start()
-            else:
-                effective_proxy = proxy
-            args.insert(1, f"--proxy-server={effective_proxy}")
-
-        log.info("launching headed browser for account %s view on %s", account_id, target_url)
-        try:
-            sess.proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-            )
-        except Exception as exc:
-            log.error("failed to launch headed browser for view: %s", exc)
-            if proxy_relay is not None:
-                await proxy_relay.stop()
-            return
-
         cdp: CDPSession | None = None
         try:
-            ws_url = await _resolve_page_ws_url(port, sess.proc, attempts=30)
-            if ws_url and account.cookies:
+            if hasattr(self.driver, "release_account_driver"):
                 with contextlib.suppress(Exception):
+                    await self.driver.release_account_driver(account_id)
+
+            profile_dir = self._get_profile_dir(account_id)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
+            for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "DevToolsActivePort"):
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    (profile_dir / lock).unlink()
+
+            try:
+                exe = find_chromium(self.settings.chromium_path)
+            except Exception as exc:
+                log.error("cannot find chromium for interactive view: %s", exc)
+                return
+
+            port = find_free_port()
+            proxy = account.proxy or self.settings.browser_proxy or ""
+
+            raw_url = (
+                (account.meta.get("hot_page") or {}).get("url")
+                or account.meta.get("last_thread_url")
+                or "https://muse.ai/"
+            )
+            target_url = _sanitize_view_url(raw_url)
+            args = [
+                exe,
+                f"--remote-debugging-port={port}",
+                "--remote-debugging-address=127.0.0.1",
+                f"--user-data-dir={profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",
+                "--autoplay-policy=no-user-gesture-required",
+                "--window-size=1280,820",
+                "about:blank",
+            ]
+            if proxy:
+                if needs_proxy_relay(proxy):
+                    proxy_relay = LocalProxyRelay(proxy)
+                    effective_proxy = await proxy_relay.start()
+                else:
+                    effective_proxy = proxy
+                args.insert(1, f"--proxy-server={effective_proxy}")
+
+            log.info("launching headed browser for account %s view on %s", account_id, target_url)
+            try:
+                sess.proc = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+            except Exception as exc:
+                log.error("failed to launch headed browser for view: %s", exc)
+                return
+
+            ws_url = await _resolve_page_ws_url(port, sess.proc, attempts=30)
+            if ws_url:
+                try:
                     cdp = await CDPSession.connect(ws_url)
-                    await _inject_cookies(cdp, account)
-                if cdp is not None:
-                    with contextlib.suppress(Exception):
-                        await cdp.close()
-                    cdp = None
+                    if account.cookies:
+                        await _inject_cookies(cdp, account)
+                    await cdp.send("Page.enable")
+                    await cdp.send("Page.navigate", {"url": target_url})
+                except Exception as exc:
+                    log.warning("failed to connect/navigate CDP for view: %s", exc)
+                finally:
+                    if cdp is not None:
+                        with contextlib.suppress(Exception):
+                            await cdp.close()
+                        cdp = None
             await sess.proc.wait()
         finally:
-            if cdp is not None:
-                with contextlib.suppress(Exception):
-                    await cdp.close()
-            await _terminate_proc(sess.proc)
-            if proxy_relay is not None:
-                with contextlib.suppress(Exception):
-                    await proxy_relay.stop()
-            if hasattr(self.driver, "mark_account_stale"):
-                with contextlib.suppress(Exception):
-                    res_stale = self.driver.mark_account_stale(account_id)
-                    if inspect.isawaitable(res_stale):
-                        await res_stale
-            if self._sessions.get(account_id) is sess:
-                self._sessions.pop(account_id, None)
+            await self._cleanup_session(
+                account_id,
+                sess,
+                cdp,
+                proxy_relay,
+                fallback_stale_tabs=False,
+            )
             log.info("headed view session ended for account %s", account_id)

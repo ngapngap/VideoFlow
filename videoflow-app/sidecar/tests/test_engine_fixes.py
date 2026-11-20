@@ -5,7 +5,11 @@ Chạy: pytest -q  (trong thư mục videoflow-app/sidecar)
 
 from __future__ import annotations
 
+import asyncio
 import time
+from contextlib import aclosing
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -297,3 +301,193 @@ def test_user_agent_chuan_hoa_windows_nt():
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     )
+
+
+# =========================================================================
+# M6 Cluster B: Startup & Driver Prewarm Eligibility + chat_stream finally
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_app_startup_prewarm_skips_ineligible_accounts(tmp_path: Path):
+    from muse2api.accounts.store import JsonAccountStore
+    from muse2api.app import create_app
+    from muse2api.config import Settings
+    from muse2api.drivers.base import DriverCapabilities, MuseDriver
+
+    settings = Settings(data_dir=tmp_path, media_dir=tmp_path / "media")
+    settings.ensure_dirs()
+
+    valid_cookies = {"hatch_sess": "s1", "hatch_native_auth_device": "d1"}
+    accounts = [
+        Account(id="acc_ok", label="ok", enabled=True, status=AccountStatus.ACTIVE, cookies=valid_cookies),
+        Account(id="acc_disabled", label="dis", enabled=False, status=AccountStatus.ACTIVE, cookies=valid_cookies),
+        Account(id="acc_invalid", label="inv", enabled=True, status=AccountStatus.INVALID, cookies=valid_cookies),
+        Account(id="acc_cooling", label="cool", enabled=True, status=AccountStatus.COOLING, cookies=valid_cookies),
+        Account(id="acc_vlocked", label="vl", enabled=True, status=AccountStatus.VIDEO_LOCKED, cookies=valid_cookies),
+        _acc({"weekly_used_pct": 100, "resets_at": "Jan 1, 2099", "extra_left": "0 tokens"},
+             id="acc_quota", label="q", enabled=True, status=AccountStatus.ACTIVE, cookies=valid_cookies),
+        Account(id="acc_nocookie", label="nc", enabled=True, status=AccountStatus.ACTIVE, cookies={"hatch_sess": "s1"}),
+    ]
+    await JsonAccountStore(settings.accounts_file).save(accounts)
+
+    prewarmed: list[str] = []
+
+    class _FakeDriver(MuseDriver):
+        name = "fake"
+        capabilities = DriverCapabilities(chat=True)
+
+        async def startup(self) -> None:
+            return
+
+        async def shutdown(self) -> None:
+            return
+
+        def prewarm(self, account: Account) -> None:
+            prewarmed.append(account.id)
+
+        async def chat_stream(self, account, req):
+            yield "ok"
+
+    app = create_app(settings, driver=_FakeDriver())
+    async with app.router.lifespan_context(app):
+        pass
+
+    assert prewarmed == ["acc_ok"]
+
+
+@pytest.mark.asyncio
+async def test_browser_driver_prewarm_skips_ineligible_and_aborts_fill_warm(tmp_path: Path):
+    from muse2api.config import Settings
+    from muse2api.drivers.browser.driver import BrowserDriver, _Tab
+    from muse2api.errors import UpstreamAuthError, UpstreamQuotaError, UpstreamVmDisabled
+
+    settings = Settings(data_dir=tmp_path, media_dir=tmp_path / "media", warm_threads=1)
+    drv = BrowserDriver(settings)
+    drv._browser = MagicMock()
+
+    valid_cookies = {"hatch_sess": "s1", "hatch_native_auth_device": "d1"}
+    ineligible = [
+        Account(id="dis", enabled=False, status=AccountStatus.ACTIVE, cookies=valid_cookies),
+        Account(id="inv", enabled=True, status=AccountStatus.INVALID, cookies=valid_cookies),
+        Account(id="cool", enabled=True, status=AccountStatus.COOLING, cookies=valid_cookies),
+        Account(id="vl", enabled=True, status=AccountStatus.VIDEO_LOCKED, cookies=valid_cookies),
+        _acc({"weekly_used_pct": 100, "resets_at": "Jan 1, 2099", "extra_left": "0 tokens"},
+             id="q", enabled=True, status=AccountStatus.ACTIVE, cookies=valid_cookies),
+        Account(id="nc", enabled=True, status=AccountStatus.ACTIVE, cookies={"hatch_sess": "s1"}),
+    ]
+    for acc in ineligible:
+        drv.prewarm(acc)
+    assert drv._prewarm_tasks == {}
+    assert drv._warming == {}
+
+    # _fill_warm must abort immediately on non-transient errors without sleeping _WARM_RETRY_DELAY
+    for exc_cls in (UpstreamAuthError, UpstreamVmDisabled, UpstreamQuotaError):
+        acc = Account(id="ok", enabled=True, status=AccountStatus.ACTIVE, cookies=valid_cookies)
+        sub = BrowserDriver(settings, account=acc)
+        sub._browser = MagicMock()
+        tab = _Tab(acc.id, "ctx", "tgt", MagicMock())
+        sleep_mock = AsyncMock()
+        with (
+            patch.object(sub, "_checkout_for_warming", AsyncMock(side_effect=[tab, None])),
+            patch.object(sub, "_warm_up", AsyncMock(side_effect=exc_cls("stop"))),
+            patch.object(sub, "_checkin", AsyncMock()),
+            patch("muse2api.drivers.browser.driver.asyncio.sleep", sleep_mock),
+        ):
+            await sub._fill_warm(acc)
+        sleep_mock.assert_not_called()
+
+    # _fill_warm stops before next round if account becomes ineligible mid-way
+    acc2 = Account(id="ok2", enabled=True, status=AccountStatus.ACTIVE, cookies=valid_cookies)
+    sub2 = BrowserDriver(settings, account=acc2)
+    sub2._browser = MagicMock()
+    tab2 = _Tab(acc2.id, "ctx", "tgt", MagicMock())
+
+    async def warm_then_invalidate(_tab):
+        acc2.status = AccountStatus.INVALID
+
+    sleep_mock2 = AsyncMock()
+    with (
+        patch.object(sub2, "_checkout_for_warming", AsyncMock(side_effect=[tab2, None])),
+        patch.object(sub2, "_warm_up", side_effect=warm_then_invalidate),
+        patch.object(sub2, "_checkin", AsyncMock()),
+        patch("muse2api.drivers.browser.driver.asyncio.sleep", sleep_mock2),
+    ):
+        await sub2._fill_warm(acc2)
+    sleep_mock2.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_finally_prewarms_only_on_clean_finish(tmp_path: Path):
+    from muse2api.config import Settings
+    from muse2api.drivers.base import ChatRequest
+    from muse2api.drivers.browser.cdp import CDPError
+    from muse2api.drivers.browser.driver import BrowserDriver, _Tab
+    from muse2api.errors import UpstreamError, UpstreamQuotaError
+
+    settings = Settings(data_dir=tmp_path, media_dir=tmp_path / "media")
+    acc = Account(
+        id="acc_1",
+        enabled=True,
+        status=AccountStatus.ACTIVE,
+        cookies={"hatch_sess": "s1", "hatch_native_auth_device": "d1"},
+    )
+
+    async def _run_case(mode: str):
+        drv = BrowserDriver(settings, account=acc)
+        tab = _Tab(acc.id, "ctx", "tgt", MagicMock())
+        prewarm_mock = MagicMock()
+        cancel = asyncio.Event()
+
+        poll = 0
+
+        async def fake_state(_tab):
+            nonlocal poll
+            poll += 1
+            if mode == "quota":
+                raise UpstreamQuotaError("out of quota")
+            if mode == "cdp":
+                raise CDPError("connection closed")
+            if mode == "cancel":
+                cancel.set()
+                return {"agentCount": 0, "lastText": ""}
+            if mode == "early_close":
+                return {"agentCount": 1, "lastText": "partial", "generating": True}
+            return {"agentCount": 1, "lastText": "hello", "generating": False}
+
+        with (
+            patch("muse2api.drivers.browser.driver.POLL_INTERVAL", 0.0),
+            patch("muse2api.drivers.browser.driver.STABLE_POLLS_DONE", 1),
+            patch.object(drv, "_begin_chat", AsyncMock(return_value=(tab, {"agentCount": 0, "lastText": ""}))),
+            patch.object(drv, "_state", side_effect=fake_state),
+            patch.object(drv, "_checkin", AsyncMock()),
+            patch.object(drv, "_close_tab", AsyncMock()),
+            patch.object(drv, "prewarm", prewarm_mock),
+        ):
+            req = ChatRequest(prompt="hi", model="muse-chat", cancel=cancel)
+            if mode == "ok":
+                chunks = [c async for c in drv.chat_stream(acc, req)]
+                assert chunks == ["hello"]
+            elif mode == "cancel":
+                chunks = [c async for c in drv.chat_stream(acc, req)]
+                assert chunks == []
+            elif mode == "early_close":
+                async with aclosing(drv.chat_stream(acc, req)) as stream:
+                    first = await anext(stream)
+                    assert first == "partial"
+            elif mode == "quota":
+                with pytest.raises(UpstreamQuotaError):
+                    async for _ in drv.chat_stream(acc, req):
+                        pass
+            elif mode == "cdp":
+                with pytest.raises(UpstreamError):
+                    async for _ in drv.chat_stream(acc, req):
+                        pass
+        return prewarm_mock
+
+    ok_mock = await _run_case("ok")
+    ok_mock.assert_called_once_with(acc)
+
+    for bad_mode in ("quota", "cdp", "cancel", "early_close"):
+        bad_mock = await _run_case(bad_mode)
+        bad_mock.assert_not_called()

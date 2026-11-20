@@ -112,6 +112,8 @@ async def _run(
 async def generate_images(body: ImageGenerationRequest, request: Request,
                           svc: Services = Depends(get_services)) -> dict:
     refs = body.image if isinstance(body.image, list) else [body.image] if body.image else []
+    if len(refs) > MAX_REFERENCE_IMAGES:
+        raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
     loaded = [InputImage(*(await load_image_ref(ref))) for ref in refs]
     return await _generate(body, loaded, request, svc)
 
@@ -130,6 +132,8 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
              if isinstance(f, UploadFile)]
     if not files:
         raise InvalidRequest("at least one image file is required (field 'image' or 'image[]')")
+    if len(files) > MAX_REFERENCE_IMAGES:
+        raise InvalidRequest(f"at most {MAX_REFERENCE_IMAGES} reference images are supported")
     fields = {k: v for k, v in form.items() if isinstance(v, str) and k not in ("image", "image[]")}
     try:
         body = ImageGenerationRequest(**fields)
@@ -137,6 +141,8 @@ async def edit_images(request: Request, svc: Services = Depends(get_services)) -
         raise InvalidRequest(exc.errors()[0].get("msg", "invalid request")) from exc
     refs = []
     for f in files:
+        if f.size is not None and f.size > _MAX_FETCH_BYTES:
+            raise InvalidRequest("uploaded image exceeds 20 MiB")
         mime = f.content_type or ""
         if not mime.startswith("image/"):
             mime = mimetypes.guess_type(f.filename or "")[0] or "image/png"

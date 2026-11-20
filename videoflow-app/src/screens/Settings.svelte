@@ -7,14 +7,24 @@
     endpointStatus,
     formatApiError,
     maxAttemptsStore,
+    museAccounts,
+    museSidecarStatus,
     project,
+    refreshMuseState,
     resetProjectRunState,
     rowChangedTick,
     running,
     settingsDirty,
     showToast,
   } from "../lib/store";
-  import { api, type ProbeResult, type Settings, type SettingsView } from "../lib/api";
+  import {
+    api,
+    type MuseStatusView,
+    type ProbeResult,
+    type Settings,
+    type SettingsView,
+  } from "../lib/api";
+  import { executeSettingsSave } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
@@ -69,35 +79,30 @@
   let videoModelMsg = "";
 
   // ━━ VideoFlow Muse nội bộ: engine + pool cookie + hạn mức (tab Endpoint video) ━━
-  type MuseAccount = import("../lib/api").MuseAccount;
-  type MuseQuotaSnapshot = import("../lib/api").MuseQuotaSnapshot;
-  type MuseStatusView = import("../lib/api").MuseStatusView;
-
-  let museStatus: import("../lib/api").MuseStatusView | null = null;
-  let museAccounts: MuseAccount[] = [];
   let museLoading = false;
   let museErr = "";
   let museSidecarBusy = false;
+  let destroyed = false;
+  let museRefreshSeq = 0;
 
   async function museRefresh() {
+    const seq = ++museRefreshSeq;
     museLoading = true;
     museErr = "";
     try {
-      museStatus = await api.muse_sidecar_status();
-      if (museStatus.sidecar.running) {
-        try {
-          const accs = await api.muse_list_accounts();
-          museAccounts = accs.data ?? [];
-        } catch {
-          museAccounts = [];
-        }
-      } else {
-        museAccounts = [];
+      const res = await refreshMuseState({ force: true });
+      if (destroyed || seq !== museRefreshSeq) return;
+      if (res.error) {
+        museErr = res.error;
       }
     } catch (e) {
-      museErr = formatApiError(e);
+      if (!destroyed && seq === museRefreshSeq) {
+        museErr = formatApiError(e);
+      }
     } finally {
-      museLoading = false;
+      if (!destroyed && seq === museRefreshSeq) {
+        museLoading = false;
+      }
     }
   }
 
@@ -195,16 +200,12 @@
     return out;
   }
 
-  $: museChanged = museChangedFields(museStatus, s);
+  $: museChanged = museChangedFields($museSidecarStatus, s);
 
-  // Khi mở tab Video lần đầu: nạp status sidecar (chưa spawn — chỉ đọc trạng thái)
-  let museLoadedOnce = false;
+  // Khi mở tab Video: luôn nạp status sidecar mới nhất từ store
   function onSelectTabVideo() {
     selectTab("video");
-    if (!museLoadedOnce) {
-      museLoadedOnce = true;
-      museRefresh();
-    }
+    void museRefresh();
   }
 
   // Modal xác nhận khi thư mục mới trống / thiếu thành phần / lỗi CSV
@@ -273,6 +274,8 @@
   }
 
   onDestroy(() => {
+    destroyed = true;
+    ++museRefreshSeq;
     clearSaveMsgTimer();
     hideAllKeyVisibility();
     if (!dirty) settingsDirty.set(false);
@@ -448,20 +451,6 @@
     if (!s || !formValid || $running || saving) return;
     saving = true;
     try {
-      if (imageKeyInput.trim()) {
-        await api.set_api_key("anh", imageKeyInput.trim());
-        imageKeyInput = "";
-      } else if (pendingClearImageKey) {
-        await api.set_api_key("anh", "");
-      }
-
-      if (videoKeyInput.trim()) {
-        await api.set_api_key("video", videoKeyInput.trim());
-        videoKeyInput = "";
-      } else if (pendingClearVideoKey) {
-        await api.set_api_key("video", "");
-      }
-
       const payload: Settings = {
         ...s,
         endpoint_image_base_url: s.endpoint_image_base_url.trim(),
@@ -485,23 +474,65 @@
         auto_cleanup_days: Math.round(Number(s.auto_cleanup_days)),
       };
 
-      await api.save_settings(payload);
-      const view = await api.get_settings();
-      applySettingsView(view);
-      hideAllKeyVisibility();
-      dirty = false;
-      // Cấu hình engine (port/Edge/headless) đổi → hỏi lại trạng thái để hiện cảnh báo
-      // "cần khởi động lại" ngay, không bắt người dùng bấm Làm mới.
-      if (museStatus?.sidecar.running) {
-        museRefresh();
+      const result = await executeSettingsSave({
+        payload,
+        imageKeyInput,
+        videoKeyInput,
+        pendingClearImageKey,
+        pendingClearVideoKey,
+        deps: {
+          saveSettings: (cfg) => api.save_settings(cfg),
+          setApiKey: (which, value) => api.set_api_key(which, value),
+          getSettings: () => api.get_settings(),
+        },
+        onImageKeyApplied: () => {
+          imageKeyInput = "";
+          pendingClearImageKey = false;
+        },
+        onVideoKeyApplied: () => {
+          videoKeyInput = "";
+          pendingClearVideoKey = false;
+        },
+      });
+
+      const shouldRefreshMuse =
+        Boolean($museSidecarStatus?.sidecar.running) ||
+        payload.video_source === "internal" ||
+        payload.image_source === "internal";
+
+      if (result.ok) {
+        applySettingsView(result.view);
+        hideAllKeyVisibility();
+        dirty = false;
+        // Cấu hình engine (port/Edge/headless) đổi → hỏi lại trạng thái để hiện cảnh báo
+        // "cần khởi động lại" ngay, không bắt người dùng bấm Làm mới.
+        if (shouldRefreshMuse) {
+          void museRefresh();
+        }
+        saveMsg = "Đã lưu cài đặt thành công";
+        showToast("success", "Đã lưu cấu hình hệ thống.");
+        clearSaveMsgTimer();
+        if (!destroyed) {
+          saveMsgTimer = setTimeout(() => {
+            saveMsgTimer = null;
+            if (!dirty) saveMsg = "";
+          }, 3000);
+        }
+      } else {
+        if (result.settingsPersisted) {
+          const keepPendingClearImage = pendingClearImageKey;
+          const keepPendingClearVideo = pendingClearVideoKey;
+          if (result.refreshedView) {
+            applySettingsView(result.refreshedView);
+          }
+          pendingClearImageKey = keepPendingClearImage;
+          pendingClearVideoKey = keepPendingClearVideo;
+          if (shouldRefreshMuse) {
+            void museRefresh();
+          }
+        }
+        showToast("error", formatApiError(result.error));
       }
-      saveMsg = "Đã lưu cài đặt thành công";
-      showToast("success", "Đã lưu cấu hình hệ thống.");
-      clearSaveMsgTimer();
-      saveMsgTimer = setTimeout(() => {
-        saveMsgTimer = null;
-        if (!dirty) saveMsg = "";
-      }, 3000);
     } catch (e) {
       showToast("error", formatApiError(e));
     } finally {
@@ -1182,8 +1213,8 @@
             <div class="muse-title">
               <Icons name="video" size={16} />
               <strong>VideoFlow Muse (nội bộ)</strong>
-              {#if museStatus?.sidecar.running}
-                <span class="muse-badge ok">Đang chạy{museStatus.sidecar.version ? ` · v${museStatus.sidecar.version}` : ""}</span>
+              {#if $museSidecarStatus?.sidecar.running}
+                <span class="muse-badge ok">Đang chạy{$museSidecarStatus.sidecar.version ? ` · v${$museSidecarStatus.sidecar.version}` : ""}</span>
               {:else}
                 <span class="muse-badge mute">Đã dừng</span>
               {/if}
@@ -1201,7 +1232,7 @@
               <button
                 type="button"
                 class="btn-secondary"
-                disabled={museSidecarBusy || $running || !museStatus?.sidecar.running}
+                disabled={museSidecarBusy || $running || !$museSidecarStatus?.sidecar.running}
                 on:click={museStop}
               >
                 <Icons name="stop" size={14} />
@@ -1211,7 +1242,7 @@
                 <Icons name="refresh" size={14} />
                 <span>{museLoading ? "Đang tải..." : "Làm mới"}</span>
               </button>
-              {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+              {#if $museSidecarStatus?.sidecar.running && $museSidecarStatus.sidecar.restart_required}
                 <button
                   type="button"
                   class="btn-primary"
@@ -1226,7 +1257,7 @@
             </div>
           </div>
 
-          {#if museStatus?.sidecar.running && museStatus.sidecar.restart_required}
+          {#if $museSidecarStatus?.sidecar.running && $museSidecarStatus.sidecar.restart_required}
             <div class="muse-stale-config">
               <Icons name="alert" size={14} />
               <span>
@@ -1242,8 +1273,8 @@
           <div class="hint">
             Sidecar tự dò Microsoft Edge/Chrome trên máy và điều khiển headless. Cookie muse.ai lưu
             trong thư mục dữ liệu app và tự gia hạn phiên mỗi 10 phút.
-            {#if museStatus?.chromium_path}
-              <br />Trình duyệt: <code>{museStatus.chromium_path}</code>
+            {#if $museSidecarStatus?.chromium_path}
+              <br />Trình duyệt: <code>{$museSidecarStatus.chromium_path}</code>
             {/if}
           </div>
 
@@ -1293,7 +1324,7 @@
             <div class="muse-summary-info">
               <Icons name="video-source" size={16} />
               <span>
-                {museAccounts.length} tài khoản · {museAccounts.filter((a) => a.enabled).length} đang bật
+                {$museAccounts.length} tài khoản · {$museAccounts.filter((a) => a.enabled).length} đang bật
               </span>
             </div>
             <button

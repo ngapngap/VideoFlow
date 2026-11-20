@@ -7,25 +7,31 @@
   import { onDestroy, onMount } from "svelte";
   import {
     activeRows,
+    clearEventLockedAccount,
     closeConfirmOpen,
     confirmStartEnabled,
     endpointStatus,
+    eventLockedAccount,
     formatApiError,
     lastRunFinished,
     maxAttemptsStore,
+    museAccounts,
+    museSidecarStatus,
     progressPercent,
     progressText,
     project,
+    refreshMuseState,
     resetProjectRunState,
     rowChangedTick,
     running,
     settingsDirty,
     showToast,
+    startMusePolling,
   } from "./lib/store";
+  import { deriveStatusbarIpText, resolveLockedAccount } from "./lib/museStatus";
   import { listen } from "@tauri-apps/api/event";
   import {
     api,
-    type MuseAccount,
     type ProbeResult,
     type RecentProject,
     type UpdateInfo,
@@ -404,70 +410,20 @@
     }
   }
 
-  // ━━ Quản lý Proxy Statusbar & Khóa tính năng Video (P2-3 & UI-2) ━━
-  let museAccounts: MuseAccount[] = [];
-  let eventLockedAccount: { id: string; label?: string } | null = null;
-  let unlistenVideoLocked: (() => void) | null = null;
-  let accountsPollTimer: ReturnType<typeof setInterval> | null = null;
-  let accountsPolling = false;
+  // ━━ Quản lý Proxy Statusbar & Khóa tính năng Video (P2-3 & UI-2 / M4) ━━
+  let stopMusePolling: (() => void) | null = null;
   let destroyed = false;
 
-  function formatProxyIp(proxy: string | null | undefined): string {
-    if (!proxy || !proxy.trim()) {
-      return "IP: trực tiếp";
-    }
-    const raw = proxy.trim();
-    let hostPort = raw.replace(/^[a-zA-Z0-9]+:\/\//, "");
-    if (hostPort.includes("@")) {
-      hostPort = hostPort.split("@").pop() || hostPort;
-    }
-    hostPort = hostPort.split("/")[0];
-    return `IP: ${hostPort}`;
-  }
+  $: lockedAccount = resolveLockedAccount(
+    $museAccounts,
+    $eventLockedAccount,
+    Boolean($museSidecarStatus?.sidecar.running)
+  );
 
-  async function refreshMuseAccounts() {
-    if (destroyed || accountsPolling) return;
-    accountsPolling = true;
-    try {
-      const st = await api.muse_sidecar_status();
-      if (destroyed) return;
-      if (!st.sidecar.running) {
-        museAccounts = [];
-        return;
-      }
-      const res = await api.muse_list_accounts();
-      if (destroyed) return;
-      museAccounts = res.data ?? [];
-    } catch {
-      // sidecar offline
-    } finally {
-      accountsPolling = false;
-    }
-  }
-
-  $: lockedAccount = (() => {
-    const fromPool = museAccounts.find((a) => a.enabled && a.status === "video_locked");
-    if (fromPool) return fromPool;
-    if (eventLockedAccount) {
-      const matched = museAccounts.find((a) => a.id === eventLockedAccount?.id);
-      if (matched && (!matched.enabled || matched.status !== "video_locked")) {
-        return null;
-      }
-      return eventLockedAccount;
-    }
-    return null;
-  })();
-
-  $: activeExecutingAccount =
-    museAccounts.find((a) => a.enabled && a.status === "active") ||
-    museAccounts.find((a) => a.enabled) ||
-    museAccounts[0] ||
-    null;
-
-  $: activeProxyValue = activeExecutingAccount?.proxy || null;
-  $: statusbarIpText = activeExecutingAccount?.proxy_exit_ip
-    ? `IP: ${activeExecutingAccount.proxy_exit_ip}${activeExecutingAccount.proxy_name ? ` (${activeExecutingAccount.proxy_name})` : ""}`
-    : formatProxyIp(activeProxyValue);
+  $: statusbarIp = deriveStatusbarIpText(
+    Boolean($museSidecarStatus?.sidecar.running),
+    $museAccounts
+  );
 
   async function handleSwitchLockedAccount(accountId: string) {
     if (accountId) {
@@ -478,31 +434,15 @@
         showToast("error", `Lỗi tạm dừng tài khoản: ${formatApiError(e)}`);
       }
     }
-    eventLockedAccount = null;
-    await refreshMuseAccounts();
+    clearEventLockedAccount();
+    await refreshMuseState({ force: true });
     requestNavigate("accounts");
   }
 
   onMount(() => {
     bootstrapApp();
     checkForUpdates(true);
-    refreshMuseAccounts();
-    accountsPollTimer = setInterval(refreshMuseAccounts, 5000);
-    listen<{ account_id?: string; id?: string; label?: string }>("account_video_locked", (ev) => {
-      const accId = ev.payload.account_id || ev.payload.id || "";
-      if (accId) {
-        eventLockedAccount = { id: accId, label: ev.payload.label || accId };
-      }
-      refreshMuseAccounts();
-    })
-      .then((un) => {
-        if (destroyed) {
-          un();
-        } else {
-          unlistenVideoLocked = un;
-        }
-      })
-      .catch(() => {});
+    stopMusePolling = startMusePolling();
     listen<UpdateProgress>("update_progress", (ev) => {
       updatePercent = ev.payload.percent;
     })
@@ -519,8 +459,10 @@
   onDestroy(() => {
     destroyed = true;
     if (unlistenUpdateProgress) unlistenUpdateProgress();
-    if (accountsPollTimer) clearInterval(accountsPollTimer);
-    if (unlistenVideoLocked) unlistenVideoLocked();
+    if (stopMusePolling) {
+      stopMusePolling();
+      stopMusePolling = null;
+    }
   });
 </script>
 
@@ -761,9 +703,9 @@
 
   <span class="status-divider"></span>
 
-  <span class="status-section ip-section" title="Địa chỉ IP / Proxy kết nối của tài khoản Muse">
+  <span class="status-section ip-section" title={statusbarIp.title}>
     <Icons name="globe" size={13} />
-    <span>{statusbarIpText}</span>
+    <span>{statusbarIp.text}</span>
   </span>
 
   <span class="status-spacer"></span>

@@ -99,10 +99,11 @@ jobs:
           $browser = $candidates[0]
           Write-Host "browser: $browser"
 
+          $dataDir = "$env:TEMP\m2a-ci-browser"
           $env:MUSE2API_DRIVER = "browser"
           $env:MUSE2API_PORT = "18703"
           $env:MUSE2API_CDP_PORT = "19203"
-          $env:MUSE2API_DATA_DIR = "$env:TEMP\m2a-ci-browser"
+          $env:MUSE2API_DATA_DIR = $dataDir
           $env:MUSE2API_API_KEY = "bkey"
           $env:MUSE2API_ADMIN_KEY = "bkey"
           $env:MUSE2API_HEADLESS = "true"
@@ -113,8 +114,11 @@ jobs:
             foreach ($i in 1..150) {
               Start-Sleep -Milliseconds 500
               if ($p.HasExited) {
-                $err = Get-Content "$env:TEMP\m2a-ci-browser\engine-stderr.log" -Raw -ErrorAction SilentlyContinue
-                $ce = Get-Content "$env:TEMP\m2a-ci-browser\chromium-stderr.log" -Raw -ErrorAction SilentlyContinue
+                $err = Get-Content -LiteralPath "$dataDir\engine-stderr.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                $ce = if (Test-Path -LiteralPath $dataDir) {
+                  (Get-ChildItem -LiteralPath $dataDir -Filter "chromium-stderr.log" -Recurse -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { "=== $($_.FullName) ===`n" + (Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) }) -join "`n"
+                } else { "" }
                 throw "engine thoát sớm (exit $($p.ExitCode))`n--- engine ---`n$err`n--- chromium ---`n$ce"
               }
               try {

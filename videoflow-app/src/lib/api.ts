@@ -273,7 +273,6 @@ export interface ProxyItem {
   host: string;
   port: number;
   username?: string | null;
-  password?: string | null;
   has_password: boolean;
   note?: string | null;
   last_status: "untested" | "alive" | "dead" | string;
@@ -293,6 +292,7 @@ export interface ProxyInput {
   port: number;
   username?: string | null;
   password?: string | null;
+  clear_password?: boolean;
   note?: string | null;
 }
 
@@ -477,7 +477,7 @@ export const api = {
   muse_reset_account: (accountId: string) =>
     invoke<{ account: MuseAccount }>("muse_reset_account", { accountId }),
   muse_account_quota: (accountId: string, refresh = false) =>
-    invoke<{ account_id: string; quota: MuseQuotaSnapshot; cached?: boolean }>(
+    invoke<{ account_id: string; quota: MuseQuotaSnapshot }>(
       "muse_account_quota",
       {
         accountId,

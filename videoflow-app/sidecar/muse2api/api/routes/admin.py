@@ -6,6 +6,7 @@ extension for one-click cookie import (served by ``GET /admin/extension.zip``).
 
 from __future__ import annotations
 
+import contextlib
 import io
 import time
 import zipfile
@@ -179,48 +180,82 @@ async def import_accounts(body: AccountsImportRequest, svc: Services = Depends(g
 async def update_account(account_id: str, body: AccountUpdate,
                          svc: Services = Depends(get_services),
                          allow_duplicate_session: bool = False) -> dict:
-    acc = _get(svc, account_id)
-    if body.label is not None:
-        acc.label = body.label
-    if body.enabled is not None:
-        acc.enabled = body.enabled
-    if body.cookies is not None:
-        # Same guard as POST: a hatching session must not be shared by two accounts,
-        # otherwise both fight over its rotation and die together.
-        if not allow_duplicate_session:
-            probe = Account(id=acc.id, label=acc.label, cookies={**acc.cookies, **body.cookies})
-            _check_duplicate_session(probe, svc)
-        for k, v in body.cookies.items():
-            if v:
-                acc.cookies[k] = v
-            else:
-                acc.cookies.pop(k, None)
-        # Expiry belongs to the OLD session: drop it for cookies that were replaced, or
-        # the account would look like it expires when the previous session did.
-        acc.cookie_expires = {
-            name: exp for name, exp in (acc.cookie_expires or {}).items()
-            if name not in body.cookies
-        }
-        # Fresh cookies give an invalid account another chance.
-        acc.status = AccountStatus.ACTIVE
-        acc.last_error = None
-    if body.cookie_expires is not None:
-        if acc.cookie_expires is None:
-            acc.cookie_expires = {}
-        acc.cookie_expires.update(body.cookie_expires)
+    interactive = getattr(svc, "interactive", None)
+    interactive_lock = getattr(interactive, "_lock", None) if interactive is not None else None
+    cond = getattr(svc.pool, "_cond", None)
+
     proxy_changed = False
-    if body.proxy is not None:
-        new_proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
-        if new_proxy is not None and acc.proxy and new_proxy == mask_proxy_url(acc.proxy):
-            pass  # keep existing unmasked proxy when client echoes back masked value
-        elif new_proxy != acc.proxy:
-            if _is_account_busy(account_id, svc):
-                raise AccountBusy(
-                    "Tài khoản đang bận xử lý hoặc đang mở trình duyệt, không thể đổi proxy lúc này"
+    async with (interactive_lock if interactive_lock is not None else contextlib.nullcontext()):
+        async with (cond if cond is not None else contextlib.nullcontext()):
+            acc = _get(svc, account_id)
+
+            new_proxy = acc.proxy
+            if "proxy" in body.model_fields_set:
+                raw_proxy = (
+                    body.proxy.strip()
+                    if isinstance(body.proxy, str) and body.proxy.strip()
+                    else None
                 )
-            acc.proxy = new_proxy
-            proxy_changed = True
-    await svc.pool.upsert(acc)
+                if raw_proxy is not None and acc.proxy and raw_proxy == mask_proxy_url(acc.proxy):
+                    pass  # keep existing unmasked proxy when client echoes back masked value
+                elif raw_proxy != acc.proxy:
+                    if _is_account_busy(account_id, svc):
+                        raise AccountBusy(
+                            "Tài khoản đang bận xử lý hoặc đang mở trình duyệt, không thể đổi proxy lúc này"
+                        )
+                    new_proxy = raw_proxy
+                    proxy_changed = True
+
+            if body.cookies is not None and not allow_duplicate_session:
+                # Same guard as POST: a hatching session must not be shared by two accounts,
+                # otherwise both fight over its rotation and die together.
+                merged_cookies = dict(acc.cookies)
+                for k, v in body.cookies.items():
+                    if v:
+                        merged_cookies[k] = v
+                    else:
+                        merged_cookies.pop(k, None)
+                probe = Account(
+                    id=acc.id,
+                    label=body.label if body.label is not None else acc.label,
+                    cookies=merged_cookies,
+                )
+                _check_duplicate_session(probe, svc)
+
+            if body.label is not None:
+                acc.label = body.label
+            if body.enabled is not None:
+                acc.enabled = body.enabled
+            if body.cookies is not None:
+                for k, v in body.cookies.items():
+                    if v:
+                        acc.cookies[k] = v
+                    else:
+                        acc.cookies.pop(k, None)
+                # Expiry belongs to the OLD session: drop it for cookies that were replaced, or
+                # the account would look like it expires when the previous session did.
+                acc.cookie_expires = {
+                    name: exp for name, exp in (acc.cookie_expires or {}).items()
+                    if name not in body.cookies
+                }
+                # Fresh cookies give an invalid account another chance.
+                acc.status = AccountStatus.ACTIVE
+                acc.last_error = None
+            if body.cookie_expires is not None:
+                if acc.cookie_expires is None:
+                    acc.cookie_expires = {}
+                acc.cookie_expires.update(body.cookie_expires)
+            if proxy_changed:
+                acc.proxy = new_proxy
+            if cond is not None:
+                cond.notify_all()
+            public_view = _account_public(acc, svc)
+
+    if cond is not None and hasattr(svc.pool, "persist"):
+        await svc.pool.persist()
+    else:
+        await svc.pool.upsert(acc)
+
     driver = getattr(svc, "driver", None)
     if proxy_changed and driver is not None and hasattr(driver, "release_account_driver"):
         await driver.release_account_driver(account_id)
@@ -228,13 +263,37 @@ async def update_account(account_id: str, body: AccountUpdate,
         res = driver.mark_account_stale(account_id)
         if hasattr(res, "__await__"):
             await res
-    return {"account": _account_public(acc, svc)}
+    return {"account": public_view}
 
 
 @router.delete("/accounts/{account_id}")
 async def delete_account(account_id: str, svc: Services = Depends(get_services)) -> dict:
-    if not await svc.pool.remove(account_id):
+    interactive = getattr(svc, "interactive", None)
+    interactive_lock = getattr(interactive, "_lock", None) if interactive is not None else None
+    cond = getattr(svc.pool, "_cond", None)
+
+    removed_via_cond = False
+    async with (interactive_lock if interactive_lock is not None else contextlib.nullcontext()):
+        async with (cond if cond is not None else contextlib.nullcontext()):
+            if svc.pool.get(account_id) is None:
+                raise NotFound(f"account '{account_id}' not found")
+            if _is_account_busy(account_id, svc):
+                raise AccountBusy(
+                    "Tài khoản đang bận xử lý hoặc đang mở trình duyệt, không thể xóa lúc này"
+                )
+            if cond is not None and hasattr(svc.pool, "_accounts") and hasattr(svc.pool, "persist"):
+                svc.pool._accounts.pop(account_id, None)
+                cond.notify_all()
+                removed_via_cond = True
+
+    if interactive is not None and hasattr(interactive, "stop_session"):
+        await interactive.stop_session(account_id)
+
+    if removed_via_cond:
+        await svc.pool.persist()
+    elif not await svc.pool.remove(account_id):
         raise NotFound(f"account '{account_id}' not found")
+
     driver = getattr(svc, "driver", None)
     if driver is not None and hasattr(driver, "release_account_driver"):
         await driver.release_account_driver(account_id)
@@ -243,6 +302,18 @@ async def delete_account(account_id: str, svc: Services = Depends(get_services))
 
 @router.post("/accounts/{account_id}/reset")
 async def reset_account(account_id: str, svc: Services = Depends(get_services)) -> dict:
+    if hasattr(svc.pool, "try_update"):
+        def _do_reset(acc: Account) -> tuple[bool, dict]:
+            acc.status, acc.cooldown_until, acc.last_error = AccountStatus.ACTIVE, 0.0, None
+            acc.meta.pop("kind_blocked_until", None)  # e.g. video after an unconfirmed VM wake
+            acc.meta.pop("wake_blocked_until", None)
+            return True, _account_public(acc, svc)
+
+        found, pub = await svc.pool.try_update(account_id, _do_reset)
+        if not found:
+            raise NotFound(f"account '{account_id}' not found")
+        return {"account": pub}
+
     acc = _get(svc, account_id)
     acc.status, acc.cooldown_until, acc.last_error = AccountStatus.ACTIVE, 0.0, None
     acc.meta.pop("kind_blocked_until", None)  # e.g. video after an unconfirmed VM wake
@@ -260,20 +331,20 @@ async def renew(account_id: str, svc: Services = Depends(get_services)) -> dict:
 @router.post("/accounts/{account_id}/open-login")
 async def open_login(account_id: str, svc: Services = Depends(get_services)) -> dict:
     acc = _get(svc, account_id)
-    if svc.interactive and svc.interactive.is_account_busy(account_id):
-        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
     if svc.interactive is None:
         raise InvalidRequest("Interactive browser sessions not available")
+    if svc.interactive.is_account_busy(account_id):
+        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
     return await svc.interactive.open_login(acc)
 
 
 @router.post("/accounts/{account_id}/open-view")
 async def open_view(account_id: str, svc: Services = Depends(get_services)) -> dict:
     acc = _get(svc, account_id)
-    if svc.interactive and svc.interactive.is_account_busy(account_id):
-        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
     if svc.interactive is None:
         raise InvalidRequest("Interactive browser sessions not available")
+    if svc.interactive.is_account_busy(account_id):
+        raise AccountBusy("Tài khoản đang bận chạy batch, không thể mở trình duyệt")
     return await svc.interactive.open_view(acc)
 
 
@@ -287,7 +358,12 @@ async def account_quota(account_id: str, refresh: bool = False,
     409 while every tab of the account is serving a request. Drivers that do not
     implement ``MuseDriver.quota`` raise ``FeatureNotImplemented`` (HTTP 501).
     """
-    acc = _get(svc, account_id)
+    if hasattr(svc.pool, "snapshot"):
+        acc = await svc.pool.snapshot(account_id)
+        if acc is None:
+            raise NotFound(f"account '{account_id}' not found")
+    else:
+        acc = _get(svc, account_id)
     if svc.interactive and svc.interactive.is_session_active(account_id):
         raise AccountBusy(f"account '{account_id}' is busy in an interactive browser session")
     if hasattr(svc.pool, "is_inflight") and svc.pool.is_inflight(account_id):
@@ -295,10 +371,19 @@ async def account_quota(account_id: str, refresh: bool = False,
     if refresh and (forget := getattr(svc.driver, "forget_quota", None)):
         forget(acc.id)
     snapshot = await svc.driver.quota(acc)
-    latest = svc.pool.get(account_id)
-    if latest is None:
-        raise NotFound(f"account '{account_id}' not found")
-    latest.meta["quota"] = {"checked_at": time.time(), **snapshot}
+    quota_entry = {"checked_at": time.time(), **snapshot}
+    if hasattr(svc.pool, "try_update"):
+        def _set_quota(latest: Account) -> tuple[bool, dict]:
+            latest.meta["quota"] = quota_entry
+            return True, latest.meta["quota"]
+
+        found, saved_quota = await svc.pool.try_update(account_id, _set_quota)
+        if not found:
+            raise NotFound(f"account '{account_id}' not found")
+        return {"account_id": account_id, "quota": saved_quota}
+
+    latest = _get(svc, account_id)
+    latest.meta["quota"] = quota_entry
     await svc.pool.upsert(latest)
     return {"account_id": latest.id, "quota": latest.meta["quota"]}
 

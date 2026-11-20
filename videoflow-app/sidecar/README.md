@@ -42,7 +42,7 @@ The project focuses on **clean engineering and easy collaboration**:
 
 ## Status
 
-> **Current**: the mock-driver test suite passes locally (81 tests, no network access) and CI runs on every push to main; the browser driver and the direct-protocol driver still need live testing against a real muse.ai account.
+> **Current**: the unit and mock-driver test suite passes locally (225 tests, no network access) and CI runs on every push to main; the browser driver and the direct-protocol driver still need live testing against a real muse.ai account.
 
 | Module | Status | Notes |
 |---|---|---|
@@ -55,7 +55,7 @@ The project focuses on **clean engineering and easy collaboration**:
 | Session renewal / keepalive | 🧪 Needs live testing | Plain HTTP, on by default every 10 min; also wakes the account's VM so the first request is not slowed by a cold start |
 | Direct HTTP protocol driver | 🚧 Reserved | Returns 501 |
 | `/v1/images/edits` (reference images) | ✅ Implemented | Images are references for a new image; `mask` is rejected |
-| `/v1/responses` | 🚧 Reserved | Returns 501 |
+| `/v1/responses` | ✅ Implemented | Streaming & non-streaming Responses API (tool items rejected cleanly with 400) |
 | Streaming heartbeats (SSE keepalive) | ✅ Implemented | Opt-in with `MUSE2API_STREAM_HEARTBEAT_INTERVAL`; sends `: keepalive` comments while waiting for the first token |
 | Automatic media cleanup | ✅ Implemented | `MUSE2API_MEDIA_RETENTION_DAYS` (default 14, `0` disables); hourly background pruning |
 | SSRF guard for server-side image fetches | ✅ Implemented | Private and loopback URLs are rejected |
@@ -283,7 +283,7 @@ curl http://localhost:18610/admin/accounts \
 | GET/POST/PATCH/DELETE | `/admin/keys[/{id}]` | Client API keys (create returns the key once; PATCH renames / revokes) |
 | GET | `/admin/requests` · `/admin/stats?window=1h\|24h\|7d` | Request log (filters: `key_id`, `account_id`, `status=2xx\|4xx\|5xx`, `path`, `since`, `hide_polls`) · aggregates |
 | GET | `/dashboard` | Web dashboard (asks for the admin key in the browser) |
-| POST | `/v1/responses` | Reserved, currently returns 501 |
+| POST | `/v1/responses` | OpenAI Responses API (streaming & non-streaming, maps instructions/input to chat) |
 
 ### Dashboard, API keys and request log
 
@@ -338,7 +338,7 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 Future extension points include:
 
 - **Drivers**: direct HTTP protocol driver, conversation thread reuse, quota-aware scheduling.
-- **Protocol**: `/v1/responses`, mask-based inpainting, emulated tool calling.
+- **Protocol**: mask-based inpainting, emulated tool calling.
 - **Accounts, admin and operations**: storage backends, per-key rate limits, Prometheus metrics.
 
 ## Testing & Linting

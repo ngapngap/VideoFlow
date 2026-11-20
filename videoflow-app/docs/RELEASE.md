@@ -4,23 +4,32 @@
 
 ```bash
 # Từ thư mục gốc của repo VideoFlow
-# 1) đổi version trong 3 file (hoặc để workflow tự sync từ tag):
-#    videoflow-app/package.json, videoflow-app/src-tauri/Cargo.toml, videoflow-app/src-tauri/tauri.conf.json
+# 1) (khuyến nghị) đồng bộ version trong 5 manifest (hoặc để workflow tự sync từ tag/input trong runner):
+#    - videoflow-app/package.json                         ("version")
+#    - videoflow-app/src-tauri/Cargo.toml                 (version = "...")
+#    - videoflow-app/src-tauri/tauri.conf.json            ("version")
+#    - videoflow-app/sidecar/muse2api/__init__.py         (__version__ = "...")
+#    - videoflow-app/sidecar/pyproject.toml               (version = "...")
 git add -A && git commit -m "feat: mô tả thay đổi"
 git push origin main
 git tag -a v1.5.1 -m "VideoFlow Desktop v1.5.1"
-git push origin v1.5.1        # ← trigger Release workflow
+git push origin v1.5.1        # ← trigger Release workflow (hoặc chạy tay qua workflow_dispatch với input version)
 ```
 
-`release.yml` chạy qua 2 giai đoạn trên runner `windows-latest`:
+`release.yml` chạy qua 2 giai đoạn trên runner `windows-latest` (khóa `concurrency` nhóm `release-windows`, không chạy song song hai bản phát hành):
 
-- **Job `verify` (Cổng chất lượng)**: chạy `npm run check` (`svelte-check`), `cargo clippy --all-targets -- -D warnings`, `cargo test`, `ruff check .` và `pytest -q` trên đúng commit được gắn tag.
+- **Job `verify` (Cổng chất lượng)**: chạy `npm ci` + `npm run check` (`svelte-check`), tạo stub `videoflow-muse-x86_64-pc-windows-msvc.exe` để `tauri-build` biên dịch, chạy `cargo clippy --all-targets -- -D warnings` + `cargo test`, và cài dependencies Python để chạy `ruff check .` + `python -m pytest -q` trên đúng commit được gắn tag (hoặc nhánh khi chạy `workflow_dispatch`).
 - **Job `build` (chỉ chạy sau khi `verify` xanh)**:
-  1. `Sync version into manifests` — ghi version từ tag vào `package.json`, `Cargo.toml`, `tauri.conf.json`.
-  2. Build sidecar engine bằng PyInstaller → `src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe`.
-  3. Smoke test 2 pha trên exe thật: (1) **Browser driver thật** với Edge headless + kiểm tra CDP; (2) **Contract VideoFlow** với mock driver (`/healthz`, `/admin/status`, `/v1/models`, `/v1/videos`, `/v1/images/edits`).
-  4. `npm ci` rồi `tauri-action`:
-     - Build bộ cài NSIS (`VideoFlow Desktop_<ver>_x64-setup.exe`).
+  1. `Resolve version` & `Sync version into manifests` — lấy version từ tag `v*` (hoặc input `version` của `workflow_dispatch`), kiểm tra định dạng semver (`X.Y.Z` hoặc `X.Y.Z-prerelease`), rồi ghi đè version vào cả **5 manifest** trong workspace runner trước khi build:
+     - `videoflow-app/package.json` (`version`)
+     - `videoflow-app/src-tauri/Cargo.toml` (`version`)
+     - `videoflow-app/src-tauri/tauri.conf.json` (`version`)
+     - `videoflow-app/sidecar/muse2api/__init__.py` (`__version__`)
+     - `videoflow-app/sidecar/pyproject.toml` (`version`)
+  2. Build sidecar engine bằng PyInstaller → `videoflow-app/src-tauri/binaries/videoflow-muse-x86_64-pc-windows-msvc.exe` và kiểm tra kích thước (`>= 8 MB`) + SHA-256 (`Verify sidecar artifact`).
+  3. Smoke test 2 pha trên exe thật: (1) **Browser driver thật** với Edge headless + kiểm tra `/healthz` và `/admin/status` (`driver=browser, ok=true`); (2) **Contract VideoFlow** với mock driver (`/healthz`, `/admin/status`, `/v1/models`, `POST /admin/accounts`, `/v1/videos`, `/v1/images/edits`).
+  4. `npm ci`, kiểm tra secret `TAURI_SIGNING_PRIVATE_KEY` (`Verify updater signing key secret`), rồi chạy `tauri-action` (`--target x86_64-pc-windows-msvc`):
+     - Build bộ cài NSIS (`VideoFlow Desktop_<ver>_x64-setup.exe`; trên GitHub Releases được chuẩn hóa tên thành `VideoFlow.Desktop_<ver>_x64-setup.exe`).
      - **Ký updater** bằng `TAURI_SIGNING_PRIVATE_KEY` → `*.exe.sig`.
      - Tạo **Draft Release** (`releaseDraft: true`) kèm `latest.json` để kiểm tra lần cuối trước khi bấm Publish trên GitHub.
 

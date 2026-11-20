@@ -1,6 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import { api, type MuseAccount, type MuseQuotaSnapshot, type ProxyItem } from "./api";
+  import { isAccountActionBlocked, shouldSyncSelectedProxy } from "./asyncGuard";
   import Icons from "./Icons.svelte";
   import Modal from "./Modal.svelte";
   import { formatApiError, showToast } from "./store";
@@ -21,13 +22,32 @@
   let actionBusy = false;
   let quotaBusy = false;
   let quotaErr = "";
-  let selectedProxyId = account.proxy_id || "";
+  let prevPropProxyId = account.proxy_id || "";
+  let selectedProxyId = prevPropProxyId;
   let proxySaving = false;
   let deleteConfirmOpen = false;
 
-  $: if (!proxySaving) {
-    selectedProxyId = account.proxy_id || "";
+  $: {
+    const nextPropProxyId = account.proxy_id || "";
+    if (shouldSyncSelectedProxy(prevPropProxyId, nextPropProxyId, proxySaving)) {
+      prevPropProxyId = nextPropProxyId;
+      selectedProxyId = nextPropProxyId;
+    }
   }
+
+  $: actionBlocked = isAccountActionBlocked({
+    actionBusy,
+    proxySaving,
+    running,
+    accountBusy: Boolean(account.busy),
+  });
+  $: proxyOrQuotaBlocked = isAccountActionBlocked({
+    actionBusy,
+    proxySaving,
+    quotaBusy,
+    running,
+    accountBusy: Boolean(account.busy),
+  });
 
   function formatProxyOptionLabel(p: ProxyItem): string {
     const dot =
@@ -151,7 +171,14 @@
 
   async function handleToggle(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
-    if (actionBusy || running) {
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
       input.checked = account.enabled;
       return;
     }
@@ -170,7 +197,15 @@
   async function handleProxySelectChange(e: Event) {
     const selectEl = e.currentTarget as HTMLSelectElement;
     const nextPid = selectEl.value;
-    if (proxySaving || running || actionBusy || quotaBusy || account.busy) {
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        quotaBusy,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
       selectEl.value = account.proxy_id || "";
       return;
     }
@@ -178,7 +213,12 @@
     selectedProxyId = nextPid;
     proxySaving = true;
     try {
-      await api.muse_update_account(account.id, undefined, undefined, undefined, nextPid);
+      const res = await api.muse_update_account(account.id, undefined, undefined, undefined, nextPid);
+      if (res?.account) {
+        account = res.account;
+        prevPropProxyId = account.proxy_id || "";
+        selectedProxyId = prevPropProxyId;
+      }
       const pxName = proxies.find((p) => p.id === nextPid)?.name;
       showToast(
         "success",
@@ -197,7 +237,17 @@
   }
 
   async function handleRefreshQuota() {
-    if (quotaBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        quotaBusy,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     quotaBusy = true;
     quotaErr = "";
     try {
@@ -218,7 +268,16 @@
   }
 
   async function handleRenew() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_renew_account(account.id);
@@ -236,7 +295,16 @@
   }
 
   async function handleReset() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     actionBusy = true;
     try {
       await api.muse_reset_account(account.id);
@@ -250,7 +318,16 @@
   }
 
   async function handleOpenLogin() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_open_login(account.id);
@@ -264,7 +341,16 @@
   }
 
   async function handleOpenView() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     actionBusy = true;
     try {
       const res = await api.muse_open_view(account.id);
@@ -278,12 +364,30 @@
   }
 
   function requestDelete() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     deleteConfirmOpen = true;
   }
 
   async function confirmDelete() {
-    if (actionBusy || running) return;
+    if (
+      isAccountActionBlocked({
+        actionBusy,
+        proxySaving,
+        running,
+        accountBusy: Boolean(account.busy),
+      })
+    ) {
+      return;
+    }
     actionBusy = true;
     try {
       await api.muse_delete_account(account.id);
@@ -318,7 +422,10 @@
       <input
         type="checkbox"
         checked={account.enabled}
-        disabled={actionBusy || running}
+        disabled={actionBlocked}
+        aria-label={account.enabled
+          ? `Tắt tài khoản ${account.label || account.id}`
+          : `Bật tài khoản ${account.label || account.id}`}
         on:change={handleToggle}
       />
       <span class="slider"></span>
@@ -369,8 +476,9 @@
     <select
       class="proxy-select"
       value={selectedProxyId}
+      aria-label={`Chọn proxy cho tài khoản ${account.label || account.id}`}
       on:change={handleProxySelectChange}
-      disabled={proxySaving || running || actionBusy || quotaBusy || Boolean(account.busy)}
+      disabled={proxyOrQuotaBlocked}
     >
       <option value="">Trực tiếp (không dùng proxy)</option>
       {#each proxies as p (p.id)}
@@ -417,7 +525,7 @@
     <button
       type="button"
       class="btn-action primary"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleOpenLogin}
       title="Mở trình duyệt có giao diện để đăng nhập tài khoản Muse và tự động bắt token"
     >
@@ -429,7 +537,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleOpenView}
       title="Mở trình duyệt xem lịch sử hội thoại trên web của tài khoản này"
     >
@@ -440,7 +548,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={quotaBusy || running}
+      disabled={proxyOrQuotaBlocked}
       on:click={handleRefreshQuota}
       title="Đọc lại hạn mức từ trang Settings → Usage của muse.ai"
     >
@@ -451,7 +559,7 @@
     <button
       type="button"
       class="btn-action"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={handleRenew}
       title="Gia hạn phiên muse.ai và làm mới cookie"
     >
@@ -463,7 +571,7 @@
       <button
         type="button"
         class="btn-action"
-        disabled={actionBusy || running}
+        disabled={actionBlocked}
         on:click={handleReset}
         title="Đặt lại trạng thái khóa/tạm chờ về hoạt động để thử lại"
       >
@@ -475,7 +583,7 @@
     <button
       type="button"
       class="btn-action danger"
-      disabled={actionBusy || running}
+      disabled={actionBlocked}
       on:click={requestDelete}
       title="Xóa tài khoản khỏi danh sách"
     >
@@ -496,6 +604,11 @@
     Bạn có chắc muốn xóa tài khoản <b>{account.label || account.id}</b> khỏi danh sách không?
     Hồ sơ trình duyệt và cookie lưu cục bộ của tài khoản này sẽ bị xóa khỏi pool.
   </p>
+  {#if running || Boolean(account.busy)}
+    <p class="acc-delete-busy-warn" role="alert">
+      Tài khoản đang bận hoặc batch đang chạy — không thể xóa lúc này.
+    </p>
+  {/if}
   <div slot="footer">
     <button
       type="button"
@@ -508,7 +621,7 @@
     <button
       type="button"
       class="btn-danger"
-      disabled={actionBusy}
+      disabled={actionBlocked}
       on:click={confirmDelete}
     >
       {actionBusy ? "Đang xóa..." : "Xóa tài khoản"}
@@ -857,5 +970,15 @@
   .btn-action:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  .acc-delete-busy-warn {
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: #92400e;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
   }
 </style>

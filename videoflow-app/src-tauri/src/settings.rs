@@ -433,8 +433,9 @@ fn is_bearer_token_char(c: char) -> bool {
 
 /// Che mọi chuỗi nhạy cảm:
 /// 1) Các khóa API thực tế đã nạp/lưu từ Keyring (kể cả định dạng không có `sk-`/`Bearer`)
-/// 2) `Bearer <token>`
-/// 3) `sk-[A-Za-z0-9_-]+` (tôn trọng ranh giới từ để không hỏng `task-123`)
+/// 2) Thông tin đăng nhập trong URL (`scheme://[user]:pass@host`)
+/// 3) `Bearer <token>`
+/// 4) `sk-[A-Za-z0-9_-]+` (tôn trọng ranh giới từ để không hỏng `task-123`)
 pub fn redact_secrets(input: &str) -> String {
     #[cfg(not(test))]
     {
@@ -455,8 +456,78 @@ pub fn redact_secrets(input: &str) -> String {
         }
     }
 
-    let pass1 = redact_bearer(&stage0);
+    let pass0_url = redact_url_credentials(&stage0);
+    let pass1 = redact_bearer(&pass0_url);
     redact_sk(&pass1)
+}
+
+fn is_url_authority_delimiter(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '/' | '?' | '#' | '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '{' | '}'
+        )
+}
+
+fn redact_url_credentials(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    while idx < input.len() {
+        let rest = &input[idx..];
+        let prev_ok = idx == 0
+            || !input[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if prev_ok {
+            let mut scheme_bytes = 0usize;
+            let mut chars = rest.char_indices();
+            if let Some((_, first)) = chars.next() {
+                if first.is_ascii_alphabetic() {
+                    scheme_bytes = first.len_utf8();
+                    for (pos, ch) in chars {
+                        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.') {
+                            scheme_bytes = pos + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            if scheme_bytes > 0 && rest[scheme_bytes..].starts_with("://") {
+                let prefix_len = scheme_bytes + 3;
+                let after_scheme = &rest[prefix_len..];
+                let auth_bytes: usize = after_scheme
+                    .chars()
+                    .take_while(|c| !is_url_authority_delimiter(*c))
+                    .map(char::len_utf8)
+                    .sum();
+                let authority = &after_scheme[..auth_bytes];
+                if let Some(at_pos) = authority.rfind('@') {
+                    let userinfo = &authority[..at_pos];
+                    let host_port = &authority[at_pos + 1..];
+                    if !host_port.is_empty() {
+                        if let Some(colon_pos) = userinfo.find(':') {
+                            let user_part = &userinfo[..colon_pos];
+                            let pass_part = &userinfo[colon_pos + 1..];
+                            if !pass_part.is_empty() {
+                                out.push_str(&rest[..prefix_len]);
+                                out.push_str(user_part);
+                                out.push_str(":[REDACTED]@");
+                                out.push_str(host_port);
+                                idx += prefix_len + auth_bytes;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let ch = rest.chars().next().expect("idx < input.len()");
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
 }
 
 fn redact_bearer(input: &str) -> String {
@@ -744,5 +815,31 @@ mod tests {
         assert!(!reloaded_false.auto_merge, "reloaded settings must preserve auto_merge = false");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_h3_redact_secrets_proxy_urls_at_in_password_and_password_only() {
+        let msg = concat!(
+            "Failed connecting via socks5h://user1:p@ss@word!@198.51.100.10:1080/tunnel?email=alice@example.com ",
+            "and fallback http://:only_secret@203.0.113.5:8080, ",
+            "also \"https://admin:sk-rawtoken99@[::1]:8443\" and https://public.example.com/u?contact=bob@example.com"
+        );
+        let redacted = redact_secrets(msg);
+
+        assert!(!redacted.contains("p@ss@word!"));
+        assert!(!redacted.contains("only_secret"));
+        assert!(!redacted.contains("sk-rawtoken99"));
+
+        assert!(redacted.contains("socks5h://user1:[REDACTED]@198.51.100.10:1080/tunnel?email=alice@example.com"));
+        assert!(redacted.contains("http://:[REDACTED]@203.0.113.5:8080"));
+        assert!(redacted.contains("\"https://admin:[REDACTED]@[::1]:8443\""));
+        assert!(redacted.contains("https://public.example.com/u?contact=bob@example.com"));
+
+        // Username-only URL without password and short 2-char password URL
+        let edge = "http://useronly@1.2.3.4:8080 and socks5://u:ab@5.6.7.8:1080";
+        let redacted_edge = redact_secrets(edge);
+        assert!(redacted_edge.contains("http://useronly@1.2.3.4:8080"));
+        assert!(redacted_edge.contains("socks5://u:[REDACTED]@5.6.7.8:1080"));
+        assert!(!redacted_edge.contains(":ab@"));
     }
 }
