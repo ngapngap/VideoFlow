@@ -2239,7 +2239,8 @@ pub async fn muse_renew_account(
             "/admin/accounts/{}/renew",
             muse_sanitize_id(&account_id)?
         );
-        crate::muse_sidecar::admin_send(port, &key, "POST", &path, None)
+        // renew_session có thể poll VM wake tối đa 20s + timeout HTTP 15s → dùng 45s.
+        crate::muse_sidecar::admin_send_timeout(port, &key, "POST", &path, None, 45)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?
@@ -2260,7 +2261,8 @@ pub async fn muse_account_quota(
         let id = muse_sanitize_id(&account_id)?;
         let flag = if refresh { "?refresh=1" } else { "" };
         let path = format!("/admin/accounts/{id}/quota{flag}");
-        crate::muse_sidecar::admin_get(port, &key, &path)
+        // Đọc quota bằng browser (cold-start Edge riêng theo account + mở muse.ai) mất 15-45s → dùng 75s.
+        crate::muse_sidecar::admin_get_timeout(port, &key, &path, 75)
     })
     .await
     .map_err(|e| AppError::new("JOIN_FAIL", format!("{e}")))?

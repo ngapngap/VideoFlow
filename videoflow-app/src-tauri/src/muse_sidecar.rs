@@ -169,20 +169,53 @@ fn find_free_port(preferred: u16) -> AppResult<u16> {
         .map_err(|e| AppError::new("MUSE_PORT_FAIL", format!("Không đọc được port: {e}")))
 }
 
-fn blocking_client() -> AppResult<reqwest::blocking::Client> {
+fn blocking_client_with_timeout(timeout_secs: u64) -> AppResult<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| AppError::new("MUSE_HTTP_FAIL", format!("Không tạo được HTTP client: {e}")))
 }
 
-/// GET request tới Admin API của sidecar, trả JSON.
-pub fn admin_get(port: u16, api_key: &str, path: &str) -> AppResult<serde_json::Value> {
+/// GET request tới Admin API của sidecar với timeout tùy chỉnh, trả JSON.
+pub fn admin_get_timeout(
+    port: u16,
+    api_key: &str,
+    path: &str,
+    timeout_secs: u64,
+) -> AppResult<serde_json::Value> {
     let url = format!("http://127.0.0.1:{port}{path}");
-    let resp = blocking_client()?
+    let resp = blocking_client_with_timeout(timeout_secs)?
         .get(&url)
         .bearer_auth(api_key)
+        .send()
+        .map_err(|e| AppError::new("MUSE_ADMIN_UNREACHABLE", format!("Sidecar không phản hồi: {e}")))?;
+    parse_admin_response(resp)
+}
+
+/// GET request tới Admin API của sidecar, trả JSON.
+pub fn admin_get(port: u16, api_key: &str, path: &str) -> AppResult<serde_json::Value> {
+    admin_get_timeout(port, api_key, path, 10)
+}
+
+/// POST/DELETE/PATCH tới Admin API với body JSON và timeout tùy chỉnh.
+pub fn admin_send_timeout(
+    port: u16,
+    api_key: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    timeout_secs: u64,
+) -> AppResult<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let client = blocking_client_with_timeout(timeout_secs)?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|e| AppError::new("MUSE_ADMIN_FAIL", format!("Sai HTTP method: {e}")))?;
+    let mut req = client.request(method, &url).bearer_auth(api_key);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    let resp = req
         .send()
         .map_err(|e| AppError::new("MUSE_ADMIN_UNREACHABLE", format!("Sidecar không phản hồi: {e}")))?;
     parse_admin_response(resp)
@@ -196,18 +229,7 @@ pub fn admin_send(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> AppResult<serde_json::Value> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let client = blocking_client()?;
-    let method = reqwest::Method::from_bytes(method.as_bytes())
-        .map_err(|e| AppError::new("MUSE_ADMIN_FAIL", format!("Sai HTTP method: {e}")))?;
-    let mut req = client.request(method, &url).bearer_auth(api_key);
-    if let Some(b) = body {
-        req = req.json(b);
-    }
-    let resp = req
-        .send()
-        .map_err(|e| AppError::new("MUSE_ADMIN_UNREACHABLE", format!("Sidecar không phản hồi: {e}")))?;
-    parse_admin_response(resp)
+    admin_send_timeout(port, api_key, method, path, body, 10)
 }
 
 pub fn open_login(port: u16, api_key: &str, account_id: &str) -> AppResult<serde_json::Value> {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { api, type MuseAccount, type MuseStatusView } from "../lib/api";
+  import { api, formatError, type MuseAccount, type MuseStatusView } from "../lib/api";
   import AccountCard from "../lib/AccountCard.svelte";
   import Icons from "../lib/Icons.svelte";
   import { running, showToast } from "../lib/store";
@@ -67,7 +67,7 @@
       showToast("success", "Đã khởi động engine VideoFlow Muse.");
       await loadData();
     } catch (e) {
-      showToast("error", `Không thể khởi động engine: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Không thể khởi động engine: ${formatError(e)}`);
     } finally {
       startingEngine = false;
     }
@@ -80,7 +80,7 @@
       showToast("info", "Đã dừng engine VideoFlow Muse.");
       await loadData();
     } catch (e) {
-      showToast("error", `Không thể dừng engine: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Không thể dừng engine: ${formatError(e)}`);
     }
   }
 
@@ -112,7 +112,7 @@
       await api.muse_open_login(acc.id);
       await loadData();
     } catch (e) {
-      addErr = e instanceof Error ? e.message : String(e);
+      addErr = formatError(e);
       showToast("error", `Lỗi thêm tài khoản: ${addErr}`);
     } finally {
       loginBusy = false;
@@ -157,7 +157,7 @@
       showToast("success", `Đã thêm tài khoản "${label}".`);
       await loadData();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = formatError(e);
       if (/trùng|belongs to account/i.test(msg) && !allowDuplicate) {
         dupPending = true;
         addErr = "Cookie trùng session với tài khoản đã có. Tick 'Cho phép trùng session' nếu bạn muốn tiếp tục.";
@@ -175,7 +175,7 @@
       const path = await api.muse_download_extension();
       showToast("success", `Đã tải extension: ${path}`);
     } catch (e) {
-      showToast("error", `Lỗi tải extension: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Lỗi tải extension: ${formatError(e)}`);
     }
   }
 

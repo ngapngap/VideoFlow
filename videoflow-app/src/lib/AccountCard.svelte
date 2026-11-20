@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { api, type MuseAccount, type MuseQuotaSnapshot } from "./api";
+  import { api, formatError, type MuseAccount, type MuseQuotaSnapshot } from "./api";
   import Icons from "./Icons.svelte";
   import { showToast } from "./store";
 
@@ -88,7 +88,7 @@
       await api.muse_update_account(account.id, !account.enabled);
       dispatch("updated", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi cập nhật: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Lỗi cập nhật: ${formatError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -103,7 +103,7 @@
       showToast("success", "Đã lưu proxy riêng cho tài khoản.");
       dispatch("updated", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi lưu proxy: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Lỗi lưu proxy: ${formatError(e)}`);
     } finally {
       proxySaving = false;
     }
@@ -118,7 +118,7 @@
       showToast("success", "Đã làm mới hạn mức.");
       dispatch("refresh", { id: account.id });
     } catch (e) {
-      quotaErr = e instanceof Error ? e.message : String(e);
+      quotaErr = formatError(e);
       showToast("error", `Lỗi đọc hạn mức: ${quotaErr}`);
     } finally {
       quotaBusy = false;
@@ -133,7 +133,7 @@
       showToast("success", "Đã gia hạn phiên thành công.");
       dispatch("updated", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi gia hạn: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Lỗi gia hạn: ${formatError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -147,7 +147,7 @@
       showToast("info", res.message || "Đang mở trình duyệt đăng nhập...");
       dispatch("openLogin", { id: account.id });
     } catch (e) {
-      showToast("error", `Không thể mở trình duyệt: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Không thể mở trình duyệt: ${formatError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -161,7 +161,7 @@
       showToast("info", res.message || "Đang mở trình duyệt xem hội thoại...");
       dispatch("openView", { id: account.id });
     } catch (e) {
-      showToast("error", `Không thể mở xem web: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Không thể mở xem web: ${formatError(e)}`);
     } finally {
       actionBusy = false;
     }
@@ -176,7 +176,7 @@
       showToast("success", "Đã xóa tài khoản.");
       dispatch("deleted", { id: account.id });
     } catch (e) {
-      showToast("error", `Lỗi xóa tài khoản: ${e instanceof Error ? e.message : String(e)}`);
+      showToast("error", `Lỗi xóa tài khoản: ${formatError(e)}`);
     } finally {
       actionBusy = false;
     }
