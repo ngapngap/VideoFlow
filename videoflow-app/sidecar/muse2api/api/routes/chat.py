@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -60,7 +61,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
     stream = svc.gateway.chat_stream(req)
 
     if not body.stream:
-        text = "".join([d async for d in stream])
+        async with contextlib.aclosing(stream):
+            text = "".join([d async for d in stream])
         return {
             "id": completion_id,
             "object": "chat.completion",
@@ -107,6 +109,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request,
                 finally:
                     if not pending.done():
                         pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
             produced = first or ""
             yield _sse(chunk({"role": "assistant", "content": produced}))
             async for delta in stream:

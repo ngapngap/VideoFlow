@@ -8,7 +8,6 @@ import logging
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 import httpx
@@ -25,6 +24,10 @@ _CANDIDATES = (
     "/usr/bin/chromium",
     "/snap/bin/chromium",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 )
 
 
@@ -38,16 +41,17 @@ def find_chromium(configured: str = "") -> str:
 
 
 def _build_wmi_filter(profile_dir: Path, port: int | None = None) -> str:
-    """Build the PowerShell boolean filter expression matching only processes of this profile/port."""
+    """Build a boundary-aware case-insensitive PowerShell filter matching only processes of this profile/port."""
     full = str(profile_dir).replace("'", "''")
-    prof_name = profile_dir.name.replace("'", "''")
-    cond_parts: list[str] = [f"$_.CommandLine.Contains('{full}')"]
+    # Match exact --user-data-dir=<full> followed by quote, whitespace, or end-of-line
+    # so acc_1 never matches acc_10.
+    cond_parts: list[str] = [
+        f"($_.CommandLine -imatch ('--user-data-dir=\"?' + [regex]::Escape('{full}') + '(\"|\\s|$)'))"
+    ]
     if port:
-        cond_parts.append(f"$_.CommandLine.Contains('--remote-debugging-port={port}')")
-    cond_parts.append(
-        f"($_.CommandLine.Contains('VideoFlowDesktop') -and "
-        f"$_.CommandLine.Contains('{prof_name}'))"
-    )
+        cond_parts.append(
+            f"($_.CommandLine -imatch '--remote-debugging-port={port}(\\s|$)')"
+        )
     return " -or ".join(cond_parts)
 
 
@@ -80,7 +84,6 @@ def _kill_stale_browsers(profile_dir: Path, port: int | None = None) -> int:
                            capture_output=True, timeout=15)
     if pids:
         log.warning("killed %d stale browser process(es) holding %s", len(pids), profile_dir)
-        time.sleep(1.5)  # let Windows release the singleton mutex + file handles
     return len(pids)
 
 
@@ -119,7 +122,9 @@ class ChromiumProcess:
         # Attempt 3 wipes the profile directory outright: it only holds the browser
         # session cache, while the accounts themselves live in data/accounts.json.
         for attempt in (1, 2, 3):
-            _kill_stale_browsers(self.profile_dir, self.port)
+            killed = await asyncio.to_thread(_kill_stale_browsers, self.profile_dir, self.port)
+            if killed:
+                await asyncio.sleep(1.5)
             if attempt == 3:
                 log.warning("resetting browser profile %s after repeated CDP failures",
                             self.profile_dir)
@@ -169,15 +174,21 @@ class ChromiumProcess:
             args.insert(1, "--no-sandbox")
 
         log.info("launching Chromium: %s (profile=%s)", self.executable, self.profile_dir)
-        # Keep stderr readable: "exited early" without a reason is otherwise undebuggable.
-        self._stderr_path = self.profile_dir.parent / "chromium-stderr.log"
-        stderr_sink = open(self._stderr_path, "wb")
+        # Keep stderr isolated per profile so concurrent account launches never collide on Windows.
+        self._stderr_path = self.profile_dir / "chromium-stderr.log"
         try:
-            self.proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.DEVNULL, stderr=stderr_sink
-            )
-        finally:
-            stderr_sink.close()
+            stderr_sink = open(self._stderr_path, "wb")
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.DEVNULL, stderr=stderr_sink
+                )
+            finally:
+                stderr_sink.close()
+        except Exception:
+            if self._proxy_relay is not None:
+                await self._proxy_relay.stop()
+                self._proxy_relay = None
+            raise
         for _ in range(120):  # 60s: cold start on Windows + AV scanning can be slow
             if url := await self.browser_ws_url():
                 return url
@@ -193,11 +204,24 @@ class ChromiumProcess:
 
     async def stop(self) -> None:
         if self.proc and self.proc.returncode is None:
-            self.proc.terminate()
+            if os.name == "nt":
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=15,
+                    )
+            else:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    self.proc.terminate()
             try:
                 await asyncio.wait_for(self.proc.wait(), 10)
             except asyncio.TimeoutError:
-                self.proc.kill()
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    self.proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.proc.wait(), 5)
         self.proc = None
         if self._proxy_relay is not None:
             await self._proxy_relay.stop()

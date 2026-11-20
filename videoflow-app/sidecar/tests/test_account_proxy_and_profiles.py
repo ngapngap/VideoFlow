@@ -378,6 +378,8 @@ def test_wmi_filter_prevents_cross_account_process_termination():
     assert "acc_A" in filter_a
 
     # Simulate WMI condition evaluation for both command lines
+    import re
+
     def eval_filter(wmi_cond: str, cmd: str) -> bool:
         branches = wmi_cond.split(" -or ")
         for branch in branches:
@@ -388,6 +390,15 @@ def test_wmi_filter_prevents_cross_account_process_termination():
                     return True
             elif branch.startswith("($_.CommandLine.Contains('VideoFlowDesktop')"):
                 if "VideoFlowDesktop" in cmd and profile_a.name in cmd:
+                    return True
+            elif "-imatch" in branch:
+                m_esc = re.search(r"\[regex\]::Escape\('([^']+)'\)", branch)
+                if m_esc:
+                    pat = r'--user-data-dir="?' + re.escape(m_esc.group(1)) + r'("|\s|$)'
+                    if re.search(pat, cmd, re.IGNORECASE):
+                        return True
+                m_port = re.search(r"-imatch '(--remote-debugging-port=\d+\(\\s\|\$\))'", branch)
+                if m_port and re.search(m_port.group(1), cmd, re.IGNORECASE):
                     return True
         return False
 

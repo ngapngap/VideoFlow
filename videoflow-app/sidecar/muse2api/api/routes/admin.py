@@ -192,6 +192,9 @@ async def update_account(account_id: str, body: AccountUpdate,
     if body.proxy is not None:
         acc.proxy = body.proxy.strip() if body.proxy and body.proxy.strip() else None
     await svc.pool.upsert(acc)
+    driver = getattr(svc, "driver", None)
+    if body.cookies is not None and driver is not None and hasattr(driver, "mark_account_stale"):
+        await driver.mark_account_stale(account_id)
     return {"account": acc.public()}
 
 
@@ -199,6 +202,9 @@ async def update_account(account_id: str, body: AccountUpdate,
 async def delete_account(account_id: str, svc: Services = Depends(get_services)) -> dict:
     if not await svc.pool.remove(account_id):
         raise NotFound(f"account '{account_id}' not found")
+    driver = getattr(svc, "driver", None)
+    if driver is not None and hasattr(driver, "release_account_driver"):
+        await driver.release_account_driver(account_id)
     return {"deleted": account_id}
 
 

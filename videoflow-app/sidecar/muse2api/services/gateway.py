@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import TypeVar
 
 from ..accounts.model import Account
@@ -50,9 +50,10 @@ class Gateway:
             async with self._lease(tried, req.conversation_hint) as lease:
                 emitted = False
                 try:
-                    async for delta in self.driver.chat_stream(lease.account, req):
-                        emitted = True
-                        yield delta
+                    async with aclosing(self.driver.chat_stream(lease.account, req)) as inner:
+                        async for delta in inner:
+                            emitted = True
+                            yield delta
                     return
                 except CDPError as exc:
                     log.warning("CDP error during chat on account %s (%s)", lease.account.id, exc)

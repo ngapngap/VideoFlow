@@ -12,6 +12,7 @@ silently dropped (see C3).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -140,7 +141,8 @@ async def create_response(body: ResponseRequest, request: Request,
     model_name = body.model or spec.id
 
     if not body.stream:
-        text = "".join([d async for d in stream])
+        async with contextlib.aclosing(stream):
+            text = "".join([d async for d in stream])
         return _response_object(resp_id, msg_id, created, model_name, text, flat.text)
 
     async def events(first: str | None) -> AsyncIterator[bytes]:
@@ -168,6 +170,7 @@ async def create_response(body: ResponseRequest, request: Request,
                 finally:
                     if not pending.done():
                         pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
             yield _sse({"type": "response.created", "sequence_number": seq,
                         "response": _response_object(resp_id, msg_id, created, model_name,
                                                      "", flat.text, status="in_progress")})

@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import WebSocketException
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,13 @@ class CDPSession:
 
     @classmethod
     async def connect(cls, ws_url: str) -> CDPSession:
-        ws = await connect(ws_url, max_size=None, ping_interval=None, open_timeout=15)
+        ws = await connect(
+            ws_url,
+            max_size=None,
+            ping_interval=20,
+            ping_timeout=10,
+            open_timeout=15,
+        )
         return cls(ws)
 
     @property
@@ -71,9 +78,17 @@ class CDPSession:
         msg_id = next(self._ids)
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = fut
-        await self._ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
         try:
-            return await asyncio.wait_for(fut, timeout)
+            try:
+                await self._ws.send(
+                    json.dumps({"id": msg_id, "method": method, "params": params or {}})
+                )
+            except (WebSocketException, OSError) as exc:
+                raise CDPError(f"cdp send failed: {exc}") from exc
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except (WebSocketException, OSError, TimeoutError) as exc:
+                raise CDPError(f"cdp {method} failed: {exc}") from exc
         finally:
             self._pending.pop(msg_id, None)
 

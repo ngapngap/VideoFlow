@@ -99,7 +99,7 @@ def allocate_cdp_port(base_port: int) -> int:
             _USED_PORTS.add(port)
             return port
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
+        s.bind(("127.0.0.1", 0))
         p = int(s.getsockname()[1])
     _USED_PORTS.add(p)
     return p
@@ -304,13 +304,82 @@ class BrowserDriver(MuseDriver):
         self._quota_locks: dict[str, asyncio.Lock] = {}
         self._warming: dict[str, asyncio.Task] = {}
         self._recovery_lock = asyncio.Lock()
+        self._coordinator_ready = False
 
         # Multi-driver registry per account (when self.account is None)
         self._account_drivers: dict[str, BrowserDriver] = {}
+        self._driver_locks: dict[str, asyncio.Lock] = {}
+        self._prewarm_tasks: dict[str, asyncio.Task] = {}
 
     @property
     def account_drivers(self) -> dict[str, BrowserDriver]:
         return self._account_drivers
+
+    async def _ensure_account_driver(self, account: Account) -> BrowserDriver:
+        """Async per-account driver lookup with serialized proxy replacement and clean startup."""
+        if self.account is not None:
+            return self
+        lock = self._driver_locks.setdefault(account.id, asyncio.Lock())
+        async with lock:
+            expected_proxy = resolve_proxy(account, self.settings.browser_proxy)
+            drv = self._account_drivers.get(account.id)
+            if drv is not None and drv.proxy != expected_proxy:
+                log.info(
+                    "account %s proxy changed from '%s' to '%s'; shutting down old driver",
+                    account.id,
+                    mask_proxy(drv.proxy),
+                    mask_proxy(expected_proxy),
+                )
+                self._account_drivers.pop(account.id, None)
+                await drv.shutdown()
+                drv = None
+            if drv is None:
+                port = allocate_cdp_port(self.settings.cdp_port + len(self._account_drivers) + 1)
+                pdir = resolve_account_profile_dir(self.settings, account.id)
+                drv = BrowserDriver(
+                    self.settings,
+                    account=account,
+                    port=port,
+                    profile_dir=pdir,
+                    proxy=expected_proxy,
+                )
+                self._account_drivers[account.id] = drv
+            return drv
+
+    async def release_account_driver(self, account_id: str) -> None:
+        """Shut down and remove an account's sub-driver (e.g. on account deletion)."""
+        if self.account is not None:
+            if self.account_id == account_id:
+                await self.shutdown()
+            return
+        task = self._prewarm_tasks.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        lock = self._driver_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            drv = self._account_drivers.pop(account_id, None)
+            if drv is not None:
+                await drv.shutdown()
+        self._quota_cache.pop(account_id, None)
+
+    async def mark_account_stale(self, account_id: str) -> None:
+        """Mark all open tabs of an account stale and close idle ones (e.g. after cookie PATCH)."""
+        if self.account is None:
+            drv = self._account_drivers.get(account_id)
+            if drv is not None:
+                await drv.mark_account_stale(account_id)
+            self._quota_cache.pop(account_id, None)
+            return
+        self._quota_cache.pop(account_id, None)
+        async with self._tab_cond:
+            tabs = list(self._tabs.get(account_id, []))
+            for tab in tabs:
+                tab.stale = True
+            idle = [t for t in tabs if not t.busy]
+        for tab in idle:
+            await self._close_tab(tab)
 
     def get_account_driver(self, account: Account) -> BrowserDriver:
         if self.account is not None:
@@ -350,8 +419,11 @@ class BrowserDriver(MuseDriver):
                 return
             log.warning("CDP disconnect detected on driver (account=%s); recovering browser and restarting Chromium...",
                         self.account_id or "default")
-            for task in self._warming.values():
+            warming_tasks = list(self._warming.values())
+            for task in warming_tasks:
                 task.cancel()
+            if warming_tasks:
+                await asyncio.gather(*warming_tasks, return_exceptions=True)
             self._warming.clear()
 
             for tabs in list(self._tabs.values()):
@@ -372,7 +444,9 @@ class BrowserDriver(MuseDriver):
                     await self._chromium.stop()
                 self._chromium = None
 
-            _kill_stale_browsers(self.profile_dir, self.port)
+            killed = await asyncio.to_thread(_kill_stale_browsers, self.profile_dir, self.port)
+            if killed:
+                await asyncio.sleep(1.5)
 
             for lock in ("SingletonLock", "SingletonCookie", "DevToolsActivePort",
                          "SingletonSocket", "lockfile"):
@@ -409,21 +483,39 @@ class BrowserDriver(MuseDriver):
                  self.account_id or "default", self.profile_dir, mask_proxy(self.proxy), self.port)
 
     async def shutdown(self) -> None:
-        if self.account is None:
-            for d in list(self._account_drivers.values()):
-                await d.shutdown()
-            self._account_drivers.clear()
-        for task in self._warming.values():
-            task.cancel()
-        for tabs in list(self._tabs.values()):
-            for tab in list(tabs):
-                await self._close_tab(tab)
-        if self._browser:
-            await self._browser.close()
-        if self._chromium:
-            await self._chromium.stop()
-        if self.port != self.settings.cdp_port:
-            release_cdp_port(self.port)
+        try:
+            if self.account is None:
+                prewarms = list(self._prewarm_tasks.values())
+                for task in prewarms:
+                    task.cancel()
+                if prewarms:
+                    await asyncio.gather(*prewarms, return_exceptions=True)
+                self._prewarm_tasks.clear()
+                for d in list(self._account_drivers.values()):
+                    with contextlib.suppress(Exception):
+                        await d.shutdown()
+                self._account_drivers.clear()
+            warming_tasks = list(self._warming.values())
+            for task in warming_tasks:
+                task.cancel()
+            if warming_tasks:
+                await asyncio.gather(*warming_tasks, return_exceptions=True)
+            self._warming.clear()
+            for tabs in list(self._tabs.values()):
+                for tab in list(tabs):
+                    with contextlib.suppress(Exception):
+                        await self._close_tab(tab)
+            if self._browser:
+                with contextlib.suppress(Exception):
+                    await self._browser.close()
+                self._browser = None
+        finally:
+            if self._chromium:
+                with contextlib.suppress(Exception):
+                    await self._chromium.stop()
+                self._chromium = None
+            if self.port != self.settings.cdp_port:
+                release_cdp_port(self.port)
 
     async def health(self) -> dict[str, Any]:
         if self.account is None and self._account_drivers:
@@ -503,19 +595,18 @@ class BrowserDriver(MuseDriver):
             return tab
         try:
             tab = await self._open_tab(account)
-        except CDPError as exc:
-            log.warning("CDP error in _checkout: %s; recovering browser", exc)
-            await self._recover_browser()
-            tab = await self._open_tab(account)
         finally:
-            async with self._tab_cond:
-                self._opening[account.id] -= 1
-                if tab:
-                    tab.busy = True
-                    self._tabs.setdefault(account.id, []).append(tab)
-                self._tab_cond.notify_all()
+            await asyncio.shield(self._finish_open(account.id, tab))
         log.info("opened tab %d for account %s", len(self._tabs[account.id]), account.id)
         return tab
+
+    async def _finish_open(self, account_id: str, tab: _Tab | None) -> None:
+        async with self._tab_cond:
+            self._opening[account_id] = max(0, self._opening.get(account_id, 1) - 1)
+            if tab:
+                tab.busy = True
+                self._tabs.setdefault(account_id, []).append(tab)
+            self._tab_cond.notify_all()
 
     async def _checkin(self, tab: _Tab) -> None:
         # Free the tab before taking the lock: a request cancelled while waiting for
@@ -554,8 +645,13 @@ class BrowserDriver(MuseDriver):
             raise UpstreamAuthError(f"account is missing session cookies: {', '.join(missing)}")
         for attempt in (1, 2):
             if not self._browser or self._browser.closed:
-                await self._recover_browser()
+                if self._chromium is None and self._browser is None:
+                    await self.startup()
+                else:
+                    await self._recover_browser()
             assert self._browser and self._chromium
+            target_id: str | None = None
+            session: CDPSession | None = None
             try:
                 context_id = await self._context(account)
                 # A window per tab: Chromium throttles background tabs of a shared window,
@@ -575,11 +671,25 @@ class BrowserDriver(MuseDriver):
                 await self._set_cookies(session, account)
                 return _Tab(account.id, context_id, target_id, session)
             except CDPError as exc:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        await session.close()
+                if target_id is not None and self._browser and not self._browser.closed:
+                    with contextlib.suppress(Exception):
+                        await self._browser.send("Target.closeTarget", {"targetId": target_id})
                 log.warning("CDP error in _open_tab (attempt %d): %s", attempt, exc)
                 if attempt == 1:
                     await self._recover_browser()
                 else:
                     raise
+            except BaseException:
+                if session is not None:
+                    with contextlib.suppress(Exception):
+                        await session.close()
+                if target_id is not None and self._browser and not self._browser.closed:
+                    with contextlib.suppress(Exception):
+                        await self._browser.send("Target.closeTarget", {"targetId": target_id})
+                raise
         raise RuntimeError("unreachable in _open_tab")
 
     async def _close_tab(self, tab: _Tab) -> None:
@@ -947,9 +1057,10 @@ class BrowserDriver(MuseDriver):
 
     async def chat_stream(self, account: Account, req: ChatRequest) -> AsyncIterator[str]:
         if self.account is None:
-            drv = self.get_account_driver(account)
-            async for delta in drv.chat_stream(account, req):
-                yield delta
+            drv = await self._ensure_account_driver(account)
+            async with contextlib.aclosing(drv.chat_stream(account, req)) as inner:
+                async for delta in inner:
+                    yield delta
             return
         tab, base = await self._begin_chat(account, req)
         base_count, base_text = base.get("agentCount", 0), base.get("lastText", "")
@@ -1018,11 +1129,20 @@ class BrowserDriver(MuseDriver):
 
     def prewarm(self, account: Account) -> None:
         """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
-        if self.account is None:
-            drv = self.get_account_driver(account)
-            drv.prewarm(account)
+        if self.settings.warm_threads <= 0:
             return
-        if self.settings.warm_threads <= 0 or self._browser is None:
+        if self.account is None:
+            existing = self._prewarm_tasks.get(account.id)
+            if existing and not existing.done():
+                return
+            async def _kick() -> None:
+                drv = await self._ensure_account_driver(account)
+                if not drv.browser_alive:
+                    await drv.startup()
+                drv.prewarm(account)
+            self._prewarm_tasks[account.id] = asyncio.create_task(_kick())
+            return
+        if self._browser is None:
             return
         task = self._warming.get(account.id)
         if task and not task.done():
@@ -1315,7 +1435,7 @@ class BrowserDriver(MuseDriver):
 
     async def generate_image(self, account: Account, req: ImageRequest) -> list[MediaResult]:
         if self.account is None:
-            drv = self.get_account_driver(account)
+            drv = await self._ensure_account_driver(account)
             return await drv.generate_image(account, req)
         prompt = self._media_prompt(req.prompt, "image", req.size)
         results = []
@@ -1328,7 +1448,7 @@ class BrowserDriver(MuseDriver):
 
     async def generate_video(self, account: Account, req: VideoRequest) -> MediaResult:
         if self.account is None:
-            drv = self.get_account_driver(account)
+            drv = await self._ensure_account_driver(account)
             return await drv.generate_video(account, req)
         prompt = self._media_prompt(req.prompt, "video", req.size, req.duration)
         images = [req.first_frame] if req.first_frame else []
@@ -1338,7 +1458,7 @@ class BrowserDriver(MuseDriver):
     # ------------------------------------------------------------ session
     async def renew_session(self, account: Account) -> SessionInfo:
         if self.account is None:
-            drv = self.get_account_driver(account)
+            drv = await self._ensure_account_driver(account)
             return await drv.renew_session(account)
         proxy = self.proxy or resolve_proxy(account, self.settings.browser_proxy) or None
         info = await muse.renew_session(account.cookies, proxy=proxy)
@@ -1393,7 +1513,7 @@ class BrowserDriver(MuseDriver):
         ``forget_quota`` bypasses it. Raises ``AccountBusy`` rather than touch a tab
         that is serving a request."""
         if self.account is None:
-            drv = self.get_account_driver(account)
+            drv = await self._ensure_account_driver(account)
             return await drv.quota(account)
         if hit := self._cached_quota(account.id):
             return hit
