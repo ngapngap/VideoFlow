@@ -411,9 +411,9 @@ jobs:
             - Bộ cài NSIS (64-bit) cho Windows
             - Tự cập nhật trong app (Cài đặt → kiểm tra cập nhật ở thanh trạng thái)
             - Kèm engine VideoFlow Muse (muse.ai: tạo ảnh + video bằng cookie)
-          # draft: release chỉ công khai sau khi tự kiểm tra xong; sai thì xoá, không ai tải bản lỗi.
-          # Bật tự động publish lại bằng cách đổi thành false khi quy trình đã ổn định.
-          releaseDraft: true
+          # Tự động publish release ngay khi build & verify thành công.
+          # Đổi lại thành true nếu muốn giữ ở trạng thái Draft để kiểm tra thủ công trước.
+          releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
           args: --target x86_64-pc-windows-msvc
