@@ -26,9 +26,12 @@
     type SettingsView,
   } from "../lib/api";
   import {
+    countUsableMuseVideoAccounts,
     executeSettingsSave,
+    getConcurrencyMax,
     getVideoSecondsMax,
     isValidIntInRange,
+    validateConcurrency,
     validateVideoSeconds,
   } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
@@ -41,6 +44,7 @@
   let recheckingProject = false;
 
   let s: Settings | null = null;
+  let settingsMuseVideoAccounts = 0;
   let imageKeyPreview = "";
   let videoKeyPreview = "";
   let hasImageKey = false;
@@ -296,7 +300,15 @@
     return /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(t);
   }
 
-  function computeValidationErrors(cfg: Settings | null): string[] {
+  $: usableMuseAccounts = countUsableMuseVideoAccounts(
+    $museAccounts,
+    Boolean($museSidecarStatus?.sidecar.running),
+    $museSidecarStatus?.muse_video_accounts ?? settingsMuseVideoAccounts,
+    $museSidecarStatus?.sidecar.account_total ?? $museSidecarStatus?.muse_total_accounts
+  );
+  $: concurrencyMax = getConcurrencyMax(s?.video_source, usableMuseAccounts);
+
+  function computeValidationErrors(cfg: Settings | null, museVideoAccs: number): string[] {
     if (!cfg) return [];
     const errs: string[] = [];
     if (cfg.image_source !== "internal") {
@@ -337,8 +349,9 @@
     if (!isValidIntInRange(cfg.video_create_timeout_s, 5, 3600)) {
       errs.push("Timeout tạo task video phải là số nguyên từ 5 đến 3600 giây.");
     }
-    if (!isValidIntInRange(cfg.concurrency, 1, 3)) {
-      errs.push("Số dòng chạy đồng thời phải từ 1 đến 3.");
+    const concErr = validateConcurrency(cfg.concurrency, cfg.video_source, museVideoAccs);
+    if (concErr) {
+      errs.push(concErr);
     }
     if (!isValidIntInRange(cfg.max_attempts, 1, 10)) {
       errs.push("Số lần thử lại tối đa phải là số nguyên từ 1 đến 10.");
@@ -360,7 +373,7 @@
     return errs;
   }
 
-  $: validationErrors = computeValidationErrors(s);
+  $: validationErrors = computeValidationErrors(s, usableMuseAccounts);
   $: formValid = validationErrors.length === 0;
 
   function applySettingsView(view: SettingsView) {
@@ -369,6 +382,9 @@
       cloned.backoff_s = [30, 120, 300];
     }
     s = cloned;
+    if (typeof view.muse_video_accounts === "number") {
+      settingsMuseVideoAccounts = view.muse_video_accounts;
+    }
     imageKeyPreview = view.image_key_preview ?? "";
     videoKeyPreview = view.video_key_preview ?? "";
     hasImageKey = Boolean(view.has_image_key);
@@ -1452,14 +1468,16 @@
       {:else if tab === "run"}
         <div class="two-cols">
           <div>
-            <label class="label" for="cfg-concurrency">Số dòng chạy đồng thời (1–3)</label>
+            <label class="label" for="cfg-concurrency">
+              Số luồng chạy đồng thời (1–{concurrencyMax})
+            </label>
             <input
               id="cfg-concurrency"
               class="input full"
-              class:invalid={!isValidIntInRange(s.concurrency, 1, 3)}
+              class:invalid={Boolean(validateConcurrency(s.concurrency, s.video_source, usableMuseAccounts))}
               type="number"
               min="1"
-              max="3"
+              max={concurrencyMax}
               bind:value={s.concurrency}
               on:input={mark}
               disabled={$running}
@@ -1480,10 +1498,41 @@
             />
           </div>
         </div>
-        {#if Number(s.concurrency) > 1}
+        {#if s.video_source === "internal"}
+          <div class="hint">
+            Đang có <strong>{usableMuseAccounts}</strong> tài khoản Muse khả dụng — tối đa
+            <strong>{concurrencyMax}</strong> luồng video song song (bảo đảm mỗi tài khoản luôn chỉ
+            chạy tối đa 1 video duy nhất). Luồng tạo ảnh (B2) chạy song song độc lập không cần đợi
+            video.
+            {#if Number(s.concurrency) > concurrencyMax}
+              <button
+                type="button"
+                class="btn-link"
+                disabled={$running}
+                on:click={() => {
+                  if (s) {
+                    s.concurrency = concurrencyMax;
+                    mark();
+                  }
+                }}
+              >
+                Điều chỉnh về {concurrencyMax} luồng
+              </button>
+            {/if}
+          </div>
+        {:else}
+          <div class="hint">
+            Luồng tạo ảnh (B2) và tạo video (B3) chạy song song độc lập: ảnh tiếp tục tạo trước không
+            cần đợi video, còn video tự động chạy ngay khi ảnh của dòng tương ứng hoàn tất (tối đa
+            {concurrencyMax} luồng cho mỗi tầng).
+          </div>
+        {/if}
+        {#if Number(s.concurrency) > 1 && Number(s.concurrency) <= concurrencyMax}
           <div class="warn-hint">
-            Chế độ chạy song song {s.concurrency} dòng giúp rút ngắn thời gian tổng, nhưng hãy đảm bảo hạn mức
-            rate-limit API của bạn cho phép nhiều phiên đồng thời.
+            Chế độ chạy song song {s.concurrency} luồng ảnh + {s.concurrency} luồng video giúp rút
+            ngắn thời gian tổng{s.video_source === "internal"
+              ? ` (mỗi tài khoản Muse chạy đúng 1 luồng video riêng biệt)`
+              : ", nhưng hãy đảm bảo hạn mức rate-limit API của bạn cho phép nhiều phiên đồng thời"}.
           </div>
         {/if}
 
@@ -1659,7 +1708,24 @@
     {#if !formValid}
       <div class="validation-banner error-box">
         <Icons name="alert" size={15} />
-        <span>{validationErrors[0]}</span>
+        <span>
+          {validationErrors[0]}
+          {#if s.video_source === "internal" && Number(s.concurrency) > concurrencyMax}
+            <button
+              type="button"
+              class="btn-link"
+              disabled={$running}
+              on:click={() => {
+                if (s) {
+                  s.concurrency = concurrencyMax;
+                  mark();
+                }
+              }}
+            >
+              Điều chỉnh về {concurrencyMax} luồng
+            </button>
+          {/if}
+        </span>
       </div>
     {/if}
 
@@ -2294,5 +2360,20 @@
     gap: 6px;
     font-size: var(--fs-hint);
     color: var(--c-muted);
+  }
+  .btn-link {
+    background: none;
+    border: none;
+    padding: 0 4px;
+    margin-left: 4px;
+    color: var(--c-teal);
+    font-size: var(--fs-hint);
+    font-weight: 600;
+    text-decoration: underline;
+    display: inline;
+    cursor: pointer;
+  }
+  .btn-link:hover:not(:disabled) {
+    color: var(--c-teal-dark);
   }
 </style>

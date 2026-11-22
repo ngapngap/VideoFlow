@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 pub const KEYRING_SERVICE: &str = "VideoFlow Desktop";
 pub const KEY_IMAGE: &str = "endpoint_image_key";
 pub const KEY_VIDEO: &str = "endpoint_video_key";
+/// Giới hạn trần số luồng chạy đồng thời (khi dùng Muse nội bộ sẽ bị chặn thêm theo số tài khoản Muse khả dụng).
+pub const MAX_CONCURRENCY: u32 = 20;
 
 /// Bộ nhớ đệm các khóa bí mật thực tế (đã lưu/nạp trong phiên) để `redact_secrets` lọc sạch cả
 /// các khóa API tùy chỉnh không mang tiền tố `sk-` hoặc `Bearer ` mà không cần gọi OS Keyring mỗi dòng log.
@@ -59,7 +61,7 @@ pub struct Settings {
     pub poll_max_s: u64,             // mặc định 600 giây (Phụ lục quyết định 2)
     pub backoff_s: [u64; 3],         // mặc định 30s / 2 phút / 5 phút (Phụ lục quyết định 1)
     pub max_attempts: u32,           // mặc định 3 (13.5)
-    pub concurrency: u32,            // 1-3 dòng chạy song song
+    pub concurrency: u32,            // 1..=MAX_CONCURRENCY (khi dùng Muse nội bộ <= số tài khoản Muse khả dụng)
     pub schedule_enabled: bool,      // tự chạy theo lịch (6.6 Thẻ 4)
     pub schedule_hours: u64,         // chu kỳ N giờ
     pub auto_cleanup_days: u32,      // 30
@@ -146,7 +148,7 @@ impl Settings {
         clean.muse_sidecar_port = clean.muse_sidecar_port.max(1);
         clean.video_size = trim_or_default(&clean.video_size, &def.video_size);
 
-        clean.concurrency = clean.concurrency.clamp(1, 3);
+        clean.concurrency = clean.concurrency.clamp(1, MAX_CONCURRENCY);
         clean.max_attempts = clean.max_attempts.clamp(1, 10);
         let max_video_seconds = if clean.video_source == "internal" {
             60
@@ -760,7 +762,7 @@ mod tests {
         assert_eq!(loaded.endpoint_video_base_url, "https://vid.example.com/v1");
         assert_eq!(loaded.endpoint_video_model, "sora-2");
         assert_eq!(loaded.video_size, "720x1280");
-        assert_eq!(loaded.concurrency, 3);
+        assert_eq!(loaded.concurrency, MAX_CONCURRENCY);
         assert_eq!(loaded.max_attempts, 1);
         assert_eq!(loaded.image_timeout_s, 1);
         assert_eq!(loaded.video_create_timeout_s, 1);

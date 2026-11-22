@@ -2,9 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { Settings, SettingsView } from "../src/lib/api.js";
 import {
+  countUsableMuseVideoAccounts,
   executeSettingsSave,
+  getConcurrencyMax,
   getVideoSecondsMax,
   isValidIntInRange,
+  MAX_CONCURRENCY,
+  validateConcurrency,
   validateVideoSeconds,
 } from "../src/lib/settingsSave.js";
 
@@ -196,5 +200,48 @@ describe("video_seconds bounds validation", () => {
     assert.equal(isValidIntInRange("", 1, 60), false);
     assert.equal(isValidIntInRange(15.5, 1, 60), false);
     assert.equal(isValidIntInRange("30", 1, 60), true);
+  });
+});
+
+describe("concurrency bounds and Muse account cap", () => {
+  it("counts only enabled non-invalid non-video_locked Muse accounts when sidecar runs, falling back to disk count when stopped", () => {
+    const liveAccounts = [
+      { enabled: true, status: "active" },
+      { enabled: true, status: "cooling" },
+      { enabled: false, status: "active" },
+      { enabled: true, status: "invalid" },
+      { enabled: true, status: "video_locked" },
+    ];
+    assert.equal(countUsableMuseVideoAccounts(liveAccounts, true, 9, 5), 2);
+    assert.equal(countUsableMuseVideoAccounts(liveAccounts, false, 4, null), 4);
+    assert.equal(countUsableMuseVideoAccounts([], false, undefined, null), 0);
+    // Avoids transient 0-flicker while sidecar reports accounts > 0 before muse_list_accounts resolves
+    assert.equal(countUsableMuseVideoAccounts([], true, 3, 3), 3);
+    // Truly 0 accounts on running sidecar returns 0 even if fallback was stale
+    assert.equal(countUsableMuseVideoAccounts([], true, 3, 0), 0);
+  });
+
+  it("caps internal Muse concurrency strictly at usable Muse accounts (min 1) while allowing up to MAX_CONCURRENCY for gateway", () => {
+    assert.equal(getConcurrencyMax("gateway", 0), MAX_CONCURRENCY);
+    assert.equal(getConcurrencyMax("internal", 0), 1);
+    assert.equal(getConcurrencyMax("internal", 1), 1);
+    assert.equal(getConcurrencyMax("internal", 5), 5);
+    assert.equal(getConcurrencyMax("internal", 99), MAX_CONCURRENCY);
+
+    // 0 accounts: 1 allowed (for saving non-concurrency settings), >=2 rejected
+    assert.equal(validateConcurrency(1, "internal", 0), null);
+    assert.match(validateConcurrency(2, "internal", 0) ?? "", /Chưa có tài khoản Muse/);
+
+    // 1 account: 1 allowed, 2 rejected
+    assert.equal(validateConcurrency(1, "internal", 1), null);
+    assert.match(validateConcurrency(2, "internal", 1) ?? "", /không vượt quá 1 tài khoản Muse/);
+
+    // 4 accounts: 1..4 allowed, 5 rejected
+    assert.equal(validateConcurrency(4, "internal", 4), null);
+    assert.match(validateConcurrency(5, "internal", 4) ?? "", /không vượt quá 4 tài khoản Muse/);
+
+    // Gateway: up to MAX_CONCURRENCY allowed
+    assert.equal(validateConcurrency(6, "gateway", 0), null);
+    assert.match(validateConcurrency(MAX_CONCURRENCY + 1, "gateway", 0) ?? "", /1 đến 20/);
   });
 });

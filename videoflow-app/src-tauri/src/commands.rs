@@ -256,6 +256,9 @@ pub struct SettingsView {
     pub video_key_preview: Option<String>,
     pub has_image_key: bool,
     pub has_video_key: bool,
+    pub muse_total_accounts: usize,
+    pub muse_video_accounts: usize,
+    pub max_concurrency: u32,
 }
 
 #[derive(Deserialize, Default)]
@@ -2310,20 +2313,62 @@ pub fn save_row_prompts(
 
 // ━━ Commands: Cài đặt, API Key, Khay hệ thống & Đóng ứng dụng ━━
 
+/// Kiểm tra số luồng chạy đồng thời hợp lệ theo nguồn video và số tài khoản Muse khả dụng:
+/// - Luôn trong khoảng `1..=MAX_CONCURRENCY`.
+/// - Khi `video_source == "internal"`, số luồng KHÔNG được vượt quá số tài khoản Muse khả dụng
+///   (tối thiểu 1 để vẫn lưu được cấu hình trước khi thêm tài khoản) nhằm bảo đảm mỗi tài khoản
+///   chỉ chạy tối đa 1 luồng video duy nhất.
+pub fn validate_settings_concurrency(cfg: &Settings, muse_video_accounts: usize) -> AppResult<()> {
+    if cfg.concurrency < 1 || cfg.concurrency > settings::MAX_CONCURRENCY {
+        return Err(AppError::new(
+            "INVALID_CONCURRENCY",
+            format!(
+                "Số luồng chạy đồng thời phải từ 1 đến {}.",
+                settings::MAX_CONCURRENCY
+            ),
+        ));
+    }
+    if cfg.video_source == "internal" {
+        let max_allowed = (muse_video_accounts.max(1) as u32).min(settings::MAX_CONCURRENCY);
+        if cfg.concurrency > max_allowed {
+            let msg = if muse_video_accounts == 0 {
+                "Chưa có tài khoản Muse khả dụng — chỉ cho phép 1 luồng cho đến khi thêm tài khoản Muse.".to_string()
+            } else {
+                format!(
+                    "Số luồng chạy đồng thời ({}) không được vượt quá số tài khoản Muse khả dụng ({}) để đảm bảo mỗi tài khoản chỉ chạy tối đa 1 video.",
+                    cfg.concurrency, muse_video_accounts
+                )
+            };
+            return Err(AppError::new("CONCURRENCY_EXCEEDS_ACCOUNTS", msg));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> SettingsView {
     let s = state.settings_cache.read().clone();
+    let muse_dir = settings::app_data_dir().join(crate::muse_sidecar::MUSE_DATA_DIR);
+    let (muse_total_accounts, muse_video_accounts) =
+        crate::muse_sidecar::count_accounts_from_disk(&muse_dir);
     SettingsView {
         settings: s,
         image_key_preview: settings::key_preview("anh"),
         video_key_preview: settings::key_preview("video"),
         has_image_key: settings::has_api_key("anh"),
         has_video_key: settings::has_api_key("video"),
+        muse_total_accounts,
+        muse_video_accounts,
+        max_concurrency: settings::MAX_CONCURRENCY,
     }
 }
 
 #[tauri::command]
 pub fn save_settings(settings: Settings, state: State<'_, AppState>) -> AppResult<bool> {
+    let muse_dir = settings::app_data_dir().join(crate::muse_sidecar::MUSE_DATA_DIR);
+    let (_, muse_video_accounts) = crate::muse_sidecar::count_accounts_from_disk(&muse_dir);
+    validate_settings_concurrency(&settings, muse_video_accounts)?;
+
     let start_with_windows = {
         let mut cur = state.settings_cache.write();
         let recent = cur.recent_projects.clone();
@@ -2474,11 +2519,25 @@ pub async fn muse_sidecar_status(state: State<'_, AppState>) -> AppResult<serde_
     } else {
         cfg.muse_chromium_path.clone()
     };
+    let muse_dir = settings::app_data_dir().join(crate::muse_sidecar::MUSE_DATA_DIR);
+    let (disk_total, disk_capable) = crate::muse_sidecar::count_accounts_from_disk(&muse_dir);
+    let muse_total_accounts = st.account_total.map(|n| n as usize).unwrap_or(disk_total);
+    let muse_video_accounts = if st.running {
+        let avail = st
+            .account_available
+            .map(|n| n as usize)
+            .unwrap_or(disk_capable);
+        disk_capable.max(avail).min(muse_total_accounts)
+    } else {
+        disk_capable
+    };
     Ok(serde_json::json!({
         "sidecar": st,
         "video_source": cfg.video_source,
         "chromium_path": chromium,
         "headless": cfg.muse_headless,
+        "muse_total_accounts": muse_total_accounts,
+        "muse_video_accounts": muse_video_accounts,
     }))
 }
 
@@ -6136,5 +6195,77 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_settings_concurrency_enforces_muse_account_limit() {
+        // Gateway: cho phép 1..=MAX_CONCURRENCY bất kể số tài khoản Muse = 0
+        let gw_ok = Settings {
+            video_source: "gateway".into(),
+            concurrency: 8,
+            ..Settings::default()
+        };
+        assert!(validate_settings_concurrency(&gw_ok, 0).is_ok());
+
+        let gw_zero = Settings {
+            video_source: "gateway".into(),
+            concurrency: 0,
+            ..Settings::default()
+        };
+        assert_eq!(
+            validate_settings_concurrency(&gw_zero, 5).unwrap_err().code,
+            "INVALID_CONCURRENCY"
+        );
+
+        let gw_too_high = Settings {
+            video_source: "gateway".into(),
+            concurrency: settings::MAX_CONCURRENCY + 1,
+            ..Settings::default()
+        };
+        assert_eq!(
+            validate_settings_concurrency(&gw_too_high, 99).unwrap_err().code,
+            "INVALID_CONCURRENCY"
+        );
+
+        // Muse nội bộ: 0 tài khoản -> cho phép 1 (để lưu cấu hình trước khi đăng nhập), chặn >= 2
+        let internal_1 = Settings {
+            video_source: "internal".into(),
+            concurrency: 1,
+            ..Settings::default()
+        };
+        assert!(validate_settings_concurrency(&internal_1, 0).is_ok());
+        assert!(validate_settings_concurrency(&internal_1, 1).is_ok());
+
+        let internal_2 = Settings {
+            video_source: "internal".into(),
+            concurrency: 2,
+            ..Settings::default()
+        };
+        assert_eq!(
+            validate_settings_concurrency(&internal_2, 0).unwrap_err().code,
+            "CONCURRENCY_EXCEEDS_ACCOUNTS"
+        );
+        assert_eq!(
+            validate_settings_concurrency(&internal_2, 1).unwrap_err().code,
+            "CONCURRENCY_EXCEEDS_ACCOUNTS"
+        );
+        assert!(validate_settings_concurrency(&internal_2, 2).is_ok());
+
+        // 5 tài khoản Muse -> cho phép 5 luồng, chặn 6 luồng
+        let internal_5 = Settings {
+            video_source: "internal".into(),
+            concurrency: 5,
+            ..Settings::default()
+        };
+        assert!(validate_settings_concurrency(&internal_5, 5).is_ok());
+        let internal_6 = Settings {
+            video_source: "internal".into(),
+            concurrency: 6,
+            ..Settings::default()
+        };
+        assert_eq!(
+            validate_settings_concurrency(&internal_6, 5).unwrap_err().code,
+            "CONCURRENCY_EXCEEDS_ACCOUNTS"
+        );
     }
 }

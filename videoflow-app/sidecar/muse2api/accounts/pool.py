@@ -145,6 +145,7 @@ class AccountPool:
         self.is_blocked_cb = is_blocked_cb
         self._accounts: dict[str, Account] = {}
         self._inflight: dict[str, int] = defaultdict(int)
+        self._video_inflight: dict[str, int] = defaultdict(int)
         self._quota_inflight: dict[str, int] = defaultdict(int)
         self._cond = asyncio.Condition()
         self._persist_lock = asyncio.Lock()
@@ -152,6 +153,7 @@ class AccountPool:
     def is_inflight(self, account_id: str) -> bool:
         return (
             self._inflight.get(account_id, 0) > 0
+            or self._video_inflight.get(account_id, 0) > 0
             or self._quota_inflight.get(account_id, 0) > 0
         )
 
@@ -230,6 +232,7 @@ class AccountPool:
             "invalid": sum(1 for a in self._accounts.values() if a.status == AccountStatus.INVALID),
             "video_locked": sum(1 for a in self._accounts.values() if a.status == AccountStatus.VIDEO_LOCKED),
             "inflight": sum(self._inflight.values()),
+            "video_inflight": sum(self._video_inflight.values()),
         }
 
     # ---- scheduling ----
@@ -285,6 +288,10 @@ class AccountPool:
             if self._inflight[acc.id] >= self.max_concurrency or self._quota_inflight.get(acc.id, 0) > 0:
                 busy = True
                 continue
+            # Hard invariant: strictly at most 1 concurrent video stream per Muse account.
+            if kind == "video" and self._video_inflight.get(acc.id, 0) >= 1:
+                busy = True
+                continue
             free.append(acc)
         return free, busy, back_at, quota_blocked, interactive_blocked
 
@@ -318,6 +325,8 @@ class AccountPool:
                 if free:
                     acc = self.strategy.choose(free, hint)
                     self._inflight[acc.id] += 1
+                    if kind == "video":
+                        self._video_inflight[acc.id] += 1
                     acc.last_used_at = time.time()
                     return acc
                 remaining = deadline - time.monotonic()
@@ -341,9 +350,22 @@ class AccountPool:
                 except asyncio.TimeoutError:
                     continue
 
-    async def release(self, account: Account, error: BaseException | None = None) -> None:
+    async def release(
+        self, account: Account, error: BaseException | None = None, *, kind: str | None = None
+    ) -> None:
         async with self._cond:
             self._inflight[account.id] = max(0, self._inflight[account.id] - 1)
+            if kind == "video":
+                cur_vid = self._video_inflight.get(account.id, 0)
+                if cur_vid <= 1:
+                    self._video_inflight.pop(account.id, None)
+                else:
+                    self._video_inflight[account.id] = cur_vid - 1
+            elif self._inflight[account.id] < self._video_inflight.get(account.id, 0):
+                if self._inflight[account.id] == 0:
+                    self._video_inflight.pop(account.id, None)
+                else:
+                    self._video_inflight[account.id] = self._inflight[account.id]
             target = self._accounts.get(account.id, account)
             self._apply_result(target, error)
             if target is not account:
@@ -403,4 +425,4 @@ class AccountPool:
             lease.error = lease.error or exc
             raise
         finally:
-            await asyncio.shield(self.release(acc, lease.error))
+            await asyncio.shield(self.release(acc, lease.error, kind=kind))

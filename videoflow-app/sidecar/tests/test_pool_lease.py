@@ -163,3 +163,114 @@ def test_extra_is_zero_khongsai_voi_don_vi_billion():
     assert _extra_is_zero("0 B tokens") is True
     assert _extra_is_zero("1.2B tokens left") is False
     assert _extra_is_zero("500K tokens") is False
+
+
+# ── Hard invariant: tối đa 1 luồng video đồng thời trên mỗi tài khoản ───────
+
+
+@pytest.mark.asyncio
+async def test_video_lease_enforces_at_most_one_video_per_account_even_with_high_max_concurrency():
+    """Ngay cả khi max_concurrency=4, 1 tài khoản chỉ được lease tối đa 1 luồng video tại một thời điểm."""
+    acc = _healthy(id="acc_only", label="only")
+    pool = AccountPool(_MemStore([acc]), max_concurrency=4, acquire_timeout=0.2)
+    await pool.load()
+
+    async with pool.lease(kind="video") as v1:
+        assert v1.account.id == "acc_only"
+        assert pool.stats()["video_inflight"] == 1
+
+        # Luồng ảnh (kind=None) VẪN chạy song song được trên cùng tài khoản
+        async with pool.lease(kind=None) as img:
+            assert img.account.id == "acc_only"
+            assert pool.stats()["inflight"] == 2
+            assert pool.stats()["video_inflight"] == 1
+
+        # Luồng video thứ 2 trên cùng tài khoản PHẢI bị chặn (không cho phép >1 video/tài khoản)
+        with pytest.raises(NoAccountAvailable, match="busy"):
+            await pool.acquire(kind="video")
+
+    # Sau khi video 1 nhả, tài khoản sẵn sàng nhận video kế tiếp
+    assert pool.stats()["video_inflight"] == 0
+    async with pool.lease(kind="video") as v2:
+        assert v2.account.id == "acc_only"
+        assert pool.stats()["video_inflight"] == 1
+    assert pool.stats()["video_inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_video_lease_spreads_across_distinct_accounts_ignoring_image_lru_shift():
+    """Khi có 2 tài khoản, video 2 PHẢI sang tài khoản 2 ngay cả khi tài khoản 1 có last_used_at cũ hơn."""
+    acc1 = _healthy(id="acc_1", label="one")
+    acc2 = _healthy(id="acc_2", label="two")
+    pool = AccountPool(_MemStore([acc1, acc2]), strategy="lru", max_concurrency=4, acquire_timeout=0.3)
+    await pool.load()
+
+    async with pool.lease(kind="video") as v1:
+        # Đẩy last_used_at của tài khoản còn lại mới hơn bằng 1 lượt ảnh
+        other_id = "acc_2" if v1.account.id == "acc_1" else "acc_1"
+        async with pool.lease(exclude={v1.account.id}, kind=None) as img:
+            assert img.account.id == other_id
+            # Bây giờ v1.account có last_used_at CŨ hơn other_id; video 2 vẫn PHẢI chọn other_id!
+            async with pool.lease(kind="video") as v2:
+                assert v2.account.id == other_id
+                assert v2.account.id != v1.account.id
+                assert pool.stats()["video_inflight"] == 2
+                # Video thứ 3 khi cả 2 tài khoản đang chạy video -> PHẢI bị chặn
+                with pytest.raises(NoAccountAvailable, match="busy"):
+                    await pool.acquire(kind="video")
+
+    assert pool.stats()["video_inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_video_lease_wakes_waiting_video_immediately_on_release():
+    """Video chờ sẵn sẽ được đánh thức ngay lập tức khi video trên tài khoản kết thúc."""
+    import asyncio
+
+    acc = _healthy(id="acc_wake", label="wake")
+    pool = AccountPool(_MemStore([acc]), max_concurrency=4, acquire_timeout=2.0)
+    await pool.load()
+
+    entered = asyncio.Event()
+    release_v1 = asyncio.Event()
+    events: list[str] = []
+
+    async def run_v1() -> None:
+        async with pool.lease(kind="video"):
+            events.append("v1_start")
+            entered.set()
+            await release_v1.wait()
+            events.append("v1_end")
+
+    async def run_v2() -> None:
+        await entered.wait()
+        async with pool.lease(kind="video"):
+            events.append("v2_start")
+
+    t1 = asyncio.create_task(run_v1())
+    t2 = asyncio.create_task(run_v2())
+    await entered.wait()
+    await asyncio.sleep(0.05)
+    assert events == ["v1_start"], "v2 MUST NOT start while v1 still holds video slot on acc_wake"
+    release_v1.set()
+    await asyncio.gather(t1, t2)
+    assert events == ["v1_start", "v1_end", "v2_start"]
+    assert pool.stats()["video_inflight"] == 0
+
+
+@pytest.mark.asyncio
+async def test_video_lease_releases_slot_on_exception_and_cancellation():
+    """Lỗi hoặc hủy giữa chừng không bao giờ làm rò rỉ video_inflight."""
+    acc = _healthy(id="acc_err", label="err")
+    pool = AccountPool(_MemStore([acc]), max_concurrency=4, acquire_timeout=0.5)
+    await pool.load()
+
+    with pytest.raises(RuntimeError):
+        async with pool.lease(kind="video"):
+            assert pool.stats()["video_inflight"] == 1
+            raise RuntimeError("boom")
+
+    assert pool.stats()["video_inflight"] == 0
+    async with pool.lease(kind="video") as v_ok:
+        assert v_ok.account.id == "acc_err"
+    assert pool.stats()["video_inflight"] == 0

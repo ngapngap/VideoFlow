@@ -1079,6 +1079,67 @@ pub fn status(live: &Settings) -> AppResult<SidecarStatus> {
     })
 }
 
+/// Thống kê số lượng tài khoản Muse khả dụng cho tạo video.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MuseAccountCounts {
+    pub total: usize,
+    /// Số tài khoản đang bật và có thể tạo video (`enabled != false` và status không thuộc `invalid` / `video_locked`).
+    pub video_capable: usize,
+    /// Số tài khoản sẵn sàng ngay lúc này (từ sidecar live nếu đang chạy, hoặc `video_capable` trên đĩa).
+    pub available_now: usize,
+}
+
+/// Đếm `(total, video_capable)` tài khoản Muse trực tiếp từ `accounts.json` trong `data_dir`.
+pub fn count_accounts_from_disk(data_dir: &std::path::Path) -> (usize, usize) {
+    let acc_file = data_dir.join("accounts.json");
+    let Ok(content) = std::fs::read_to_string(&acc_file) else {
+        return (0, 0);
+    };
+    let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(&content)
+    else {
+        return (0, 0);
+    };
+    let total = arr.len();
+    let video_capable = arr
+        .iter()
+        .filter(|a| {
+            let enabled = a.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let status = a
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("active");
+            enabled && !matches!(status, "invalid" | "video_locked")
+        })
+        .count();
+    (total, video_capable)
+}
+
+/// Lấy số lượng tài khoản Muse thực tế (kết hợp `accounts.json` trên đĩa và trạng thái live của sidecar nếu đang chạy).
+pub fn inspect_account_counts(cfg: &Settings) -> MuseAccountCounts {
+    let data_dir = crate::settings::app_data_dir().join(MUSE_DATA_DIR);
+    let (disk_total, disk_capable) = count_accounts_from_disk(&data_dir);
+    if current_session().is_some() {
+        if let Ok(st) = status(cfg) {
+            let total = st.account_total.map(|n| n as usize).unwrap_or(disk_total);
+            let avail = st
+                .account_available
+                .map(|n| n as usize)
+                .unwrap_or(disk_capable);
+            let video_capable = disk_capable.max(avail).min(total);
+            return MuseAccountCounts {
+                total,
+                video_capable,
+                available_now: avail,
+            };
+        }
+    }
+    MuseAccountCounts {
+        total: disk_total,
+        video_capable: disk_capable,
+        available_now: disk_capable,
+    }
+}
+
 /// Ghi một dòng vào file log sidecar trong thư mục dữ liệu app (fire-and-forget).
 /// Dùng file thay vì bảng `logs` SQLite vì log sidecar không thuộc về một dự án nào.
 pub fn log_app_event(msg: &str) {
@@ -1800,5 +1861,32 @@ mod tests {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn count_accounts_from_disk_filters_disabled_invalid_and_video_locked() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "vf_muse_acc_cnt_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Chưa có accounts.json -> (0, 0)
+        assert_eq!(count_accounts_from_disk(&tmp_dir), (0, 0));
+
+        let payload = serde_json::json!([
+            { "id": "a1", "enabled": true, "status": "active" },
+            { "id": "a2", "enabled": true, "status": "cooling" },
+            { "id": "a3", "enabled": false, "status": "active" },
+            { "id": "a4", "enabled": true, "status": "invalid" },
+            { "id": "a5", "enabled": true, "status": "video_locked" },
+            { "id": "a6" }
+        ]);
+        std::fs::write(tmp_dir.join("accounts.json"), payload.to_string()).unwrap();
+
+        // total=6, video_capable=3 (a1 active, a2 cooling, a6 default enabled+active)
+        assert_eq!(count_accounts_from_disk(&tmp_dir), (6, 3));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

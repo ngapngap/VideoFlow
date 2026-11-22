@@ -224,6 +224,9 @@ export interface SettingsView {
   video_key_preview: string | null;
   has_image_key: boolean;
   has_video_key: boolean;
+  muse_total_accounts?: number;
+  muse_video_accounts?: number;
+  max_concurrency?: number;
 }
 
 // ━━ VideoFlow Muse nội bộ (engine + pool cookie + hạn mức) ━━
@@ -247,6 +250,8 @@ export interface MuseStatusView {
   video_source: string;
   chromium_path: string;
   headless: boolean;
+  muse_total_accounts?: number;
+  muse_video_accounts?: number;
 }
 
 export interface ProxyItem {

@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Màn hình Tổng quan (6.2, 6.2b, 6.8, 6.14): Onboarding 1-chạm, 3 thẻ nguồn, 4 thẻ số liệu, tiến độ đa luồng 1..3, Start/Stop/Chạy thử
-  import { createEventDispatcher } from "svelte";
+  // Màn hình Tổng quan (6.2, 6.2b, 6.8, 6.14): Onboarding 1-chạm, 3 thẻ nguồn, 4 thẻ số liệu, tiến độ đa luồng theo tài khoản Muse, Start/Stop/Chạy thử
+  import { createEventDispatcher, onMount } from "svelte";
   import {
     project,
     running,
@@ -14,12 +14,15 @@
     pendingRowsFilter,
     endpointStatus,
     confirmStartEnabled,
+    museAccounts,
+    museSidecarStatus,
     beginProjectSwitch,
     resetProjectRunState,
     showToast,
     formatApiError,
   } from "../lib/store";
   import { api, type DryRunResult, type ProbeResult } from "../lib/api";
+  import { countUsableMuseVideoAccounts, getConcurrencyMax } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
@@ -50,6 +53,73 @@
   let skippedCount = 0;
   let loadError: string | null = null;
   let refreshSeq = 0;
+
+  // Điều chỉnh nhanh số luồng chạy song song (tối đa theo số tài khoản Muse khả dụng)
+  let concurrency = 1;
+  let videoSource = "gateway";
+  let settingsMuseVideoAccounts = 0;
+  let savingConcurrency = false;
+
+  $: usableMuseAccounts = countUsableMuseVideoAccounts(
+    $museAccounts,
+    Boolean($museSidecarStatus?.sidecar.running),
+    $museSidecarStatus?.muse_video_accounts ?? settingsMuseVideoAccounts,
+    $museSidecarStatus?.sidecar.account_total ?? $museSidecarStatus?.muse_total_accounts
+  );
+  $: concurrencyMax = getConcurrencyMax(videoSource, usableMuseAccounts);
+  $: effectiveConcurrency = Math.max(1, Math.min(concurrency, concurrencyMax));
+  $: concurrencyTooltip =
+    videoSource === "internal"
+      ? usableMuseAccounts > 0
+        ? `Số luồng chạy đồng thời (tối đa ${concurrencyMax} theo ${usableMuseAccounts} tài khoản Muse khả dụng — bảo đảm mỗi tài khoản chỉ chạy tối đa 1 video)`
+        : "Chưa có tài khoản Muse khả dụng — thêm tài khoản Muse ở tab Tài khoản để chạy nhiều luồng video"
+      : `Số luồng chạy đồng thời (1–${concurrencyMax})`;
+
+  async function loadConcurrencyState(): Promise<void> {
+    try {
+      const view = await api.get_settings();
+      concurrency = Math.max(1, Math.round(Number(view.settings.concurrency) || 1));
+      videoSource = view.settings.video_source || "gateway";
+      if (typeof view.muse_video_accounts === "number") {
+        settingsMuseVideoAccounts = view.muse_video_accounts;
+      }
+    } catch {
+      // Giữ giá trị hiện tại nếu chưa nạp được settings
+    }
+  }
+
+  onMount(() => {
+    void loadConcurrencyState();
+  });
+
+  async function changeConcurrency(nextVal: number): Promise<void> {
+    if ($running || savingConcurrency) return;
+    const clamped = Math.max(1, Math.min(concurrencyMax, Math.round(nextVal)));
+    if (clamped === effectiveConcurrency && clamped === concurrency) return;
+    savingConcurrency = true;
+    try {
+      const view = await api.get_settings();
+      videoSource = view.settings.video_source || "gateway";
+      if (typeof view.muse_video_accounts === "number") {
+        settingsMuseVideoAccounts = view.muse_video_accounts;
+      }
+      const liveUsable = countUsableMuseVideoAccounts(
+        $museAccounts,
+        Boolean($museSidecarStatus?.sidecar.running),
+        $museSidecarStatus?.muse_video_accounts ?? settingsMuseVideoAccounts,
+        $museSidecarStatus?.sidecar.account_total ?? $museSidecarStatus?.muse_total_accounts
+      );
+      const liveMax = getConcurrencyMax(videoSource, liveUsable);
+      const target = Math.max(1, Math.min(liveMax, Math.round(nextVal)));
+      await api.save_settings({ ...view.settings, concurrency: target });
+      concurrency = target;
+    } catch (e) {
+      showToast("error", formatApiError(e));
+      await loadConcurrencyState();
+    } finally {
+      savingConcurrency = false;
+    }
+  }
 
   $: if (!$running) {
     stopping = false;
@@ -252,8 +322,17 @@
       if (dontAskAgain && $confirmStartEnabled) {
         try {
           const view = await api.get_settings();
-          const updated = { ...view.settings, confirm_start: false };
+          const maxForSave = getConcurrencyMax(
+            view.settings.video_source,
+            view.muse_video_accounts ?? usableMuseAccounts
+          );
+          const updated = {
+            ...view.settings,
+            confirm_start: false,
+            concurrency: Math.max(1, Math.min(view.settings.concurrency, maxForSave)),
+          };
           await api.save_settings(updated);
+          concurrency = updated.concurrency;
           confirmStartEnabled.set(false);
         } catch {
           // Không chặn luồng chạy nếu lưu tùy chọn phụ thất bại
@@ -587,7 +666,11 @@
         {#if activeEntries.length > 1}
           <div class="concurrent-pills">
             {#each activeEntries as [rKey, info] (rKey)}
-              <span class="worker-pill selectable" title={info.detail}>
+              <span
+                class="worker-pill selectable"
+                class:step-b3={info.step === "B3" || info.step === "download"}
+                title={info.detail}
+              >
                 <span class="worker-step">{formatStepBadge(info.step)}</span>
                 <strong>{rKey}</strong>
                 {#if info.detail}
@@ -705,11 +788,45 @@
 
       <div class="action-spacer"></div>
 
+      <div class="concurrency-control" title={concurrencyTooltip}>
+        <span class="conc-label">Số luồng</span>
+        <button
+          type="button"
+          class="conc-step-btn"
+          disabled={$running || savingConcurrency || effectiveConcurrency <= 1}
+          aria-label="Giảm số luồng"
+          on:click={() => changeConcurrency(effectiveConcurrency - 1)}
+        >
+          −
+        </button>
+        <span class="conc-value">{effectiveConcurrency}</span>
+        <button
+          type="button"
+          class="conc-step-btn"
+          disabled={$running || savingConcurrency || effectiveConcurrency >= concurrencyMax}
+          aria-label="Tăng số luồng"
+          on:click={() => changeConcurrency(effectiveConcurrency + 1)}
+        >
+          +
+        </button>
+        {#if videoSource === "internal"}
+          <span
+            class="conc-cap"
+            title="Tối đa theo số tài khoản Muse khả dụng (1 tài khoản = tối đa 1 video)"
+          >
+            / {usableMuseAccounts} TK
+          </span>
+        {/if}
+      </div>
+
       <button
         type="button"
         class="btn-ghost"
         disabled={$running}
-        on:click={refresh}
+        on:click={() => {
+          void refresh();
+          void loadConcurrencyState();
+        }}
         title="Làm mới số liệu tổng quan"
       >
         <Icons name="refresh" size={15} />
@@ -1367,10 +1484,17 @@
     color: var(--c-text);
     max-width: 100%;
   }
+  .worker-pill.step-b3 {
+    background: var(--c-green-bg);
+    border-color: #b7dfca;
+  }
   .worker-step {
     font-size: 11px;
     font-weight: 700;
     color: var(--c-teal-dark);
+  }
+  .worker-pill.step-b3 .worker-step {
+    color: var(--c-green);
   }
   .worker-detail {
     color: var(--c-muted);
@@ -1415,6 +1539,53 @@
   }
   .btn-secondary.tall {
     height: var(--h-btn-start);
+  }
+  .concurrency-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--h-btn-secondary);
+    padding: 0 10px;
+    border-radius: var(--r-btn);
+    border: 1px solid var(--c-border);
+    background: var(--c-card);
+    font-size: var(--fs-label);
+    color: var(--c-text);
+  }
+  .conc-label {
+    color: var(--c-muted);
+    font-weight: 600;
+    font-size: var(--fs-hint);
+  }
+  .conc-step-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 6px;
+    border: 1px solid var(--c-border);
+    background: var(--c-surface-subtle);
+    color: var(--c-text);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .conc-step-btn:hover:not(:disabled) {
+    border-color: var(--c-teal);
+    color: var(--c-teal);
+    background: var(--c-teal-subtle);
+  }
+  .conc-value {
+    min-width: 18px;
+    text-align: center;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--c-teal-dark);
+  }
+  .conc-cap {
+    font-size: var(--fs-hint);
+    color: var(--c-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Nội dung Modal */

@@ -1502,6 +1502,464 @@ impl WorkerRowCtx<'_> {
             .lock()
             .retain(|item| !item.row_key.eq_ignore_ascii_case(row_key));
     }
+
+    /// Phát sự kiện `progress` phản ánh đúng danh sách dòng còn đang chạy sau khi một bước kết thúc.
+    fn emit_active_snapshot(&self, fallback_row_key: &str) {
+        let snap = self.active_rows.lock().clone();
+        let done = self.done_count.load(Ordering::SeqCst);
+        let (cur_key, cur_step, cur_detail) = if let Some(first) = snap.first() {
+            (
+                first.row_key.clone(),
+                first.step.clone(),
+                first.detail.clone(),
+            )
+        } else {
+            (
+                fallback_row_key.to_string(),
+                "done".to_string(),
+                format!("{done}/{} dòng", self.total),
+            )
+        };
+        emit(
+            self.emitter,
+            "progress",
+            &ProgressEvent {
+                run_id: self.run_id,
+                done,
+                total: self.total,
+                percent: (done as f64 / self.total.max(1) as f64) * 100.0,
+                current_row_key: cur_key,
+                current_step: cur_step,
+                step_detail: cur_detail,
+                active_count: snap.len(),
+                active_rows: snap,
+            },
+        );
+    }
+}
+
+/// Mỗi tài khoản Muse nội bộ chạy tối đa `MUSE2API_ACCOUNT_MAX_CONCURRENCY = 4` tác vụ đồng thời.
+const MUSE_INTERNAL_SLOTS_PER_ACCOUNT: usize = 4;
+
+/// Tính số luồng worker cho hai tầng pipeline tách rời `(image_workers, video_workers)`:
+/// - Tầng tạo ảnh (B2) không phụ thuộc video nên chạy song song độc lập và cấp đầu vào cho tầng video.
+/// - Tầng tạo video (B3) đợi ảnh xong; nếu có `noi_canh = true`, video ép về 1 luồng theo đúng thứ tự CSV,
+///   trong khi luồng ảnh vẫn tiếp tục chạy song song phía trước.
+/// - Khi nguồn video là Muse nội bộ (`video_source == "internal"`), số luồng video TUYỆT ĐỐI không được
+///   vượt quá số tài khoản Muse khả dụng để bảo đảm mỗi tài khoản chỉ chạy tối đa 1 luồng video duy nhất.
+/// - Nếu cả ảnh lẫn video cùng dùng sidecar Muse nội bộ, tổng luồng B2 + B3 được giữ trong ngưỡng slot
+///   của các tài khoản khả dụng (`accounts * 4`) để tránh lỗi 503 "all accounts are busy".
+pub fn compute_pipeline_workers(
+    cfg: &Settings,
+    b2_count: usize,
+    b3_count: usize,
+    has_noi_canh: bool,
+    muse_available_accounts: Option<usize>,
+) -> (usize, usize) {
+    let base = cfg.concurrency.clamp(1, crate::settings::MAX_CONCURRENCY) as usize;
+    let effective_base = if cfg.video_source == "internal" {
+        base.min(muse_available_accounts.unwrap_or(1).max(1))
+    } else {
+        base
+    };
+
+    let video_workers = if b3_count == 0 {
+        0
+    } else if has_noi_canh {
+        1
+    } else {
+        effective_base.min(b3_count)
+    };
+
+    let mut image_workers = if b2_count == 0 {
+        0
+    } else {
+        effective_base.min(b2_count)
+    };
+
+    if image_workers > 0 && cfg.image_source == "internal" {
+        let accounts = muse_available_accounts.unwrap_or(1).max(1);
+        let max_total_slots = accounts.saturating_mul(MUSE_INTERNAL_SLOTS_PER_ACCOUNT);
+        let used_by_video = if cfg.video_source == "internal" {
+            video_workers
+        } else {
+            0
+        };
+        let max_img_slots = max_total_slots.saturating_sub(used_by_video).max(1);
+        image_workers = image_workers.min(max_img_slots);
+    }
+
+    (image_workers, video_workers)
+}
+
+struct ImageWorkItem {
+    seq_idx: usize,
+    row: prompts_csv::Row,
+    plan: RowPlan,
+}
+
+struct VideoWorkItem {
+    seq_idx: usize,
+    row: prompts_csv::Row,
+    plan: RowPlan,
+    job_id: Option<i64>,
+    b2_duration_ms: i64,
+    b2_completed: bool,
+}
+
+enum VideoSlot {
+    PendingB2,
+    Ready(Box<VideoWorkItem>),
+    Skipped,
+}
+
+struct VideoQueueInner {
+    ordered: bool,
+    slots: Vec<VideoSlot>,
+    next_seq: usize,
+    ready_fifo: VecDeque<VideoWorkItem>,
+    active_image_workers: usize,
+    stop_requested: bool,
+}
+
+struct VideoPipelineQueue {
+    state: parking_lot::Mutex<VideoQueueInner>,
+    cv: parking_lot::Condvar,
+}
+
+impl VideoPipelineQueue {
+    fn new(ordered: bool, total_slots: usize, active_image_workers: usize) -> Self {
+        let slots = if ordered {
+            (0..total_slots).map(|_| VideoSlot::PendingB2).collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            state: parking_lot::Mutex::new(VideoQueueInner {
+                ordered,
+                slots,
+                next_seq: 0,
+                ready_fifo: VecDeque::new(),
+                active_image_workers,
+                stop_requested: false,
+            }),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn push_ready(&self, item: VideoWorkItem) {
+        let mut st = self.state.lock();
+        if st.ordered {
+            let idx = item.seq_idx;
+            if idx < st.slots.len() {
+                st.slots[idx] = VideoSlot::Ready(Box::new(item));
+            }
+        } else {
+            st.ready_fifo.push_back(item);
+        }
+        self.cv.notify_one();
+    }
+
+    fn mark_skipped(&self, seq_idx: usize) {
+        let mut st = self.state.lock();
+        if st.ordered && seq_idx < st.slots.len() {
+            st.slots[seq_idx] = VideoSlot::Skipped;
+            self.cv.notify_all();
+        }
+    }
+
+    fn finish_image_worker(&self) {
+        let mut st = self.state.lock();
+        st.active_image_workers = st.active_image_workers.saturating_sub(1);
+        if st.active_image_workers == 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    fn request_stop(&self) {
+        let mut st = self.state.lock();
+        st.stop_requested = true;
+        self.cv.notify_all();
+    }
+
+    fn pop_next(
+        &self,
+        stop_flag: &AtomicBool,
+        stopped_flag: &AtomicBool,
+    ) -> Option<VideoWorkItem> {
+        let mut st = self.state.lock();
+        loop {
+            if stop_flag.load(Ordering::SeqCst)
+                || stopped_flag.load(Ordering::SeqCst)
+                || st.stop_requested
+            {
+                stopped_flag.store(true, Ordering::SeqCst);
+                st.stop_requested = true;
+                self.cv.notify_all();
+                return None;
+            }
+
+            if st.ordered {
+                while st.next_seq < st.slots.len()
+                    && matches!(st.slots[st.next_seq], VideoSlot::Skipped)
+                {
+                    st.next_seq += 1;
+                }
+                if st.next_seq >= st.slots.len() {
+                    return None;
+                }
+                if matches!(st.slots[st.next_seq], VideoSlot::Ready(_)) {
+                    let idx = st.next_seq;
+                    let slot = std::mem::replace(&mut st.slots[idx], VideoSlot::Skipped);
+                    st.next_seq += 1;
+                    if let VideoSlot::Ready(item) = slot {
+                        return Some(*item);
+                    }
+                }
+                if st.active_image_workers == 0 {
+                    // Không còn luồng ảnh nào chạy; mọi slot PendingB2 còn lại không thể hoàn tất.
+                    let idx = st.next_seq;
+                    st.slots[idx] = VideoSlot::Skipped;
+                    continue;
+                }
+            } else {
+                if let Some(item) = st.ready_fifo.pop_front() {
+                    return Some(item);
+                }
+                if st.active_image_workers == 0 {
+                    return None;
+                }
+            }
+
+            let _ = self.cv.wait_for(&mut st, Duration::from_millis(200));
+        }
+    }
+}
+
+struct ImageWorkerDropGuard<'a>(&'a VideoPipelineQueue);
+
+impl Drop for ImageWorkerDropGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish_image_worker();
+    }
+}
+
+struct PipelineShared<'a> {
+    emitter: EventEmitter<'a>,
+    cfg: &'a Settings,
+    project_path: &'a Path,
+    csv_path: &'a Path,
+    image_out: &'a Path,
+    video_out: &'a Path,
+    stop_flag: &'a AtomicBool,
+    run_id: i64,
+    total: usize,
+    done_count: &'a AtomicUsize,
+    error_count: &'a AtomicUsize,
+    stopped: &'a AtomicBool,
+    active_rows: &'a parking_lot::Mutex<Vec<ActiveRowProgress>>,
+    fatal_err: &'a parking_lot::Mutex<Option<AppError>>,
+    video_queue: &'a VideoPipelineQueue,
+}
+
+fn update_runs_progress(
+    conn: &Connection,
+    run_id: i64,
+    done_count: &AtomicUsize,
+    error_count: &AtomicUsize,
+) {
+    let d_now = done_count.load(Ordering::SeqCst) as i64;
+    let e_now = error_count.load(Ordering::SeqCst) as i64;
+    let _ = conn.execute(
+        "UPDATE runs
+         SET done_count = MAX(done_count, ?1), error_count = MAX(error_count, ?2)
+         WHERE id = ?3",
+        rusqlite::params![d_now, e_now, run_id],
+    );
+}
+
+fn insert_job_for_row(
+    conn: &Connection,
+    run_id: i64,
+    row: &prompts_csv::Row,
+    row_key: &str,
+    plan: &RowPlan,
+    img_ref: &Path,
+) -> Result<i64, rusqlite::Error> {
+    let prev_before_insert = latest_job_info(conn, row_key);
+    let base_st = effective_row_status(row, prev_before_insert.as_ref())
+        .unwrap_or_else(|| row.status());
+    let (init_img_status, init_db_status) =
+        initial_job_image_state(row, base_st, plan, img_ref);
+
+    // [P0-2]: Khởi tạo `image_prompt_hash` và `video_prompt_hash` bằng hash LỊCH SỬ (`prev_*_hash`),
+    // CHỈ cập nhật sang hash mới sau khi từng bước thực sự hoàn tất!
+    let ts_job = chrono::Local::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status,
+                          image_prompt_hash, video_prompt_hash, video_task_id, video_download_url,
+                          attempts_count, started_at)
+         VALUES (?1,?2,?3,?4,?5,'chua_chay',?6,?7,?8,?9,?10,?11)",
+        rusqlite::params![
+            run_id,
+            row_key,
+            row.row_no as i64,
+            init_db_status,
+            init_img_status,
+            plan.prev_img_hash,
+            plan.prev_vid_hash,
+            plan.resume_task_id,
+            plan.resume_download_url,
+            plan.carried_attempts,
+            ts_job
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+struct StepFailInput<'a> {
+    step: Step,
+    fail: &'a ApiFail,
+    row_key: &'a str,
+    plan: &'a RowPlan,
+    b2_completed_in_this_job: bool,
+    duration_ms: i64,
+}
+
+fn handle_step_failure(
+    shared: &PipelineShared<'_>,
+    ctx: &WorkerRowCtx<'_>,
+    row: &mut prompts_csv::Row,
+    input: StepFailInput<'_>,
+) -> bool {
+    let StepFailInput {
+        step,
+        fail,
+        row_key,
+        plan,
+        b2_completed_in_this_job,
+        duration_ms,
+    } = input;
+    let step_name = if step == Step::B2 { "B2" } else { "B3" };
+    let has_img = !row.anh_da_tao.is_empty() && shared.image_out.join(&row.anh_da_tao).is_file();
+    let b2_needs_fresh =
+        step == Step::B2 && !b2_completed_in_this_job && (plan.force_new_image || !has_img);
+    let res = resolve_step_failure(step, fail, has_img, b2_needs_fresh);
+    finish_job_status(ctx, row, &res, duration_ms);
+    ctx.clear_active_row(row_key);
+
+    if res.count_as_run_error {
+        shared.error_count.fetch_add(1, Ordering::SeqCst);
+        crate::settings::log(
+            ctx.conn,
+            "error",
+            Some(shared.run_id),
+            Some(row_key),
+            Some(step_name),
+            &fail.message,
+        );
+    } else {
+        let lvl = if fail.code == "STOPPED" {
+            "info"
+        } else {
+            "warn"
+        };
+        crate::settings::log(
+            ctx.conn,
+            lvl,
+            Some(shared.run_id),
+            Some(row_key),
+            Some(step_name),
+            &fail.message,
+        );
+    }
+
+    emit(
+        shared.emitter,
+        "row_changed",
+        &RowChangedEvent {
+            row_key: row_key.to_string(),
+            status: res.csv_label.into(),
+            image_status: res.image_status.into(),
+            video_status: res.video_status.into(),
+            attempts_count: current_job_attempts(ctx.conn, ctx.job_id),
+            last_error: res.last_error.clone(),
+        },
+    );
+
+    let mut should_stop = res.trigger_stop;
+
+    if fail.kind == ApiFailKind::HetQuota || fail.code == "VIDEO_LOCKED" {
+        emit(
+            shared.emitter,
+            "run_error",
+            &RunErrorEvent {
+                run_id: shared.run_id,
+                row_key: Some(row_key.to_string()),
+                step: Some(step_name.into()),
+                code: fail.code.clone(),
+                message: fail.message.clone(),
+            },
+        );
+        if fail.code == "VIDEO_LOCKED" {
+            let mut account_id = None;
+            let mut account_label = None;
+            let acc_file = crate::settings::app_data_dir()
+                .join(crate::muse_sidecar::MUSE_DATA_DIR)
+                .join("accounts.json");
+            if let Ok(content) = std::fs::read_to_string(&acc_file) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val.as_array() {
+                        if let Some(locked) = arr.iter().find(|a| {
+                            a.get("status").and_then(|s| s.as_str()) == Some("video_locked")
+                        }) {
+                            account_id = locked
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                            account_label = locked
+                                .get("label")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                        } else if arr.len() == 1 {
+                            account_id = arr[0]
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                            account_label = arr[0]
+                                .get("label")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                        }
+                    }
+                }
+            }
+            let acc_id_val = account_id.clone().unwrap_or_default();
+            let acc_lbl_val = account_label.or(account_id).unwrap_or_default();
+            emit(
+                shared.emitter,
+                "account_video_locked",
+                &serde_json::json!({
+                    "code": "VIDEO_LOCKED",
+                    "message": fail.message.clone(),
+                    "account_id": acc_id_val,
+                    "id": acc_id_val,
+                    "label": acc_lbl_val,
+                }),
+            );
+        }
+        shared.stop_flag.store(true, Ordering::SeqCst);
+        should_stop = true;
+    }
+
+    if should_stop {
+        shared.stopped.store(true, Ordering::SeqCst);
+        shared.video_queue.request_stop();
+    }
+
+    update_runs_progress(ctx.conn, shared.run_id, shared.done_count, shared.error_count);
+    ctx.emit_active_snapshot(row_key);
+    should_stop
 }
 
 pub fn run(
@@ -1647,58 +2105,148 @@ pub fn run_with_emitter_and_hook(
         },
     );
 
-    // Nếu batch có ít nhất 1 dòng `noi_canh = true`, ép tuần tự (`worker_count = 1`)
-    // để đảm bảo video cảnh trước luôn hoàn tất trước khi trích frame cuối cho cảnh sau.
+    // Tách pipeline 2 tầng độc lập:
+    // - Tầng tạo ảnh (B2) chạy song song liên tục, không chờ tầng tạo video (B3).
+    // - Tầng tạo video (B3) đợi từng dòng có ảnh xong (hoặc chạy ngay với dòng đã có ảnh / không cần B2).
+    // - Nếu batch có ít nhất 1 dòng `noi_canh = true`, riêng tầng video ép 1 luồng theo đúng thứ tự CSV
+    //   để đảm bảo video cảnh trước luôn xong trước khi trích frame cuối cho cảnh sau, trong khi luồng ảnh
+    //   vẫn tiếp tục chạy song song phía trước.
     let has_noi_canh = planned_rows.iter().any(|(r, _)| r.noi_canh);
-    let worker_count = if has_noi_canh {
-        1
+
+    let mut image_items: VecDeque<ImageWorkItem> = VecDeque::new();
+    let mut initial_video_items: Vec<VideoWorkItem> = Vec::new();
+    let mut b3_count: usize = 0;
+
+    for (seq_idx, (row, plan)) in planned_rows.into_iter().enumerate() {
+        let has_b2 = plan.steps.first() == Some(&Step::B2);
+        let has_b3 = plan.steps.contains(&Step::B3);
+        if has_b3 {
+            b3_count += 1;
+        }
+        if has_b2 {
+            image_items.push_back(ImageWorkItem { seq_idx, row, plan });
+        } else if has_b3 {
+            initial_video_items.push(VideoWorkItem {
+                seq_idx,
+                row,
+                plan,
+                job_id: None,
+                b2_duration_ms: 0,
+                b2_completed: false,
+            });
+        }
+    }
+
+    let muse_counts = if cfg.video_source == "internal" || cfg.image_source == "internal" {
+        Some(crate::muse_sidecar::inspect_account_counts(cfg))
     } else {
-        (cfg.concurrency.clamp(1, 3) as usize).min(total.max(1))
+        None
     };
-    let queue = parking_lot::Mutex::new(planned_rows);
-    let active_rows: parking_lot::Mutex<Vec<ActiveRowProgress>> = parking_lot::Mutex::new(Vec::new());
+    let muse_avail = muse_counts.map(|c| c.available_now);
+
+    let (image_worker_count, video_worker_count) = compute_pipeline_workers(
+        cfg,
+        image_items.len(),
+        b3_count,
+        has_noi_canh,
+        muse_avail,
+    );
+
+    if cfg.video_source == "internal" && !has_noi_canh && b3_count > 0 {
+        let requested = (cfg.concurrency.clamp(1, crate::settings::MAX_CONCURRENCY) as usize)
+            .min(b3_count);
+        if video_worker_count < requested {
+            let avail_n = muse_avail.unwrap_or(0);
+            crate::settings::log(
+                &conn,
+                "info",
+                Some(run_id),
+                None,
+                Some("B1"),
+                &format!(
+                    "Giới hạn số luồng video về {video_worker_count} (cấu hình: {requested}) theo số tài khoản Muse khả dụng ({avail_n}) để đảm bảo mỗi tài khoản chỉ chạy tối đa 1 video."
+                ),
+            );
+        }
+    }
+
+    let image_queue = parking_lot::Mutex::new(image_items);
+    let video_queue = VideoPipelineQueue::new(has_noi_canh, total, image_worker_count);
+    for item in initial_video_items {
+        video_queue.push_ready(item);
+    }
+
+    let active_rows: parking_lot::Mutex<Vec<ActiveRowProgress>> =
+        parking_lot::Mutex::new(Vec::new());
     let done_count = AtomicUsize::new(0);
     let error_count = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     let fatal_err: parking_lot::Mutex<Option<AppError>> = parking_lot::Mutex::new(None);
     let run_start = Instant::now();
 
+    let shared = PipelineShared {
+        emitter,
+        cfg,
+        project_path,
+        csv_path: &csv_path,
+        image_out: &image_out,
+        video_out: &video_out,
+        stop_flag: stop_flag.as_ref(),
+        run_id,
+        total,
+        done_count: &done_count,
+        error_count: &error_count,
+        stopped: &stopped,
+        active_rows: &active_rows,
+        fatal_err: &fatal_err,
+        video_queue: &video_queue,
+    };
+
     std::thread::scope(|scope| {
-        for _worker_idx in 0..worker_count {
-            let queue_ref = &queue;
-            let active_ref = &active_rows;
-            let done_ref = &done_count;
-            let err_ref = &error_count;
-            let stopped_ref = &stopped;
-            let fatal_ref = &fatal_err;
-            let csv_ref = &csv_path;
-            let img_ref = &image_out;
-            let vid_ref = &video_out;
-            let stop_ref = stop_flag.as_ref();
+        // ── Tầng 1: Luồng tạo ảnh (B2) chạy song song, không đợi video ──
+        for _img_worker_idx in 0..image_worker_count {
+            let shared_ref = &shared;
+            let img_queue_ref = &image_queue;
 
             scope.spawn(move || {
-                let w_conn = match crate::state_db::open(project_path) {
+                let _drop_guard = ImageWorkerDropGuard(shared_ref.video_queue);
+                let w_conn = match crate::state_db::open(shared_ref.project_path) {
                     Ok(c) => c,
                     Err(e) => {
-                        *fatal_ref.lock() =
-                            Some(AppError::new("DB_FAIL", format!("Worker không mở được state.db: {e}")));
-                        stopped_ref.store(true, Ordering::SeqCst);
+                        *shared_ref.fatal_err.lock() = Some(AppError::new(
+                            "DB_FAIL",
+                            format!("Worker tạo ảnh không mở được state.db: {e}"),
+                        ));
+                        shared_ref.stopped.store(true, Ordering::SeqCst);
+                        shared_ref.video_queue.request_stop();
                         return;
                     }
                 };
 
                 loop {
-                    if stop_ref.load(Ordering::SeqCst) || stopped_ref.load(Ordering::SeqCst) {
-                        stopped_ref.store(true, Ordering::SeqCst);
+                    if shared_ref.stop_flag.load(Ordering::SeqCst)
+                        || shared_ref.stopped.load(Ordering::SeqCst)
+                    {
+                        shared_ref.stopped.store(true, Ordering::SeqCst);
+                        shared_ref.video_queue.request_stop();
                         break;
                     }
 
-                    let Some((mut row, plan)) = queue_ref.lock().pop_front() else {
+                    let Some(ImageWorkItem {
+                        seq_idx,
+                        mut row,
+                        plan,
+                    }) = img_queue_ref.lock().pop_front()
+                    else {
                         break;
                     };
 
-                    if stop_ref.load(Ordering::SeqCst) || stopped_ref.load(Ordering::SeqCst) {
-                        stopped_ref.store(true, Ordering::SeqCst);
+                    if shared_ref.stop_flag.load(Ordering::SeqCst)
+                        || shared_ref.stopped.load(Ordering::SeqCst)
+                    {
+                        shared_ref.video_queue.mark_skipped(seq_idx);
+                        shared_ref.stopped.store(true, Ordering::SeqCst);
+                        shared_ref.video_queue.request_stop();
                         break;
                     }
 
@@ -1707,268 +2255,293 @@ pub fn run_with_emitter_and_hook(
                         &row.promt_tao_image,
                         &row.promt_tao_video,
                     );
-                    let row_timer = Instant::now();
+                    let step_timer = Instant::now();
 
-                    let prev_before_insert = latest_job_info(&w_conn, &row_key);
-                    let base_st = effective_row_status(&row, prev_before_insert.as_ref())
-                        .unwrap_or_else(|| row.status());
-                    let (init_img_status, init_db_status) =
-                        initial_job_image_state(&row, base_st, &plan, img_ref);
-
-                    // [P0-2]: Khởi tạo `image_prompt_hash` và `video_prompt_hash` bằng hash LỊCH SỬ (`prev_*_hash`),
-                    // CHỈ cập nhật sang hash mới sau khi từng bước thực sự hoàn tất!
-                    let ts_job = chrono::Local::now().to_rfc3339();
-                    if let Err(e) = w_conn.execute(
-                        "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status,
-                                          image_prompt_hash, video_prompt_hash, video_task_id, video_download_url,
-                                          attempts_count, started_at)
-                         VALUES (?1,?2,?3,?4,?5,'chua_chay',?6,?7,?8,?9,?10,?11)",
-                        rusqlite::params![
-                            run_id,
-                            row_key,
-                            row.row_no as i64,
-                            init_db_status,
-                            init_img_status,
-                            plan.prev_img_hash,
-                            plan.prev_vid_hash,
-                            plan.resume_task_id,
-                            plan.resume_download_url,
-                            plan.carried_attempts,
-                            ts_job
-                        ],
+                    let job_id = match insert_job_for_row(
+                        &w_conn,
+                        shared_ref.run_id,
+                        &row,
+                        &row_key,
+                        &plan,
+                        shared_ref.image_out,
                     ) {
-                        crate::settings::log(
-                            &w_conn,
-                            "error",
-                            Some(run_id),
-                            Some(&row_key),
-                            Some("B1"),
-                            &format!("Không chèn được bản ghi job: {e}"),
-                        );
-                        err_ref.fetch_add(1, Ordering::SeqCst);
-                        continue;
-                    }
-                    let job_id = w_conn.last_insert_rowid();
-
-                    let ctx = WorkerRowCtx {
-                        emitter,
-                        cfg,
-                        conn: &w_conn,
-                        csv_path: csv_ref,
-                        image_out: img_ref,
-                        video_out: vid_ref,
-                        stop_flag: stop_ref,
-                        run_id,
-                        job_id,
-                        total,
-                        done_count: done_ref,
-                        active_rows: active_ref,
+                        Ok(id) => id,
+                        Err(e) => {
+                            crate::settings::log(
+                                &w_conn,
+                                "error",
+                                Some(shared_ref.run_id),
+                                Some(&row_key),
+                                Some("B1"),
+                                &format!("Không chèn được bản ghi job: {e}"),
+                            );
+                            shared_ref.error_count.fetch_add(1, Ordering::SeqCst);
+                            update_runs_progress(
+                                &w_conn,
+                                shared_ref.run_id,
+                                shared_ref.done_count,
+                                shared_ref.error_count,
+                            );
+                            shared_ref.video_queue.mark_skipped(seq_idx);
+                            continue;
+                        }
                     };
 
-                    let mut row_incomplete = false;
-                    let mut b2_completed_in_this_job = false;
+                    let ctx = WorkerRowCtx {
+                        emitter: shared_ref.emitter,
+                        cfg: shared_ref.cfg,
+                        conn: &w_conn,
+                        csv_path: shared_ref.csv_path,
+                        image_out: shared_ref.image_out,
+                        video_out: shared_ref.video_out,
+                        stop_flag: shared_ref.stop_flag,
+                        run_id: shared_ref.run_id,
+                        job_id,
+                        total: shared_ref.total,
+                        done_count: shared_ref.done_count,
+                        active_rows: shared_ref.active_rows,
+                    };
 
-                    for step in &plan.steps {
-                        if stop_ref.load(Ordering::SeqCst) || stopped_ref.load(Ordering::SeqCst) {
-                            let has_img =
-                                !row.anh_da_tao.is_empty() && img_ref.join(&row.anh_da_tao).is_file();
-                            let b2_needs_fresh =
-                                *step == Step::B2 && (plan.force_new_image || !has_img);
-                            let stop_fail = ApiFail::stopped("Đã dừng an toàn giữa các bước");
-                            let res =
-                                resolve_step_failure(*step, &stop_fail, has_img, b2_needs_fresh);
-                            finish_job_status(
-                                &ctx,
-                                &mut row,
-                                &res,
-                                row_timer.elapsed().as_millis() as i64,
+                    ctx.emit_step_progress(&row_key, "B2", "Đang tạo image".to_string());
+
+                    match run_b2(&ctx, &mut row, plan.force_new_image) {
+                        Ok(next_status) => {
+                            let b2_dur_ms = step_timer.elapsed().as_millis() as i64;
+                            let ts_done = chrono::Local::now().to_rfc3339();
+                            let _ = w_conn.execute(
+                                "UPDATE jobs SET finished_at = ?1, duration_ms = ?2 WHERE id = ?3",
+                                rusqlite::params![ts_done, b2_dur_ms, job_id],
                             );
+
+                            let has_b3 = plan.steps.contains(&Step::B3);
+                            let (img_st, vid_st) = match next_status {
+                                RowStatus::DaTaoImage => ("xong", "chua_chay"),
+                                RowStatus::DaTaoVideo => ("xong", "xong"),
+                                _ => ("chua_chay", "chua_chay"),
+                            };
+
+                            // Xóa khỏi active_rows TRƯỚC khi đẩy sang hàng đợi video để tránh
+                            // xóa nhầm trạng thái B3 nếu worker video nhận dòng ngay lập tức.
                             ctx.clear_active_row(&row_key);
+
                             emit(
-                                emitter,
+                                shared_ref.emitter,
                                 "row_changed",
                                 &RowChangedEvent {
                                     row_key: row_key.clone(),
-                                    status: res.csv_label.into(),
-                                    image_status: res.image_status.into(),
-                                    video_status: res.video_status.into(),
+                                    status: row_status_to_label(next_status).into(),
+                                    image_status: img_st.into(),
+                                    video_status: vid_st.into(),
                                     attempts_count: current_job_attempts(&w_conn, job_id),
                                     last_error: None,
                                 },
                             );
-                            stopped_ref.store(true, Ordering::SeqCst);
-                            row_incomplete = true;
-                            break;
-                        }
 
-                        let step_name = if *step == Step::B2 { "B2" } else { "B3" };
-                        let step_msg = if *step == Step::B2 {
-                            "Đang tạo image".to_string()
-                        } else {
-                            "Đang tạo video".to_string()
-                        };
-                        ctx.emit_step_progress(&row_key, step_name, step_msg);
-
-                        let result = match step {
-                            Step::B2 => run_b2(&ctx, &mut row, plan.force_new_image),
-                            Step::B3 => run_b3(&ctx, &mut row, plan.force_new_video),
-                        };
-
-                        match result {
-                            Ok(next_status) => {
-                                if *step == Step::B2 {
-                                    b2_completed_in_this_job = true;
+                            if has_b3 {
+                                ctx.emit_active_snapshot(&row_key);
+                                if shared_ref.stop_flag.load(Ordering::SeqCst)
+                                    || shared_ref.stopped.load(Ordering::SeqCst)
+                                {
+                                    shared_ref.video_queue.mark_skipped(seq_idx);
+                                    shared_ref.stopped.store(true, Ordering::SeqCst);
+                                    shared_ref.video_queue.request_stop();
+                                    break;
                                 }
-                                let (img_st, vid_st) = match next_status {
-                                    RowStatus::DaTaoImage => ("xong", "chua_chay"),
-                                    RowStatus::DaTaoVideo => ("xong", "xong"),
-                                    _ => ("chua_chay", "chua_chay"),
-                                };
-                                let dur_ms = row_timer.elapsed().as_millis() as i64;
-                                let ts_done = chrono::Local::now().to_rfc3339();
-                                let _ = w_conn.execute(
-                                    "UPDATE jobs SET finished_at = ?1, duration_ms = ?2 WHERE id = ?3",
-                                    rusqlite::params![ts_done, dur_ms, job_id],
+                                shared_ref.video_queue.push_ready(VideoWorkItem {
+                                    seq_idx,
+                                    row,
+                                    plan,
+                                    job_id: Some(job_id),
+                                    b2_duration_ms: b2_dur_ms,
+                                    b2_completed: true,
+                                });
+                            } else {
+                                shared_ref.done_count.fetch_add(1, Ordering::SeqCst);
+                                update_runs_progress(
+                                    &w_conn,
+                                    shared_ref.run_id,
+                                    shared_ref.done_count,
+                                    shared_ref.error_count,
                                 );
-                                emit(
-                                    emitter,
-                                    "row_changed",
-                                    &RowChangedEvent {
-                                        row_key: row_key.clone(),
-                                        status: row_status_to_label(next_status).into(),
-                                        image_status: img_st.into(),
-                                        video_status: vid_st.into(),
-                                        attempts_count: current_job_attempts(&w_conn, job_id),
-                                        last_error: None,
-                                    },
-                                );
+                                ctx.emit_active_snapshot(&row_key);
+                                shared_ref.video_queue.mark_skipped(seq_idx);
                             }
-                            Err(fail) => {
-                                row_incomplete = true;
-                                let has_img = !row.anh_da_tao.is_empty()
-                                    && img_ref.join(&row.anh_da_tao).is_file();
-                                let b2_needs_fresh = *step == Step::B2
-                                    && !b2_completed_in_this_job
-                                    && (plan.force_new_image || !has_img);
-                                let res =
-                                    resolve_step_failure(*step, &fail, has_img, b2_needs_fresh);
-                                finish_job_status(
-                                    &ctx,
-                                    &mut row,
-                                    &res,
-                                    row_timer.elapsed().as_millis() as i64,
-                                );
-                                ctx.clear_active_row(&row_key);
-
-                                if res.count_as_run_error {
-                                    err_ref.fetch_add(1, Ordering::SeqCst);
-                                    crate::settings::log(
-                                        &w_conn,
-                                        "error",
-                                        Some(run_id),
-                                        Some(&row_key),
-                                        Some(step_name),
-                                        &fail.message,
-                                    );
-                                } else {
-                                    let lvl =
-                                        if fail.code == "STOPPED" { "info" } else { "warn" };
-                                    crate::settings::log(
-                                        &w_conn,
-                                        lvl,
-                                        Some(run_id),
-                                        Some(&row_key),
-                                        Some(step_name),
-                                        &fail.message,
-                                    );
-                                }
-
-                                emit(
-                                    emitter,
-                                    "row_changed",
-                                    &RowChangedEvent {
-                                        row_key: row_key.clone(),
-                                        status: res.csv_label.into(),
-                                        image_status: res.image_status.into(),
-                                        video_status: res.video_status.into(),
-                                        attempts_count: current_job_attempts(&w_conn, job_id),
-                                        last_error: res.last_error.clone(),
-                                    },
-                                );
-
-                                if fail.kind == ApiFailKind::HetQuota || fail.code == "VIDEO_LOCKED" {
-                                    emit(
-                                        emitter,
-                                        "run_error",
-                                        &RunErrorEvent {
-                                            run_id,
-                                            row_key: Some(row_key.clone()),
-                                            step: Some(step_name.into()),
-                                            code: fail.code.clone(),
-                                            message: fail.message.clone(),
-                                        },
-                                    );
-                                    if fail.code == "VIDEO_LOCKED" {
-                                        let mut account_id = None;
-                                        let mut account_label = None;
-                                        let acc_file = crate::settings::app_data_dir()
-                                            .join(crate::muse_sidecar::MUSE_DATA_DIR)
-                                            .join("accounts.json");
-                                        if let Ok(content) = std::fs::read_to_string(&acc_file) {
-                                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                                                if let Some(arr) = val.as_array() {
-                                                    if let Some(locked) = arr.iter().find(|a| {
-                                                        a.get("status").and_then(|s| s.as_str()) == Some("video_locked")
-                                                    }) {
-                                                        account_id = locked.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
-                                                        account_label = locked.get("label").and_then(|s| s.as_str()).map(|s| s.to_string());
-                                                    } else if arr.len() == 1 {
-                                                        account_id = arr[0].get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
-                                                        account_label = arr[0].get("label").and_then(|s| s.as_str()).map(|s| s.to_string());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let acc_id_val = account_id.clone().unwrap_or_default();
-                                        let acc_lbl_val = account_label.or(account_id).unwrap_or_default();
-                                        emit(
-                                            emitter,
-                                            "account_video_locked",
-                                            &serde_json::json!({
-                                                "code": "VIDEO_LOCKED",
-                                                "message": fail.message.clone(),
-                                                "account_id": acc_id_val,
-                                                "id": acc_id_val,
-                                                "label": acc_lbl_val,
-                                            }),
-                                        );
-                                    }
-                                    stop_ref.store(true, Ordering::SeqCst);
-                                }
-
-                                if res.trigger_stop {
-                                    stopped_ref.store(true, Ordering::SeqCst);
-                                }
+                        }
+                        Err(fail) => {
+                            let dur_ms = step_timer.elapsed().as_millis() as i64;
+                            let should_stop = handle_step_failure(
+                                shared_ref,
+                                &ctx,
+                                &mut row,
+                                StepFailInput {
+                                    step: Step::B2,
+                                    fail: &fail,
+                                    row_key: &row_key,
+                                    plan: &plan,
+                                    b2_completed_in_this_job: false,
+                                    duration_ms: dur_ms,
+                                },
+                            );
+                            shared_ref.video_queue.mark_skipped(seq_idx);
+                            if should_stop || shared_ref.stopped.load(Ordering::SeqCst) {
                                 break;
                             }
                         }
                     }
+                }
+            });
+        }
 
-                    ctx.clear_active_row(&row_key);
-                    if !row_incomplete {
-                        done_ref.fetch_add(1, Ordering::SeqCst);
+        // ── Tầng 2: Luồng tạo video (B3) nhận từng dòng ngay khi có ảnh ──
+        for _vid_worker_idx in 0..video_worker_count {
+            let shared_ref = &shared;
+
+            scope.spawn(move || {
+                let w_conn = match crate::state_db::open(shared_ref.project_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        *shared_ref.fatal_err.lock() = Some(AppError::new(
+                            "DB_FAIL",
+                            format!("Worker tạo video không mở được state.db: {e}"),
+                        ));
+                        shared_ref.stopped.store(true, Ordering::SeqCst);
+                        shared_ref.video_queue.request_stop();
+                        return;
+                    }
+                };
+
+                while let Some(VideoWorkItem {
+                    seq_idx: _,
+                    mut row,
+                    plan,
+                    job_id,
+                    b2_duration_ms,
+                    b2_completed,
+                }) = shared_ref
+                    .video_queue
+                    .pop_next(shared_ref.stop_flag, shared_ref.stopped)
+                {
+
+                    if shared_ref.stop_flag.load(Ordering::SeqCst)
+                        || shared_ref.stopped.load(Ordering::SeqCst)
+                    {
+                        shared_ref.stopped.store(true, Ordering::SeqCst);
+                        shared_ref.video_queue.request_stop();
+                        break;
                     }
 
-                    let d_now = done_ref.load(Ordering::SeqCst);
-                    let e_now = err_ref.load(Ordering::SeqCst);
-                    let _ = w_conn.execute(
-                        "UPDATE runs SET done_count = ?1, error_count = ?2 WHERE id = ?3",
-                        rusqlite::params![d_now as i64, e_now as i64, run_id],
+                    let row_key = crate::prompts_csv::row_key_of(
+                        &row.anh_tham_chieu,
+                        &row.promt_tao_image,
+                        &row.promt_tao_video,
                     );
-                    ctx.emit_step_progress(&row_key, "done", format!("{d_now}/{total} dòng"));
+                    let b3_timer = Instant::now();
 
-                    if stopped_ref.load(Ordering::SeqCst) {
-                        break;
+                    let job_id = match job_id {
+                        Some(id) => id,
+                        None => match insert_job_for_row(
+                            &w_conn,
+                            shared_ref.run_id,
+                            &row,
+                            &row_key,
+                            &plan,
+                            shared_ref.image_out,
+                        ) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                crate::settings::log(
+                                    &w_conn,
+                                    "error",
+                                    Some(shared_ref.run_id),
+                                    Some(&row_key),
+                                    Some("B1"),
+                                    &format!("Không chèn được bản ghi job: {e}"),
+                                );
+                                shared_ref.error_count.fetch_add(1, Ordering::SeqCst);
+                                update_runs_progress(
+                                    &w_conn,
+                                    shared_ref.run_id,
+                                    shared_ref.done_count,
+                                    shared_ref.error_count,
+                                );
+                                continue;
+                            }
+                        },
+                    };
+
+                    let ctx = WorkerRowCtx {
+                        emitter: shared_ref.emitter,
+                        cfg: shared_ref.cfg,
+                        conn: &w_conn,
+                        csv_path: shared_ref.csv_path,
+                        image_out: shared_ref.image_out,
+                        video_out: shared_ref.video_out,
+                        stop_flag: shared_ref.stop_flag,
+                        run_id: shared_ref.run_id,
+                        job_id,
+                        total: shared_ref.total,
+                        done_count: shared_ref.done_count,
+                        active_rows: shared_ref.active_rows,
+                    };
+
+                    ctx.emit_step_progress(&row_key, "B3", "Đang tạo video".to_string());
+
+                    match run_b3(&ctx, &mut row, plan.force_new_video) {
+                        Ok(next_status) => {
+                            let dur_ms =
+                                b2_duration_ms + b3_timer.elapsed().as_millis() as i64;
+                            let ts_done = chrono::Local::now().to_rfc3339();
+                            let _ = w_conn.execute(
+                                "UPDATE jobs SET finished_at = ?1, duration_ms = ?2 WHERE id = ?3",
+                                rusqlite::params![ts_done, dur_ms, job_id],
+                            );
+                            let (img_st, vid_st) = match next_status {
+                                RowStatus::DaTaoImage => ("xong", "chua_chay"),
+                                RowStatus::DaTaoVideo => ("xong", "xong"),
+                                _ => ("chua_chay", "chua_chay"),
+                            };
+                            ctx.clear_active_row(&row_key);
+                            shared_ref.done_count.fetch_add(1, Ordering::SeqCst);
+                            update_runs_progress(
+                                &w_conn,
+                                shared_ref.run_id,
+                                shared_ref.done_count,
+                                shared_ref.error_count,
+                            );
+                            emit(
+                                shared_ref.emitter,
+                                "row_changed",
+                                &RowChangedEvent {
+                                    row_key: row_key.clone(),
+                                    status: row_status_to_label(next_status).into(),
+                                    image_status: img_st.into(),
+                                    video_status: vid_st.into(),
+                                    attempts_count: current_job_attempts(&w_conn, job_id),
+                                    last_error: None,
+                                },
+                            );
+                            ctx.emit_active_snapshot(&row_key);
+                        }
+                        Err(fail) => {
+                            let dur_ms =
+                                b2_duration_ms + b3_timer.elapsed().as_millis() as i64;
+                            let should_stop = handle_step_failure(
+                                shared_ref,
+                                &ctx,
+                                &mut row,
+                                StepFailInput {
+                                    step: Step::B3,
+                                    fail: &fail,
+                                    row_key: &row_key,
+                                    plan: &plan,
+                                    b2_completed_in_this_job: b2_completed,
+                                    duration_ms: dur_ms,
+                                },
+                            );
+                            if should_stop || shared_ref.stopped.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -5741,6 +6314,684 @@ mod tests {
         );
         drop(res);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compute_pipeline_workers_matrix() {
+        // Concurrency = 1, gateway -> 1 image + 1 video chạy song song độc lập
+        let mut cfg = Settings {
+            concurrency: 1,
+            ..Settings::default()
+        };
+        assert_eq!(compute_pipeline_workers(&cfg, 5, 5, false, None), (1, 1));
+        assert_eq!(compute_pipeline_workers(&cfg, 5, 5, true, None), (1, 1));
+
+        // Concurrency = 2 -> 2 image + 2 video; khi có noi_canh -> 2 image + 1 video
+        cfg.concurrency = 2;
+        assert_eq!(compute_pipeline_workers(&cfg, 5, 5, false, None), (2, 2));
+        assert_eq!(compute_pipeline_workers(&cfg, 5, 5, true, None), (2, 1));
+
+        // Chỉ có B3 (b2_count = 0) -> không spawn worker ảnh
+        assert_eq!(compute_pipeline_workers(&cfg, 0, 5, false, None), (0, 2));
+        // Chỉ có B2 (b3_count = 0) -> không spawn worker video
+        assert_eq!(compute_pipeline_workers(&cfg, 5, 0, false, None), (2, 0));
+
+        // Nguồn video là Muse nội bộ: số luồng TUYỆT ĐỐI <= số tài khoản Muse khả dụng
+        // để bảo đảm 1 tài khoản chỉ chạy tối đa 1 luồng video duy nhất và khớp hiển thị UI!
+        cfg.concurrency = 5;
+        cfg.image_source = "internal".into();
+        cfg.video_source = "internal".into();
+        // 1 tài khoản -> chặn cứng về (1 image, 1 video)
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(1)), (1, 1));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, None), (1, 1));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(0)), (1, 1));
+        // 2 tài khoản -> (2 image, 2 video) (mỗi TK 1 video)
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(2)), (2, 2));
+        // 5 tài khoản -> (5 image, 5 video) (mỗi TK 1 video)
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(5)), (5, 5));
+        // 5 tài khoản + noi_canh -> video ép về 1 theo thứ tự CSV; image vẫn chạy song song 5
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, true, Some(5)), (5, 1));
+
+        // Nguồn hỗn hợp (gateway ảnh + internal video): số luồng bị chặn <= số tài khoản Muse
+        cfg.image_source = "gateway".into();
+        cfg.video_source = "internal".into();
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(1)), (1, 1));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(3)), (3, 3));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(6)), (5, 5));
+
+        // Nguồn hỗn hợp (internal ảnh + gateway video): ảnh vẫn bị chặn trong ngưỡng 4 slot / TK Muse
+        cfg.image_source = "internal".into();
+        cfg.video_source = "gateway".into();
+        cfg.concurrency = 10;
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(1)), (4, 10));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 0, false, Some(1)), (4, 0));
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(3)), (10, 10));
+
+        // Gateway ngoài cho cả ảnh và video -> chạy được > 3 luồng (tối đa MAX_CONCURRENCY)
+        cfg.image_source = "gateway".into();
+        cfg.video_source = "gateway".into();
+        cfg.concurrency = 6;
+        assert_eq!(compute_pipeline_workers(&cfg, 10, 10, false, Some(1)), (6, 6));
+    }
+
+    #[test]
+    fn test_e2e_decoupled_image_pipeline_runs_parallel_with_video_even_at_concurrency_1() {
+        let dir = make_temp_project("e2e_decoupled_c1");
+        for (name, rgb) in [
+            ("r1.png", (10, 20, 30)),
+            ("r2.png", (40, 50, 60)),
+            ("r3.png", (70, 80, 90)),
+        ] {
+            std::fs::write(dir.join("input").join(name), sample_png_bytes(rgb.0, rgb.1, rgb.2))
+                .unwrap();
+        }
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[
+                Row {
+                    row_no: 2,
+                    anh_tham_chieu: "r1.png".into(),
+                    promt_tao_image: "img 1".into(),
+                    promt_tao_video: "vid 1".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 3,
+                    anh_tham_chieu: "r2.png".into(),
+                    promt_tao_image: "img 2".into(),
+                    promt_tao_video: "vid 2".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 4,
+                    anh_tham_chieu: "r3.png".into(),
+                    promt_tao_image: "img 3".into(),
+                    promt_tao_video: "vid 3".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"DECP"))
+        });
+
+        // Cổng đồng bộ chứng minh: video dòng 1 CHỈ hoàn tất sau khi CẢ 3 ảnh (r1, r2, r3) đã tạo xong!
+        // Nếu B2 phải đợi B3 như kiến trúc cũ, r2 & r3 sẽ không bao giờ chạy trước khi video 1 xong.
+        let images_completed = Arc::new(AtomicUsize::new(0));
+        let all_images_seen_during_v1 = Arc::new(AtomicBool::new(false));
+        let vid_seq = Arc::new(AtomicUsize::new(0));
+
+        let img_cnt_ref = images_completed.clone();
+        let seen_ref = all_images_seen_during_v1.clone();
+        let vid_seq_ref = vid_seq.clone();
+
+        let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/images/edits" {
+                std::thread::sleep(Duration::from_millis(60));
+                img_cnt_ref.fetch_add(1, Ordering::SeqCst);
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(30, 120, 210) }] }),
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/videos" {
+                let n = vid_seq_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                return RawHttpResp::json(
+                    201,
+                    "Created",
+                    serde_json::json!({ "id": format!("task_dec_{n}") }),
+                );
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/videos/task_dec_") {
+                if req.path == "/v1/videos/task_dec_1" {
+                    let deadline = Instant::now() + Duration::from_secs(6);
+                    while img_cnt_ref.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    if img_cnt_ref.load(Ordering::SeqCst) >= 3 {
+                        seen_ref.store(true, Ordering::SeqCst);
+                    }
+                }
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "progress": 100,
+                        "video_url": format!("http://127.0.0.1:{port_b}/dec.mp4")
+                    }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port_a}/v1");
+        adapters::register_test_api_key(&api_base, "sk-decoupled-test");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            concurrency: 1, // Ngay cả khi concurrency=1, ảnh & video vẫn chạy song song 2 tầng!
+            poll_interval_s: 1,
+            poll_max_s: 30,
+            backoff_s: [1, 1, 1],
+            ..Settings::default()
+        };
+
+        let saw_b2_and_b3_concurrent = Arc::new(AtomicBool::new(false));
+        let conc_ref = saw_b2_and_b3_concurrent.clone();
+        let emitter = move |name: &str, val: serde_json::Value| {
+            if name == "progress" {
+                if let Some(arr) = val.get("active_rows").and_then(|v| v.as_array()) {
+                    let has_b2 = arr
+                        .iter()
+                        .any(|r| r.get("step").and_then(|s| s.as_str()) == Some("B2"));
+                    let has_b3 = arr
+                        .iter()
+                        .any(|r| r.get("step").and_then(|s| s.as_str()) == Some("B3"));
+                    if has_b2 && has_b3 {
+                        conc_ref.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        };
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let out = run_with_emitter(&emitter, &cfg, &dir, EngineConfig::default(), &stop_flag)
+            .expect("decoupled concurrency=1 run must succeed");
+
+        assert_eq!(out.done, 3);
+        assert_eq!(out.errors, 0);
+        assert!(
+            all_images_seen_during_v1.load(Ordering::SeqCst),
+            "r2 & r3 images MUST complete while r1 video is still in progress"
+        );
+        assert!(
+            saw_b2_and_b3_concurrent.load(Ordering::SeqCst),
+            "progress events must observe B2 and B3 running concurrently"
+        );
+        for stem in ["r1", "r2", "r3"] {
+            assert!(dir.join("image_out").join(format!("{stem}_gen.png")).is_file());
+            assert!(dir.join("video_out").join(format!("{stem}_gen.mp4")).is_file());
+        }
+
+        stop_a.store(true, Ordering::SeqCst);
+        stop_b.store(true, Ordering::SeqCst);
+        let _ = join_a.join();
+        let _ = join_b.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_e2e_decoupled_pipeline_noi_canh_preserves_video_order_while_images_run_ahead() {
+        let dir = make_temp_project("e2e_decoupled_noi_canh");
+        for (name, rgb) in [
+            ("s1.png", (10, 20, 30)),
+            ("s2.png", (40, 50, 60)),
+            ("s3.png", (70, 80, 90)),
+        ] {
+            std::fs::write(dir.join("input").join(name), sample_png_bytes(rgb.0, rgb.1, rgb.2))
+                .unwrap();
+        }
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[
+                Row {
+                    row_no: 2,
+                    anh_tham_chieu: "s1.png".into(),
+                    promt_tao_image: "scene 1 img".into(),
+                    promt_tao_video: "scene 1 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    noi_canh: false,
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 3,
+                    anh_tham_chieu: "s2.png".into(),
+                    promt_tao_image: "scene 2 img".into(),
+                    promt_tao_video: "scene 2 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    noi_canh: true,
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 4,
+                    anh_tham_chieu: "s3.png".into(),
+                    promt_tao_image: "scene 3 img".into(),
+                    promt_tao_video: "scene 3 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    noi_canh: true,
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let downloads_completed = Arc::new(AtomicUsize::new(0));
+        let dl_ref = downloads_completed.clone();
+        let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+            dl_ref.fetch_add(1, Ordering::SeqCst);
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"NOIC"))
+        });
+
+        let video_create_prompts: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let video_start_prev_downloads: Arc<parking_lot::Mutex<Vec<usize>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let images_done = Arc::new(AtomicUsize::new(0));
+        let images_done_before_s1_video_finish = Arc::new(AtomicUsize::new(0));
+
+        let vprompts_ref = video_create_prompts.clone();
+        let vprev_dl_ref = video_start_prev_downloads.clone();
+        let dl_check_ref = downloads_completed.clone();
+        let img_done_ref = images_done.clone();
+        let img_before_s1_ref = images_done_before_s1_video_finish.clone();
+
+        let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/images/edits" {
+                let body_str = String::from_utf8_lossy(&req.body);
+                // Cố tình làm chậm B2 của scene 1 hơn scene 2 để kiểm chứng hàng đợi video
+                // vẫn giữ đúng thứ tự scene 1 -> scene 2 -> scene 3 (không để scene 2 nhảy trước!).
+                if body_str.contains("scene 1 img") {
+                    std::thread::sleep(Duration::from_millis(250));
+                } else {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                img_done_ref.fetch_add(1, Ordering::SeqCst);
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(90, 150, 210) }] }),
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/videos" {
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or_default();
+                let prompt = parsed
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let idx = {
+                    let mut vp = vprompts_ref.lock();
+                    vp.push(prompt.clone());
+                    vp.len()
+                };
+                vprev_dl_ref.lock().push(dl_check_ref.load(Ordering::SeqCst));
+                return RawHttpResp::json(
+                    201,
+                    "Created",
+                    serde_json::json!({ "id": format!("task_nc_{idx}") }),
+                );
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/videos/task_nc_") {
+                if req.path == "/v1/videos/task_nc_1" {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while img_done_ref.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    img_before_s1_ref.store(img_done_ref.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "progress": 100,
+                        "video_url": format!("http://127.0.0.1:{port_b}/nc.mp4")
+                    }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port_a}/v1");
+        adapters::register_test_api_key(&api_base, "sk-noicanh-test");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            concurrency: 2,
+            poll_interval_s: 1,
+            poll_max_s: 30,
+            backoff_s: [1, 1, 1],
+            ..Settings::default()
+        };
+        let noop_emit = |_name: &str, _val: serde_json::Value| {};
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let out = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag)
+            .expect("noi_canh decoupled run must succeed");
+        assert_eq!(out.done, 3);
+        assert_eq!(out.errors, 0);
+        assert_eq!(
+            images_done_before_s1_video_finish.load(Ordering::SeqCst),
+            3,
+            "all 3 images must finish ahead while scene 1 video is rendering"
+        );
+        assert_eq!(
+            *video_create_prompts.lock(),
+            vec![
+                "scene 1 vid".to_string(),
+                "scene 2 vid".to_string(),
+                "scene 3 vid".to_string(),
+            ],
+            "noi_canh videos MUST run in strict CSV order even when scene 2 image finished before scene 1 image"
+        );
+        assert_eq!(
+            *video_start_prev_downloads.lock(),
+            vec![0, 1, 2],
+            "each noi_canh video MUST wait for the previous scene's video download to complete"
+        );
+
+        stop_a.store(true, Ordering::SeqCst);
+        stop_b.store(true, Ordering::SeqCst);
+        let _ = join_a.join();
+        let _ = join_b.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_e2e_decoupled_pipeline_b2_failure_does_not_block_or_deadlock_other_rows() {
+        for ordered_noi_canh in [false, true] {
+            let dir = make_temp_project(&format!("e2e_dec_b2_fail_{ordered_noi_canh}"));
+            for (name, rgb) in [
+                ("f1.png", (10, 20, 30)),
+                ("f2.png", (40, 50, 60)),
+                ("f3.png", (70, 80, 90)),
+            ] {
+                std::fs::write(
+                    dir.join("input").join(name),
+                    sample_png_bytes(rgb.0, rgb.1, rgb.2),
+                )
+                .unwrap();
+            }
+
+            prompts_csv::write_all(
+                &dir.join("prompts.csv"),
+                &[
+                    Row {
+                        row_no: 2,
+                        anh_tham_chieu: "f1.png".into(),
+                        promt_tao_image: "bad prompt".into(),
+                        promt_tao_video: "vid 1".into(),
+                        trang_thai: "Đang chờ".into(),
+                        noi_canh: false,
+                        ..Default::default()
+                    },
+                    Row {
+                        row_no: 3,
+                        anh_tham_chieu: "f2.png".into(),
+                        promt_tao_image: "good prompt 2".into(),
+                        promt_tao_video: "vid 2".into(),
+                        trang_thai: "Đang chờ".into(),
+                        noi_canh: ordered_noi_canh,
+                        ..Default::default()
+                    },
+                    Row {
+                        row_no: 4,
+                        anh_tham_chieu: "f3.png".into(),
+                        promt_tao_image: "good prompt 3".into(),
+                        promt_tao_video: "vid 3".into(),
+                        trang_thai: "Đang chờ".into(),
+                        noi_canh: ordered_noi_canh,
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+            let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+                RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"FAIL"))
+            });
+
+            let vid_seq = Arc::new(AtomicUsize::new(0));
+            let vid_seq_ref = vid_seq.clone();
+            let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+                if req.method == "POST" && req.path == "/v1/images/edits" {
+                    let body_str = String::from_utf8_lossy(&req.body);
+                    if body_str.contains("bad prompt") {
+                        return RawHttpResp::json(
+                            400,
+                            "Bad Request",
+                            serde_json::json!({ "error": "rejected prompt" }),
+                        );
+                    }
+                    return RawHttpResp::json(
+                        200,
+                        "OK",
+                        serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(10, 90, 180) }] }),
+                    );
+                }
+                if req.method == "POST" && req.path == "/v1/videos" {
+                    let n = vid_seq_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                    return RawHttpResp::json(
+                        201,
+                        "Created",
+                        serde_json::json!({ "id": format!("task_f_{n}") }),
+                    );
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/videos/task_f_") {
+                    return RawHttpResp::json(
+                        200,
+                        "OK",
+                        serde_json::json!({
+                            "status": "succeeded",
+                            "progress": 100,
+                            "video_url": format!("http://127.0.0.1:{port_b}/f.mp4")
+                        }),
+                    );
+                }
+                RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+            });
+
+            let api_base = format!("http://127.0.0.1:{port_a}/v1");
+            adapters::register_test_api_key(&api_base, "sk-b2fail-test");
+            let cfg = Settings {
+                endpoint_image_base_url: api_base.clone(),
+                endpoint_video_base_url: api_base,
+                concurrency: 2,
+                poll_interval_s: 1,
+                poll_max_s: 30,
+                backoff_s: [1, 1, 1],
+                ..Settings::default()
+            };
+            let noop_emit = |_name: &str, _val: serde_json::Value| {};
+            let stop_flag = Arc::new(AtomicBool::new(false));
+
+            let out = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag)
+                .expect("run must complete cleanly when row 1 B2 fails");
+            assert_eq!(out.status, "hoan_tat");
+            assert_eq!(out.done, 2);
+            assert_eq!(out.errors, 1);
+            assert_eq!(vid_seq.load(Ordering::SeqCst), 2, "only 2 rows with valid images should call B3");
+            assert!(!dir.join("video_out").join("f1_gen.mp4").exists());
+            assert!(dir.join("video_out").join("f2_gen.mp4").is_file());
+            assert!(dir.join("video_out").join("f3_gen.mp4").is_file());
+
+            let conn = crate::state_db::open(&dir).unwrap();
+            let f1_key = crate::prompts_csv::row_key_of("f1.png", "bad prompt", "vid 1");
+            assert_eq!(
+                latest_job_info(&conn, &f1_key).unwrap().status,
+                "loi_tao_image"
+            );
+
+            stop_a.store(true, Ordering::SeqCst);
+            stop_b.store(true, Ordering::SeqCst);
+            let _ = join_a.join();
+            let _ = join_b.join();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_e2e_decoupled_pipeline_stop_mid_video_preserves_completed_ahead_images() {
+        let dir = make_temp_project("e2e_dec_stop_resume");
+        for (name, rgb) in [
+            ("p1.png", (10, 20, 30)),
+            ("p2.png", (40, 50, 60)),
+            ("p3.png", (70, 80, 90)),
+        ] {
+            std::fs::write(dir.join("input").join(name), sample_png_bytes(rgb.0, rgb.1, rgb.2))
+                .unwrap();
+        }
+
+        prompts_csv::write_all(
+            &dir.join("prompts.csv"),
+            &[
+                Row {
+                    row_no: 2,
+                    anh_tham_chieu: "p1.png".into(),
+                    promt_tao_image: "p1 img".into(),
+                    promt_tao_video: "p1 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 3,
+                    anh_tham_chieu: "p2.png".into(),
+                    promt_tao_image: "p2 img".into(),
+                    promt_tao_video: "p2 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+                Row {
+                    row_no: 4,
+                    anh_tham_chieu: "p3.png".into(),
+                    promt_tao_image: "p3 img".into(),
+                    promt_tao_video: "p3 vid".into(),
+                    trang_thai: "Đang chờ".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        let (port_b, stop_b, join_b) = spawn_mock_http_server(move |_req| {
+            RawHttpResp::binary(200, "OK", "video/mp4", sample_mp4_bytes(b"STOP"))
+        });
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_on_first_poll = Arc::new(AtomicBool::new(true));
+        let img_calls = Arc::new(AtomicUsize::new(0));
+        let vid_create_calls = Arc::new(AtomicUsize::new(0));
+
+        let stop_flag_srv = stop_flag.clone();
+        let stop_poll_srv = stop_on_first_poll.clone();
+        let img_calls_srv = img_calls.clone();
+        let vid_calls_srv = vid_create_calls.clone();
+
+        let (port_a, stop_a, join_a) = spawn_mock_http_server(move |req| {
+            if req.method == "POST" && req.path == "/v1/images/edits" {
+                img_calls_srv.fetch_add(1, Ordering::SeqCst);
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({ "data": [{ "b64_json": sample_jpeg_b64(25, 115, 205) }] }),
+                );
+            }
+            if req.method == "POST" && req.path == "/v1/videos" {
+                let n = vid_calls_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                return RawHttpResp::json(
+                    201,
+                    "Created",
+                    serde_json::json!({ "id": format!("task_sr_{n}") }),
+                );
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/videos/task_sr_") {
+                if stop_poll_srv.load(Ordering::SeqCst) {
+                    // Đợi đủ cả 3 ảnh hoàn tất rồi mới kích hoạt STOP ngay giữa lượt poll video 1
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while img_calls_srv.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    stop_flag_srv.store(true, Ordering::SeqCst);
+                    return RawHttpResp::json(
+                        200,
+                        "OK",
+                        serde_json::json!({ "status": "in_progress", "progress": 30 }),
+                    );
+                }
+                return RawHttpResp::json(
+                    200,
+                    "OK",
+                    serde_json::json!({
+                        "status": "succeeded",
+                        "progress": 100,
+                        "video_url": format!("http://127.0.0.1:{port_b}/sr.mp4")
+                    }),
+                );
+            }
+            RawHttpResp::json(404, "Not Found", serde_json::json!({}))
+        });
+
+        let api_base = format!("http://127.0.0.1:{port_a}/v1");
+        adapters::register_test_api_key(&api_base, "sk-stop-resume-test");
+        let cfg = Settings {
+            endpoint_image_base_url: api_base.clone(),
+            endpoint_video_base_url: api_base,
+            concurrency: 1,
+            poll_interval_s: 1,
+            poll_max_s: 30,
+            backoff_s: [1, 1, 1],
+            ..Settings::default()
+        };
+        let noop_emit = |_name: &str, _val: serde_json::Value| {};
+
+        // Lượt 1: dừng an toàn giữa lúc poll video dòng 1, sau khi cả 3 ảnh đã tạo xong phía trước
+        let out1 = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag)
+            .expect("stopped run must succeed cleanly");
+        assert!(out1.stopped);
+        assert_eq!(out1.status, "da_dung");
+        assert_eq!(out1.done, 0);
+        assert_eq!(out1.errors, 0);
+        assert_eq!(img_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(vid_create_calls.load(Ordering::SeqCst), 1);
+
+        {
+            let conn = crate::state_db::open(&dir).unwrap();
+            for (img, ip, vp) in [
+                ("p1.png", "p1 img", "p1 vid"),
+                ("p2.png", "p2 img", "p2 vid"),
+                ("p3.png", "p3 img", "p3 vid"),
+            ] {
+                let k = crate::prompts_csv::row_key_of(img, ip, vp);
+                let job = latest_job_info(&conn, &k).expect("job must be persisted");
+                assert_eq!(job.status, "da_tao_image");
+                assert_eq!(job.image_status, "xong");
+            }
+        }
+
+        // Lượt 2: tiếp tục chạy — KHÔNG gọi tạo ảnh lại lần nào, resume task_sr_1 + tạo 2 video còn lại
+        stop_on_first_poll.store(false, Ordering::SeqCst);
+        stop_flag.store(false, Ordering::SeqCst);
+        let out2 = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag)
+            .expect("resumed run must succeed");
+        assert_eq!(out2.status, "hoan_tat");
+        assert_eq!(out2.done, 3);
+        assert_eq!(out2.errors, 0);
+        assert_eq!(
+            img_calls.load(Ordering::SeqCst),
+            3,
+            "resumed run MUST NOT re-generate already completed images"
+        );
+        assert_eq!(
+            vid_create_calls.load(Ordering::SeqCst),
+            3,
+            "task_sr_1 must be resumed without recreating, plus 2 new tasks for p2 and p3"
+        );
+
+        stop_a.store(true, Ordering::SeqCst);
+        stop_b.store(true, Ordering::SeqCst);
+        let _ = join_a.join();
+        let _ = join_b.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

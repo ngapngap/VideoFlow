@@ -9,6 +9,81 @@ export function isValidIntInRange(val: unknown, min: number, max: number): boole
   return Number.isFinite(n) && Number.isInteger(n) && n >= min && n <= max;
 }
 
+/** Global hard ceiling on concurrent worker threads per pipeline stage. */
+export const MAX_CONCURRENCY = 20;
+
+/**
+ * Counts Muse accounts eligible to run video tasks (`enabled !== false`, not `invalid` / `video_locked`).
+ * Prefers live sidecar account list when running, while avoiding a transient 0-flicker when the
+ * sidecar reports accounts present (`sidecarAccountTotal > 0`) before `muse_list_accounts()` resolves.
+ */
+export function countUsableMuseVideoAccounts(
+  accounts: { enabled?: boolean; status?: string }[] | null | undefined,
+  sidecarRunning: boolean,
+  fallbackCount?: number | null,
+  sidecarAccountTotal?: number | null
+): number {
+  if (sidecarRunning && Array.isArray(accounts)) {
+    const listStillLoading =
+      accounts.length === 0 &&
+      typeof sidecarAccountTotal === "number" &&
+      Number.isFinite(sidecarAccountTotal) &&
+      sidecarAccountTotal > 0;
+    if (!listStillLoading) {
+      return accounts.filter(
+        (a) => a.enabled !== false && a.status !== "invalid" && a.status !== "video_locked"
+      ).length;
+    }
+  }
+  if (typeof fallbackCount === "number" && Number.isFinite(fallbackCount)) {
+    return Math.max(0, Math.floor(fallbackCount));
+  }
+  return 0;
+}
+
+/**
+ * Maximum concurrency selectable in UI:
+ * - When `videoSource === "internal"`, strictly capped by usable Muse accounts (minimum 1 so settings
+ *   remain savable before logging in an account) to guarantee at most 1 video per Muse account.
+ * - Otherwise (external gateway), up to `MAX_CONCURRENCY`.
+ */
+export function getConcurrencyMax(
+  videoSource?: string | null,
+  museVideoAccounts?: number | null
+): number {
+  if (videoSource === "internal") {
+    const count =
+      typeof museVideoAccounts === "number" && Number.isFinite(museVideoAccounts)
+        ? Math.max(0, Math.floor(museVideoAccounts))
+        : 0;
+    return Math.min(MAX_CONCURRENCY, Math.max(1, count));
+  }
+  return MAX_CONCURRENCY;
+}
+
+/** Validates `concurrency` against video source and usable Muse account count, returning a Vietnamese error or null. */
+export function validateConcurrency(
+  concurrency: unknown,
+  videoSource?: string | null,
+  museVideoAccounts?: number | null
+): string | null {
+  const max = getConcurrencyMax(videoSource, museVideoAccounts);
+  if (isValidIntInRange(concurrency, 1, max)) {
+    return null;
+  }
+  if (videoSource === "internal") {
+    const count =
+      typeof museVideoAccounts === "number" && Number.isFinite(museVideoAccounts)
+        ? Math.max(0, Math.floor(museVideoAccounts))
+        : 0;
+    if (count <= 0) {
+      return "Chưa có tài khoản Muse khả dụng — chỉ cho phép 1 luồng cho đến khi thêm tài khoản Muse.";
+    }
+    return `Số luồng chạy đồng thời phải từ 1 đến ${max} (không vượt quá ${count} tài khoản Muse khả dụng để đảm bảo mỗi tài khoản chỉ chạy tối đa 1 video).`;
+  }
+  return `Số luồng chạy đồng thời phải là số nguyên từ 1 đến ${MAX_CONCURRENCY}.`;
+}
+
 /** Maximum `video_seconds` allowed by the selected video backend (`internal` Muse caps at 60s). */
 export function getVideoSecondsMax(videoSource?: string | null): number {
   return videoSource === "internal" ? 60 : 120;
