@@ -1543,8 +1543,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         // 2. STOP_EPOCH increment aborts wait_health immediately with MUSE_START_CANCELLED
+        #[cfg(windows)]
         let mut child = Command::new(windows_system32_exe("cmd.exe"))
             .args(["/C", "timeout /T 1 /NOBREAK >NUL"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 1"])
             .spawn()
             .unwrap();
         let epoch = STOP_EPOCH.load(std::sync::atomic::Ordering::SeqCst);

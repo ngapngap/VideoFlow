@@ -6,6 +6,7 @@ pub mod commands;
 pub mod csv_writer;
 pub mod engine;
 pub mod error;
+pub mod ffmpeg;
 pub mod muse_sidecar;
 pub mod project;
 pub mod prompts_csv;
@@ -61,6 +62,8 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::set_api_key_cmd,
+            commands::check_ffmpeg,
+            commands::pick_ffmpeg_binary,
             commands::hide_to_tray,
             commands::force_quit_app,
             commands::test_connection,

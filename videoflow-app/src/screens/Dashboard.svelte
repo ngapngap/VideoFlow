@@ -1,6 +1,6 @@
 <script lang="ts">
   // Màn hình Tổng quan (6.2, 6.2b, 6.8, 6.14): Onboarding 1-chạm, 3 thẻ nguồn, 4 thẻ số liệu, tiến độ đa luồng theo tài khoản Muse, Start/Stop/Chạy thử
-  import { createEventDispatcher, onMount } from "svelte";
+  import { createEventDispatcher, onDestroy, onMount } from "svelte";
   import {
     project,
     running,
@@ -23,6 +23,7 @@
   } from "../lib/store";
   import { api, type DryRunResult, type ProbeResult } from "../lib/api";
   import { countUsableMuseVideoAccounts, getConcurrencyMax } from "../lib/settingsSave";
+  import { createCoalescedScheduler } from "../lib/asyncGuard";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
@@ -139,21 +140,42 @@
     .map((i) => i.key)
     .join(", ");
 
-  // Tự động làm mới khi dự án đang mở hoặc trạng thái dòng thay đổi
+  // Tự động làm mới khi dự án đang mở hoặc trạng thái dòng thay đổi (gom nhịp 250ms khi chạy đa luồng)
+  let lastDashboardProjectPath: string | null = null;
+  let lastDashboardTick = -1;
+  const dashboardTickScheduler = createCoalescedScheduler(250, () => {
+    if ($project?.path) {
+      void refresh();
+    }
+  });
+
+  onDestroy(() => {
+    dashboardTickScheduler.cancel();
+  });
+
   $: {
     const projectPath = $project?.path ?? null;
     const tick = $rowChangedTick;
-    void tick;
-    if (projectPath) {
-      void refresh();
-    } else {
-      dryRun = null;
-      totalRows = 0;
-      pendingCount = 0;
-      doneCount = 0;
-      errorRows = 0;
-      skippedCount = 0;
-      loadError = null;
+    if (projectPath !== lastDashboardProjectPath) {
+      dashboardTickScheduler.cancel();
+      lastDashboardProjectPath = projectPath;
+      lastDashboardTick = tick;
+      if (projectPath) {
+        void refresh();
+      } else {
+        dryRun = null;
+        totalRows = 0;
+        pendingCount = 0;
+        doneCount = 0;
+        errorRows = 0;
+        skippedCount = 0;
+        loadError = null;
+      }
+    } else if (tick !== lastDashboardTick) {
+      lastDashboardTick = tick;
+      if (projectPath) {
+        dashboardTickScheduler.schedule();
+      }
     }
   }
 
@@ -302,7 +324,12 @@
         showToast("info", "Không có dòng nào đang chờ xử lý.");
         return;
       }
-      if ($confirmStartEnabled || freshDryRun.is_csv_locked) {
+      if (
+        $confirmStartEnabled ||
+        freshDryRun.is_csv_locked ||
+        freshDryRun.ffmpeg_missing_for_auto_merge ||
+        freshDryRun.ffmpeg_missing_for_noi_canh
+      ) {
         dontAskAgain = false;
         confirmModalOpen = true;
         return;
@@ -497,6 +524,27 @@
         <button type="button" class="btn-secondary small-btn" on:click={refresh}>
           <Icons name="refresh" size={14} />
           Kiểm tra lại
+        </button>
+      </div>
+    {/if}
+
+    {#if dryRun?.ffmpeg_missing_for_auto_merge || dryRun?.ffmpeg_missing_for_noi_canh}
+      <div class="warn-banner selectable" role="status">
+        <div class="warn-banner-text">
+          <Icons name="alert" size={18} />
+          <span>
+            <strong>Chưa tìm thấy FFmpeg trên máy</strong> —
+            {#if dryRun.ffmpeg_missing_for_auto_merge}
+              tính năng <em>Tự động ghép video sau batch</em> cần FFmpeg để chạy.
+            {:else}
+              batch có dòng <em>Nối cảnh (noi_canh)</em> cần FFmpeg để trích frame cuối (nếu thiếu sẽ dùng ảnh gốc).
+            {/if}
+            Cài nhanh bằng <code>winget install Gyan.FFmpeg</code> hoặc chọn đường dẫn trong Cài đặt.
+          </span>
+        </div>
+        <button type="button" class="btn-secondary small-btn" on:click={() => dispatch("navigate", "settings")}>
+          <Icons name="settings" size={14} />
+          Mở Cài đặt
         </button>
       </div>
     {/if}
@@ -1000,6 +1048,19 @@
       </div>
     {/if}
 
+    {#if dryRun?.ffmpeg_missing_for_auto_merge || dryRun?.ffmpeg_missing_for_noi_canh}
+      <div class="modal-csv-warn selectable">
+        <Icons name="alert" size={18} />
+        <div>
+          <strong>Chưa tìm thấy FFmpeg:</strong>
+          {dryRun.ffmpeg_hint || "Hãy cài FFmpeg (winget install Gyan.FFmpeg) hoặc chỉ định đường dẫn trong Cài đặt."}
+          {#if dryRun.ffmpeg_missing_for_auto_merge}
+            <br />Bật <em>Tự động ghép video</em> sẽ bị chặn trước khi chạy cho đến khi có FFmpeg hoặc bạn tắt tùy chọn này trong Cài đặt.
+          {/if}
+        </div>
+      </div>
+    {/if}
+
     {#if $confirmStartEnabled}
       <label class="dont-ask-row" for="confirm-dont-ask-again">
         <input
@@ -1074,6 +1135,16 @@
           <Icons name="alert" size={18} />
           <div>
             <strong>prompts.csv đang mở trong ứng dụng khác (Excel)</strong> — hãy đóng file trước khi chạy thật để cập nhật tức thì.
+          </div>
+        </div>
+      {/if}
+
+      {#if dryRun.ffmpeg_missing_for_auto_merge || dryRun.ffmpeg_missing_for_noi_canh}
+        <div class="modal-csv-warn selectable">
+          <Icons name="alert" size={18} />
+          <div>
+            <strong>Chưa tìm thấy FFmpeg:</strong>
+            {dryRun.ffmpeg_hint || "Cần cài FFmpeg để dùng Tự động ghép video / Nối cảnh."}
           </div>
         </div>
       {/if}
@@ -1626,7 +1697,7 @@
     border: 1px solid var(--c-border);
     border-radius: 8px;
     cursor: pointer;
-    background: #fff;
+    background: var(--c-card);
   }
   .mode-option.selected {
     border-color: var(--c-teal);

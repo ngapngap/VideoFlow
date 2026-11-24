@@ -66,6 +66,12 @@ pub struct Settings {
     pub schedule_hours: u64,         // chu kỳ N giờ
     pub auto_cleanup_days: u32,      // 30
     pub auto_merge: bool,            // tự động ghép nối video sau batch (P2-2)
+    /// Đường dẫn file thực thi FFmpeg thủ công (rỗng = tự dò từ PATH / vị trí phổ biến).
+    pub ffmpeg_path: String,
+    /// Giao diện: "system" (theo hệ thống) | "light" | "dark".
+    pub theme: String,
+    /// Ngôn ngữ giao diện: "vi" | "en".
+    pub language: String,
     pub confirm_start: bool,         // hộp xác nhận Start "Không hỏi lại"
     pub notify_on_finish: bool,
     pub minimize_to_tray: bool,
@@ -99,6 +105,9 @@ impl Default for Settings {
             schedule_hours: 3,
             auto_cleanup_days: 30,
             auto_merge: false,
+            ffmpeg_path: String::new(),
+            theme: "system".into(),
+            language: "vi".into(),
             confirm_start: true,
             notify_on_finish: true,
             minimize_to_tray: false,
@@ -145,6 +154,13 @@ impl Settings {
             clean.video_source = "gateway".into();
         }
         clean.muse_chromium_path = clean.muse_chromium_path.trim().to_string();
+        clean.ffmpeg_path = clean.ffmpeg_path.trim().to_string();
+        if !matches!(clean.theme.as_str(), "system" | "light" | "dark") {
+            clean.theme = "system".into();
+        }
+        if !matches!(clean.language.as_str(), "vi" | "en") {
+            clean.language = "vi".into();
+        }
         clean.muse_sidecar_port = clean.muse_sidecar_port.max(1);
         clean.video_size = trim_or_default(&clean.video_size, &def.video_size);
 
@@ -979,5 +995,28 @@ mod tests {
         assert_eq!(reloaded.video_source, "internal");
         assert_eq!(reloaded.video_seconds, 60);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_settings_ffmpeg_theme_and_language_sanitization() {
+        let s = Settings {
+            ffmpeg_path: "  C:\\ffmpeg\\bin\\ffmpeg.exe  ".into(),
+            theme: "dark".into(),
+            language: "en".into(),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(s.ffmpeg_path, r"C:\ffmpeg\bin\ffmpeg.exe");
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.language, "en");
+
+        let invalid = Settings {
+            theme: "neon".into(),
+            language: "jp".into(),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(invalid.theme, "system");
+        assert_eq!(invalid.language, "vi");
     }
 }

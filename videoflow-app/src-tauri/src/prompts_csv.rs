@@ -315,6 +315,19 @@ fn read_existing_headers_unlocked(csv_path: &Path) -> Option<Vec<String>> {
     Some(headers.iter().map(|s| s.to_string()).collect())
 }
 
+struct CsvCacheEntry {
+    path: std::path::PathBuf,
+    byte_len: usize,
+    digest: [u8; 32],
+    rows: Vec<Row>,
+}
+
+fn csv_cache() -> &'static parking_lot::Mutex<Option<CsvCacheEntry>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<Option<CsvCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
 fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
     let bytes = fs::read(csv_path).map_err(|e| {
         AppError::new(
@@ -325,6 +338,19 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
 
     if bytes.is_empty() {
         return Err(AppError::new("PROMPTS_EMPTY", "File prompts.csv rỗng."));
+    }
+
+    let digest_arr: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+    {
+        let guard = csv_cache().lock();
+        if let Some(entry) = guard.as_ref() {
+            if entry.path == csv_path
+                && entry.byte_len == bytes.len()
+                && entry.digest == digest_arr
+            {
+                return Ok(entry.rows.clone());
+            }
+        }
     }
 
     let content = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
@@ -414,6 +440,12 @@ fn read_all_unlocked(csv_path: &Path) -> AppResult<Vec<Row>> {
     }
 
     validate_rows(&rows)?;
+    *csv_cache().lock() = Some(CsvCacheEntry {
+        path: csv_path.to_path_buf(),
+        byte_len: bytes.len(),
+        digest: digest_arr,
+        rows: rows.clone(),
+    });
     Ok(rows)
 }
 

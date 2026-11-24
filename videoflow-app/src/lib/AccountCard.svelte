@@ -559,7 +559,7 @@
   .acc-card {
     border: 1px solid var(--c-border);
     border-radius: 10px;
-    background: #fff;
+    background: var(--c-card);
     padding: 14px 16px;
     display: flex;
     flex-direction: column;
@@ -760,7 +760,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    background: #fff;
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     border-radius: 6px;
     padding: 3px 8px;

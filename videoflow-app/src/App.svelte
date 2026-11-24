@@ -33,6 +33,18 @@
     startMusePolling,
   } from "./lib/store";
   import { deriveStatusbarIpText, resolveLockedAccount } from "./lib/museStatus";
+  import {
+    cycleThemeMode,
+    initPreferences,
+    locale,
+    normalizeLocale,
+    normalizeThemeMode,
+    setLocale,
+    setThemeMode,
+    t,
+    themeMode,
+    toggleLocale,
+  } from "./lib/preferences";
   import { listen } from "@tauri-apps/api/event";
   import {
     api,
@@ -57,24 +69,57 @@
   let stoppingHeader = false;
   let quittingApp = false;
 
-  const navItems: { key: Screen; label: string; icon: string }[] = [
-    { key: "dash", label: "Tổng quan", icon: "dashboard" },
-    { key: "rows", label: "Dòng việc", icon: "rows" },
-    { key: "accounts", label: "Tài khoản", icon: "video-source" },
-    { key: "proxies", label: "Proxy", icon: "globe" },
-    { key: "history", label: "Lịch sử", icon: "history" },
-    { key: "folder", label: "Thư mục Local", icon: "folder" },
+  $: navItems = [
+    { key: "dash" as Screen, label: $t("nav.dash"), icon: "dashboard" },
+    { key: "rows" as Screen, label: $t("nav.rows"), icon: "rows" },
+    { key: "accounts" as Screen, label: $t("nav.accounts"), icon: "video-source" },
+    { key: "proxies" as Screen, label: $t("nav.proxies"), icon: "globe" },
+    { key: "history" as Screen, label: $t("nav.history"), icon: "history" },
+    { key: "folder" as Screen, label: $t("nav.folder"), icon: "folder" },
   ];
 
-  const screenTitles: Record<Screen, string> = {
-    dash: "Tổng quan vận hành",
-    rows: "Quản lý dòng việc",
-    accounts: "Quản lý tài khoản Muse",
-    proxies: "Quản lý Proxy (HTTP / SOCKS5)",
-    history: "Lịch sử & Nhật ký",
-    folder: "Thư mục dự án Local",
-    settings: "Cài đặt hệ thống",
-  };
+  $: screenTitles = {
+    dash: $t("title.dash"),
+    rows: $t("title.rows"),
+    accounts: $t("title.accounts"),
+    proxies: $t("title.proxies"),
+    history: $t("title.history"),
+    folder: $t("title.folder"),
+    settings: $t("title.settings"),
+  } as Record<Screen, string>;
+
+  $: themeIcon = $themeMode === "light" ? "sun" : $themeMode === "dark" ? "moon" : "monitor";
+  $: themeTooltip =
+    $themeMode === "light"
+      ? $t("header.theme.light")
+      : $themeMode === "dark"
+        ? $t("header.theme.dark")
+        : $t("header.theme.system");
+
+  async function persistAppearancePref(patch: { theme?: string; language?: string }) {
+    if ($running) return;
+    try {
+      const view = await api.get_settings();
+      await api.save_settings({
+        ...view.settings,
+        ...patch,
+      });
+    } catch {
+      // localStorage đã lưu ngay lập tức; bỏ qua nếu không ghi được settings.json lúc này
+    }
+  }
+
+  function handleCycleTheme() {
+    const next = cycleThemeMode($themeMode);
+    setThemeMode(next);
+    void persistAppearancePref({ theme: next });
+  }
+
+  function handleToggleLanguage() {
+    const next = toggleLocale($locale);
+    setLocale(next);
+    void persistAppearancePref({ language: next });
+  }
 
   const checklistNames: Record<string, string> = {
     input: "input/",
@@ -340,6 +385,12 @@
       });
       confirmStartEnabled.set(view.settings?.confirm_start ?? true);
       maxAttemptsStore.set(Math.max(1, Number(view.settings?.max_attempts) || 3));
+      if (view.settings?.theme) {
+        setThemeMode(normalizeThemeMode(view.settings.theme));
+      }
+      if (view.settings?.language) {
+        setLocale(normalizeLocale(view.settings.language));
+      }
     } catch (e) {
       console.warn("[VideoFlow] Không nạp được cài đặt ban đầu:", e);
     }
@@ -374,7 +425,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.5.1";
+  let appVersion = "1.5.4";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;
@@ -432,6 +483,7 @@
 
   // ━━ Quản lý Proxy Statusbar & Khóa tính năng Video (P2-3 & UI-2 / M4) ━━
   let stopMusePolling: (() => void) | null = null;
+  let stopPrefsListener: (() => void) | null = null;
   let destroyed = false;
 
   $: lockedAccount = resolveLockedAccount(
@@ -460,6 +512,7 @@
   }
 
   onMount(() => {
+    stopPrefsListener = initPreferences();
     bootstrapApp();
     checkForUpdates(true);
     stopMusePolling = startMusePolling();
@@ -480,6 +533,10 @@
     destroyed = true;
     unsubProjectSeq();
     if (unlistenUpdateProgress) unlistenUpdateProgress();
+    if (stopPrefsListener) {
+      stopPrefsListener();
+      stopPrefsListener = null;
+    }
     if (stopMusePolling) {
       stopMusePolling();
       stopMusePolling = null;
@@ -563,7 +620,7 @@
         on:click={() => requestNavigate("settings")}
       >
         <Icons name="settings" size={18} />
-        <span class="nav-label">Cài đặt</span>
+        <span class="nav-label">{$t("nav.settings")}</span>
         {#if $settingsDirty}
           <span class="status-badge-dot warn" title="Có thay đổi chưa lưu"></span>
         {:else if settingsNeedsAttention}
@@ -589,7 +646,7 @@
               on:click={() => requestNavigate("dash")}
             >
               <span class="pulse-dot"></span>
-              <span>Đang chạy {activeCount} dòng · {Math.floor($progressPercent)}%</span>
+              <span>{$t("header.runningSummary", { n: activeCount, pct: Math.floor($progressPercent) })}</span>
             </button>
             <button
               type="button"
@@ -599,7 +656,7 @@
               on:click={handleHeaderStop}
             >
               <Icons name="stop" size={12} />
-              <span>{stoppingHeader ? "Đang dừng..." : "STOP"}</span>
+              <span>{stoppingHeader ? $t("header.stopping") : $t("header.stop")}</span>
             </button>
           </div>
         {/if}
@@ -624,19 +681,39 @@
           on:click={openSwitcher}
         >
           <Icons name={$project ? "folder-open" : "folder"} size={15} />
-          <span class="switcher-name">{$project ? $project.name : "Chọn dự án..."}</span>
+          <span class="switcher-name">{$project ? $project.name : $t("header.chooseProject")}</span>
           {#if $project}
-            <span class="switcher-count">{$project.row_count} dòng</span>
+            <span class="switcher-count">{$t("header.rowsCount", { n: $project.row_count })}</span>
           {/if}
           <Icons name="chevron-down" size={14} />
         </button>
 
         <button
           type="button"
+          class="btn-ghost header-pref-btn"
+          aria-label={themeTooltip}
+          title={themeTooltip}
+          on:click={handleCycleTheme}
+        >
+          <Icons name={themeIcon} size={16} />
+        </button>
+
+        <button
+          type="button"
+          class="btn-ghost header-lang-btn"
+          aria-label={$t("header.lang")}
+          title={`${$t("header.lang")}: ${$locale.toUpperCase()}`}
+          on:click={handleToggleLanguage}
+        >
+          {$locale.toUpperCase()}
+        </button>
+
+        <button
+          type="button"
           class="btn-ghost header-gear"
           class:active={screen === "settings"}
-          aria-label="Mở màn hình Cài đặt"
-          title="Cài đặt"
+          aria-label={$t("header.settings")}
+          title={$t("header.settings")}
           on:click={() => requestNavigate("settings")}
         >
           <Icons name="settings" size={18} />
@@ -693,20 +770,20 @@
       class:bad={Boolean($project) && !structureOk}
     ></span>
     {#if structureOk}
-      <span>Cấu trúc đủ (5/5)</span>
+      <span>{$t("status.structOk")}</span>
     {:else if $project}
       <span class="missing-parts-text" title={`Thiếu/lỗi: ${missingParts}`}>
-        Kiểm tra: {missingParts}
+        {$t("status.check", { parts: missingParts })}
       </span>
     {:else}
-      <span>Chưa chọn dự án</span>
+      <span>{$t("status.noProject")}</span>
     {/if}
   </span>
 
   <span class="status-divider"></span>
 
   <span class="status-section">
-    <span>Ảnh:</span>
+    <span>{$t("status.image")}</span>
     <span
       class="dot"
       class:ok={$endpointStatus.imageConfigured}
@@ -1348,9 +1425,23 @@
     font-weight: 600;
     padding: 1px 7px;
     border-radius: 999px;
-    background: #fff;
+    background: var(--c-card);
     color: var(--c-muted);
     border: 1px solid var(--c-border);
+  }
+  .header-pref-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+  }
+  .header-lang-btn {
+    height: 32px;
+    padding: 0 8px;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--c-border);
+    border-radius: 7px;
   }
 
   .header-gear {
@@ -1486,7 +1577,7 @@
   .switcher-item {
     border: 1px solid var(--c-border);
     border-radius: 10px;
-    background: #fff;
+    background: var(--c-card);
     overflow: hidden;
   }
   .switcher-item.current {
@@ -1602,7 +1693,7 @@
     border: 1px solid var(--c-border);
     border-radius: 8px;
     cursor: pointer;
-    background: #fff;
+    background: var(--c-card);
   }
   .mode-card.selected {
     border-color: var(--c-teal);

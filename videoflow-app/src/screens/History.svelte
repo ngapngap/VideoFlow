@@ -1258,7 +1258,7 @@
     flex-shrink: 0;
   }
   .info-note code {
-    background: #ffffff;
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     padding: 0 5px;
     border-radius: 4px;

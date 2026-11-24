@@ -1,13 +1,23 @@
 //! Tự động ghép nối video sau batch bằng FFmpeg (P2-2).
+//! Hỗ trợ:
+//! - Kiểm tra trước FFmpeg (tự dò PATH / đường dẫn tùy chọn).
+//! - Fast-path `-c copy` khi toàn bộ clip đã đồng nhất codec, độ phân giải, FPS và âm thanh.
+//! - Fallback chuẩn hóa `libx264` + bù âm thanh câm nếu clip không đồng nhất hoặc fast-path lỗi.
+//! - Timeout cho mọi tiến trình FFmpeg và hỗ trợ hủy tức thì qua `stop_flag`.
 
 use super::{
     image_counts, latest_job_for_csv_row, load_current_media_map, load_latest_jobs_map,
     map_lookup_legacy, row_key_low,
 };
+use crate::ffmpeg::{
+    can_fast_stream_copy, probe_clip_info, resolve_ffmpeg_binary, run_command_with_timeout,
+    ClipProbeInfo, FFMPEG_CLIP_TIMEOUT, FFMPEG_CONCAT_TIMEOUT, FFMPEG_PROBE_TIMEOUT,
+};
 use crate::prompts_csv;
 use crate::settings::Settings;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ━━ P2-2: Tự động ghép nối video sau batch (Auto-Merge FFmpeg) ━━
 
@@ -79,25 +89,14 @@ pub fn generate_merged_output_filename(project_name: &str, timestamp: &str) -> S
     }
 }
 
-/// Kiểm tra xem file video có chứa luồng âm thanh hay không bằng FFmpeg (CREATE_NO_WINDOW trên Windows).
+/// Kiểm tra xem file video có chứa luồng âm thanh hay không bằng FFmpeg (có timeout & tự dò đường dẫn).
 pub fn probe_has_audio_ffmpeg(video_path: &Path) -> Result<bool, String> {
     if !video_path.is_file() {
         return Err(format!("File video không tồn tại: {}", video_path.display()));
     }
-
-    let mut cmd = std::process::Command::new("ffmpeg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.args(["-hide_banner", "-i"]).arg(video_path);
-
-    let output = cmd.output().map_err(|e| format!("Không thể thực thi lệnh FFmpeg: {e}"))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let has_audio = stderr.lines().any(|line| line.contains("Stream #") && line.contains("Audio:"));
-    Ok(has_audio)
+    let bin = resolve_ffmpeg_binary("")?;
+    let info = probe_clip_info(&bin, video_path, FFMPEG_PROBE_TIMEOUT, None)?;
+    Ok(info.has_audio)
 }
 
 /// Tách độ phân giải video từ chuỗi cấu hình `video_size` (mặc định 720x1280).
@@ -174,7 +173,7 @@ pub fn build_normalize_clip_args(
     args
 }
 
-/// Xây dựng tham số FFmpeg concat demuxer ghép nối nhanh các clip đã chuẩn hóa.
+/// Xây dựng tham số FFmpeg concat demuxer ghép nối nhanh các clip (stream copy không mã hóa lại).
 pub fn build_concat_demuxer_args(list_path: &Path, output_path: &Path) -> Vec<String> {
     vec![
         "-y".into(),
@@ -245,14 +244,56 @@ pub fn build_filter_complex_concat_args(
     args
 }
 
-/// Thực hiện ghép nối tự động các video thành phẩm của batch bằng FFmpeg.
-/// Báo lỗi an toàn (fail-safe) để không làm hỏng dữ liệu gốc hoặc crash batch.
+fn write_concat_list(list_file: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    let mut list_content = String::new();
+    for p in paths {
+        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let raw = abs.to_string_lossy();
+        let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+        let safe_path = stripped.replace('\\', "/").replace('\'', "'\\''");
+        list_content.push_str(&format!("file '{safe_path}'\n"));
+    }
+    std::fs::write(list_file, list_content.as_bytes())
+        .map_err(|e| format!("Không thể ghi file concat_list.txt: {e}"))
+}
+
+fn commit_merged_output(tmp_output: &Path, final_output: &Path) -> Result<(), String> {
+    let len = std::fs::metadata(tmp_output).map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return Err("File video sau ghép rỗng (0 bytes)".into());
+    }
+    if let Err(e) = std::fs::rename(tmp_output, final_output) {
+        if let Err(copy_err) = std::fs::copy(tmp_output, final_output) {
+            let _ = std::fs::remove_file(final_output);
+            return Err(format!("Không thể lưu file video sau ghép: {e} ({copy_err})"));
+        }
+    }
+    Ok(())
+}
+
+/// Thực hiện ghép nối tự động các video thành phẩm của batch bằng FFmpeg (wrapper giữ tương thích).
 pub fn auto_merge_batch(
     project_path: &Path,
     run_id: Option<i64>,
     conn: Option<&Connection>,
     cfg: &Settings,
 ) -> Result<Option<PathBuf>, String> {
+    auto_merge_batch_with_stop(project_path, run_id, conn, cfg, None)
+}
+
+/// Thực hiện ghép nối tự động các video thành phẩm của batch bằng FFmpeg có timeout và hỗ trợ dừng (`stop_flag`).
+/// Ưu tiên ghép nhanh `-c copy` nếu mọi clip đồng nhất codec/độ phân giải/FPS/audio, chỉ chuẩn hóa `libx264` làm fallback.
+pub fn auto_merge_batch_with_stop(
+    project_path: &Path,
+    run_id: Option<i64>,
+    conn: Option<&Connection>,
+    cfg: &Settings,
+    stop_flag: Option<&AtomicBool>,
+) -> Result<Option<PathBuf>, String> {
+    if stop_flag.is_some_and(|f| f.load(Ordering::SeqCst)) {
+        return Ok(None);
+    }
+
     let video_out = project_path.join("video_out");
     let csv_path = project_path.join("prompts.csv");
 
@@ -301,6 +342,7 @@ pub fn auto_merge_batch(
     } else {
         collect_batch_video_paths(&csv_path, &video_out)?
     };
+
     if video_paths.len() < 2 {
         if let Some(c) = conn {
             crate::settings::log(
@@ -309,11 +351,16 @@ pub fn auto_merge_batch(
                 run_id,
                 None,
                 Some("auto_merge"),
-                &format!("Số lượng video thành phẩm ({}) ít hơn 2 clip, bỏ qua tự động ghép nối.", video_paths.len()),
+                &format!(
+                    "Số lượng video thành phẩm ({}) ít hơn 2 clip, bỏ qua tự động ghép nối.",
+                    video_paths.len()
+                ),
             );
         }
         return Ok(None);
     }
+
+    let ffmpeg_bin = resolve_ffmpeg_binary(&cfg.ffmpeg_path)?;
 
     let project_name = crate::project::project_display_name(project_path);
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
@@ -326,35 +373,78 @@ pub fn auto_merge_batch(
     std::fs::create_dir_all(&cache_dir)
         .map_err(|e| format!("Không tạo được thư mục tạm cho ghép nối video: {e}"))?;
 
+    struct CacheCleanup(PathBuf);
+    impl Drop for CacheCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = CacheCleanup(cache_dir.clone());
+
+    // Dò thông số stream từng clip để kiểm tra khả năng ghép nhanh không mã hóa lại (`-c copy`).
+    let mut clip_infos: Vec<ClipProbeInfo> = Vec::with_capacity(video_paths.len());
+    for vpath in &video_paths {
+        if stop_flag.is_some_and(|f| f.load(Ordering::SeqCst)) {
+            return Err("STOPPED: Đã dừng ghép nối video theo yêu cầu người dùng.".into());
+        }
+        let info = probe_clip_info(&ffmpeg_bin, vpath, FFMPEG_PROBE_TIMEOUT, stop_flag)
+            .unwrap_or_default();
+        clip_infos.push(info);
+    }
+
+    // Fast-path: nếu toàn bộ clip đã đồng nhất codec/độ phân giải/FPS/âm thanh -> ghép thẳng bằng `-c copy`!
+    if can_fast_stream_copy(&clip_infos) {
+        let fast_list = cache_dir.join("concat_fast_list.txt");
+        let fast_tmp = cache_dir.join("merged_fast_tmp.mp4");
+        if write_concat_list(&fast_list, &video_paths).is_ok() {
+            let fast_args = build_concat_demuxer_args(&fast_list, &fast_tmp);
+            match run_command_with_timeout(&ffmpeg_bin, &fast_args, FFMPEG_CONCAT_TIMEOUT, stop_flag)
+            {
+                Ok(out) if out.status.success() && fast_tmp.is_file() => {
+                    if commit_merged_output(&fast_tmp, &final_output).is_ok() {
+                        if let Some(c) = conn {
+                            crate::settings::log(
+                                c,
+                                "info",
+                                run_id,
+                                None,
+                                Some("auto_merge"),
+                                &format!(
+                                    "Đã ghép nhanh (-c copy) {} video thành công -> {}",
+                                    video_paths.len(),
+                                    out_filename
+                                ),
+                            );
+                        }
+                        return Ok(Some(final_output));
+                    }
+                }
+                Err(e) if e.starts_with("STOPPED:") => return Err(e),
+                _ => {
+                    // Fallback về chuẩn hóa từng clip nếu stream-copy gặp lỗi container/timestamp
+                    let _ = std::fs::remove_file(&fast_tmp);
+                }
+            }
+        }
+    }
+
     let (w, h) = parse_video_dimensions(&cfg.video_size);
     let fps = 30;
 
-    // Bước 1: Chuẩn hóa từng clip (độ phân giải, fps, âm thanh câm nếu thiếu)
-    let mut normalized_clips = Vec::new();
+    // Fallback bước 1: Chuẩn hóa từng clip (độ phân giải, fps, âm thanh câm nếu thiếu)
+    let mut normalized_clips = Vec::with_capacity(video_paths.len());
     for (i, vpath) in video_paths.iter().enumerate() {
+        if stop_flag.is_some_and(|f| f.load(Ordering::SeqCst)) {
+            return Err("STOPPED: Đã dừng ghép nối video theo yêu cầu người dùng.".into());
+        }
         let norm_path = cache_dir.join(format!("norm_{i:04}.mp4"));
-        let has_audio = probe_has_audio_ffmpeg(vpath).unwrap_or(false);
+        let has_audio = clip_infos.get(i).map(|info| info.has_audio).unwrap_or(false);
         let args = build_normalize_clip_args(vpath, &norm_path, has_audio, w, h, fps);
 
-        let mut cmd = std::process::Command::new("ffmpeg");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        cmd.args(&args);
-
-        let output = cmd
-            .output()
-            .map_err(|e| {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                format!("Không thể thực thi lệnh FFmpeg: {e}")
-            })?;
-
+        let output =
+            run_command_with_timeout(&ffmpeg_bin, &args, FFMPEG_CLIP_TIMEOUT, stop_flag)?;
         if !output.status.success() || !norm_path.is_file() {
             let err_msg = String::from_utf8_lossy(&output.stderr);
-            let _ = std::fs::remove_dir_all(&cache_dir);
             return Err(format!(
                 "FFmpeg chuẩn hóa clip thất bại cho {}: {}",
                 vpath.display(),
@@ -364,63 +454,22 @@ pub fn auto_merge_batch(
         normalized_clips.push(norm_path);
     }
 
-    // Bước 2: Ghi file danh sách concat demuxer (escape dấu nháy đơn cho FFmpeg)
+    // Fallback bước 2: Ghi file danh sách concat demuxer
     let list_file = cache_dir.join("concat_list.txt");
-    let mut list_content = String::new();
-    for norm_path in &normalized_clips {
-        let safe_path = norm_path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .replace('\'', "'\\''");
-        list_content.push_str(&format!("file '{safe_path}'\n"));
-    }
-    if let Err(e) = std::fs::write(&list_file, list_content.as_bytes()) {
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        return Err(format!("Không thể ghi file concat_list.txt: {e}"));
-    }
+    write_concat_list(&list_file, &normalized_clips)?;
 
-    // Bước 3: Ghép nối ra file tạm rồi rename nguyên tử sang final_output
+    // Fallback bước 3: Ghép nối ra file tạm rồi rename nguyên tử sang final_output
     let tmp_output = cache_dir.join("merged_tmp.mp4");
     let concat_args = build_concat_demuxer_args(&list_file, &tmp_output);
-    let mut cmd = std::process::Command::new("ffmpeg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.args(&concat_args);
-
-    let output = cmd
-        .output()
-        .map_err(|e| {
-            let _ = std::fs::remove_dir_all(&cache_dir);
-            format!("Không thể thực thi lệnh FFmpeg concat: {e}")
-        })?;
+    let output =
+        run_command_with_timeout(&ffmpeg_bin, &concat_args, FFMPEG_CONCAT_TIMEOUT, stop_flag)?;
 
     if !output.status.success() || !tmp_output.is_file() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
-        let _ = std::fs::remove_dir_all(&cache_dir);
         return Err(format!("FFmpeg ghép nối thất bại: {}", err_msg.trim()));
     }
 
-    let len = std::fs::metadata(&tmp_output)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    if len == 0 {
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        return Err("File video sau ghép rỗng (0 bytes)".into());
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_output, &final_output) {
-        // Fallback copy+remove nếu khác ổ đĩa
-        if let Err(copy_err) = std::fs::copy(&tmp_output, &final_output) {
-            let _ = std::fs::remove_file(&final_output);
-            let _ = std::fs::remove_dir_all(&cache_dir);
-            return Err(format!("Không thể lưu file video sau ghép: {e} ({copy_err})"));
-        }
-    }
-    let _ = std::fs::remove_dir_all(&cache_dir);
+    commit_merged_output(&tmp_output, &final_output)?;
 
     if let Some(c) = conn {
         crate::settings::log(

@@ -594,6 +594,7 @@ fn test_e2e_http_concurrency_2_origin_boundary_and_v2_prompt_versioning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn test_e2e_http_resume_quota_attempts_cap_3_of_3_and_reset_to_zero_on_success() {
     let dir = make_temp_project("e2e_resume_cap");
@@ -765,6 +766,7 @@ fn test_e2e_http_resume_quota_attempts_cap_3_of_3_and_reset_to_zero_on_success()
     let _ = join_b.join();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 
 #[test]
 fn test_p0_6_is_transient_error_classification() {
@@ -1619,6 +1621,7 @@ fn test_e2e_transient_retries_not_starved_when_carried_attempts_at_max() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn test_plan_row_legacy_key_same_image_and_empty_img_prompt_b3_resume() {
     let dir = make_temp_project("plan_row_m7");
@@ -1795,6 +1798,7 @@ fn test_run_with_emitter_and_hook_defers_run_finished() {
     let _ = join_b.join();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 
 #[test]
 fn test_plan_row_cho_empty_image_prompt_skips_to_b3() {
@@ -2301,6 +2305,7 @@ fn test_e2e_decoupled_image_pipeline_runs_parallel_with_video_even_at_concurrenc
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn test_e2e_decoupled_pipeline_noi_canh_preserves_video_order_while_images_run_ahead() {
     let dir = make_temp_project("e2e_decoupled_noi_canh");
@@ -2469,6 +2474,7 @@ fn test_e2e_decoupled_pipeline_noi_canh_preserves_video_order_while_images_run_a
     let _ = join_b.join();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 
 #[test]
 fn test_e2e_decoupled_pipeline_b2_failure_does_not_block_or_deadlock_other_rows() {
@@ -2764,5 +2770,44 @@ fn test_e2e_decoupled_pipeline_stop_mid_video_preserves_completed_ahead_images()
     stop_b.store(true, Ordering::SeqCst);
     let _ = join_a.join();
     let _ = join_b.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_auto_merge_preflight_fails_fast_with_ffmpeg_missing_and_stop_abort() {
+    let dir = make_temp_project("ffmpeg_preflight");
+    std::fs::write(dir.join("input/a.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let rows = vec![Row {
+        anh_tham_chieu: "a.png".into(),
+        promt_tao_image: "p img".into(),
+        promt_tao_video: "p vid".into(),
+        trang_thai: "Đang chờ".into(),
+        ..Default::default()
+    }];
+    prompts_csv::write_all(&dir.join("prompts.csv"), &rows).unwrap();
+
+    let cfg = Settings {
+        auto_merge: true,
+        ffmpeg_path: "/definitely/nonexistent/ffmpeg_bin".into(),
+        ..Settings::default()
+    };
+
+    // Dry-run warns immediately before starting
+    let dr = dry_run(&dir, &cfg).expect("dry_run must succeed");
+    assert!(dr.ffmpeg_missing_for_auto_merge);
+    assert!(dr.ffmpeg_hint.is_some());
+
+    // Starting batch fails fast with FFMPEG_MISSING before running B2/B3
+    let noop_emit = |_name: &str, _val: serde_json::Value| {};
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let err = run_with_emitter(&noop_emit, &cfg, &dir, EngineConfig::default(), &stop_flag)
+        .expect_err("auto_merge without FFmpeg must fail fast");
+    assert_eq!(err.code, "FFMPEG_MISSING");
+
+    // auto_merge_batch_with_stop returns Ok(None) immediately when stop_flag is already set
+    let already_stopped = AtomicBool::new(true);
+    let stop_res = auto_merge_batch_with_stop(&dir, Some(1), None, &cfg, Some(&already_stopped));
+    assert!(matches!(stop_res, Ok(None)));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

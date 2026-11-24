@@ -137,6 +137,16 @@ export interface DryRunResult {
   groups: { status: string; count: number; row_keys: string[] }[];
   total: number;
   is_csv_locked?: boolean;
+  ffmpeg_missing_for_auto_merge?: boolean;
+  ffmpeg_missing_for_noi_canh?: boolean;
+  ffmpeg_hint?: string | null;
+}
+
+export interface FfmpegStatus {
+  available: boolean;
+  resolved_path: string | null;
+  version: string | null;
+  error: string | null;
 }
 
 export interface RunSummary {
@@ -210,6 +220,12 @@ export interface Settings {
   auto_cleanup_days: number;
   /** Tự động ghép nối các clip video sau khi kết thúc batch (P2-2) */
   auto_merge: boolean;
+  /** Đường dẫn file thực thi FFmpeg tùy chọn (rỗng = tự dò từ PATH) */
+  ffmpeg_path?: string;
+  /** Chủ đề giao diện: "system" | "light" | "dark" */
+  theme?: "system" | "light" | "dark" | string;
+  /** Ngôn ngữ giao diện: "vi" | "en" */
+  language?: "vi" | "en" | string;
   confirm_start: boolean;
   notify_on_finish: boolean;
   minimize_to_tray: boolean;
@@ -227,6 +243,8 @@ export interface SettingsView {
   muse_total_accounts?: number;
   muse_video_accounts?: number;
   max_concurrency?: number;
+  ffmpeg_available?: boolean;
+  ffmpeg_resolved_path?: string | null;
 }
 
 // ━━ VideoFlow Muse nội bộ (engine + pool cookie + hạn mức) ━━
@@ -389,6 +407,9 @@ export const api = {
   save_settings: (settings: Settings) => invoke<boolean>("save_settings", { settings }),
   set_api_key: (which: string, value: string) =>
     invoke<boolean>("set_api_key_cmd", { which, value }),
+  check_ffmpeg: (overridePath?: string | null) =>
+    invoke<FfmpegStatus>("check_ffmpeg", { overridePath: overridePath ?? null }),
+  pick_ffmpeg_binary: () => invoke<string | null>("pick_ffmpeg_binary"),
   test_connection: (which: string, baseUrl?: string, apiKey?: string) =>
     invoke<[boolean, number, string]>("test_connection", { which, baseUrl, apiKey }),
   get_history: (

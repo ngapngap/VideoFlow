@@ -701,7 +701,7 @@
     padding: 0 12px;
     border-radius: 6px;
     border: 1px solid var(--c-border);
-    background: #fff;
+    background: var(--c-card);
     font-size: 13px;
     color: var(--c-text);
     outline: none;

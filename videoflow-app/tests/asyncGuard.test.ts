@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  createCoalescedScheduler,
   createSeqGuard,
   isAccountActionBlocked,
   isRowLockedForBatch,
@@ -336,5 +337,35 @@ describe("runStartupProjectAutoOpen", () => {
     const opened = await bootPromise;
     assert.equal(opened, false);
     assert.deepEqual(current, { path: "E:\\ManualChoice" });
+  });
+});
+
+describe("createCoalescedScheduler", () => {
+  it("coalesces rapid bursts into a single trailing call and supports cancel/flush", async () => {
+    let calls = 0;
+    const sched = createCoalescedScheduler(25, () => {
+      calls += 1;
+    });
+
+    sched.schedule();
+    sched.schedule();
+    sched.schedule();
+    assert.equal(calls, 0);
+
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(calls, 1);
+
+    // cancel prevents pending callback from running
+    sched.schedule();
+    sched.cancel();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls, 1);
+
+    // flush executes pending callback immediately once
+    sched.schedule();
+    sched.flush();
+    assert.equal(calls, 2);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls, 2);
   });
 });

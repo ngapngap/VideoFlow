@@ -20,11 +20,19 @@
   } from "../lib/store";
   import {
     api,
+    type FfmpegStatus,
     type MuseStatusView,
     type ProbeResult,
     type Settings,
     type SettingsView,
   } from "../lib/api";
+  import {
+    normalizeLocale,
+    normalizeThemeMode,
+    setLocale,
+    setThemeMode,
+    t,
+  } from "../lib/preferences";
   import {
     countUsableMuseVideoAccounts,
     executeSettingsSave,
@@ -79,6 +87,9 @@
   let testingVideo = false;
   let testVideo = "";
   let testVideoOk: boolean | null = null;
+
+  let ffmpegStatus: FfmpegStatus | null = null;
+  let checkingFfmpeg = false;
 
   let loadingImageModels = false;
   let imageModels: string[] = [];
@@ -385,6 +396,20 @@
     if (typeof view.muse_video_accounts === "number") {
       settingsMuseVideoAccounts = view.muse_video_accounts;
     }
+    if (typeof view.ffmpeg_available === "boolean") {
+      ffmpegStatus = {
+        available: view.ffmpeg_available,
+        resolved_path: view.ffmpeg_resolved_path ?? null,
+        version: ffmpegStatus?.version ?? null,
+        error: view.ffmpeg_available ? null : (ffmpegStatus?.error ?? null),
+      };
+    }
+    if (cloned.theme) {
+      setThemeMode(normalizeThemeMode(cloned.theme));
+    }
+    if (cloned.language) {
+      setLocale(normalizeLocale(cloned.language));
+    }
     imageKeyPreview = view.image_key_preview ?? "";
     videoKeyPreview = view.video_key_preview ?? "";
     hasImageKey = Boolean(view.has_image_key);
@@ -465,6 +490,55 @@
     }
   }
 
+  async function runCheckFfmpeg() {
+    if (checkingFfmpeg) return;
+    checkingFfmpeg = true;
+    try {
+      const st = await api.check_ffmpeg(s?.ffmpeg_path ?? "");
+      if (destroyed) return;
+      ffmpegStatus = st;
+      if (st.available) {
+        showToast("success", `FFmpeg sẵn sàng${st.version ? ` (${st.version})` : ""}.`);
+      } else {
+        showToast("warn", st.error || "Chưa tìm thấy FFmpeg trên máy.");
+      }
+    } catch (e) {
+      if (!destroyed) {
+        showToast("error", formatApiError(e));
+      }
+    } finally {
+      if (!destroyed) {
+        checkingFfmpeg = false;
+      }
+    }
+  }
+
+  async function browseFfmpegBinary() {
+    if (!s || $running) return;
+    try {
+      const picked = await api.pick_ffmpeg_binary();
+      if (picked && s) {
+        s.ffmpeg_path = picked;
+        mark();
+        await runCheckFfmpeg();
+      }
+    } catch (e) {
+      showToast("error", formatApiError(e));
+    }
+  }
+
+  function onThemeChange() {
+    if (!s) return;
+    setThemeMode(normalizeThemeMode(s.theme));
+    mark();
+  }
+
+  function onLanguageChange() {
+    if (!s) return;
+    setLocale(normalizeLocale(s.language));
+    mark();
+  }
+
   async function save() {
     if (!s || !formValid || $running || saving) return;
     saving = true;
@@ -492,6 +566,9 @@
         auto_cleanup_days: Math.round(Number(s.auto_cleanup_days)),
         muse_chromium_path: (s.muse_chromium_path || "").trim(),
         muse_sidecar_port: Math.round(Number(s.muse_sidecar_port)),
+        ffmpeg_path: (s.ffmpeg_path || "").trim(),
+        theme: normalizeThemeMode(s.theme),
+        language: normalizeLocale(s.language),
       };
 
       const result = await executeSettingsSave({
@@ -1640,13 +1717,66 @@
             id="cfg-auto-merge"
             type="checkbox"
             bind:checked={s.auto_merge}
-            on:change={mark}
+            on:change={() => {
+              mark();
+              if (s?.auto_merge && !ffmpegStatus?.available) {
+                void runCheckFfmpeg();
+              }
+            }}
             disabled={$running}
           />
           <span>Tự động ghép video sau batch (Auto-merge FFmpeg)</span>
         </label>
         <div class="hint" style="margin-left: 24px;">
-          Tự động ghép nối các clip video thành phẩm theo đúng thứ tự dòng CSV thành file tổng hợp tại <code>video_out/</code> sau khi hoàn tất batch.
+          Tự động ghép nối các clip video thành phẩm theo đúng thứ tự dòng CSV thành file tổng hợp tại <code>video_out/</code> sau khi hoàn tất batch (ưu tiên ghép nhanh <code>-c copy</code> khi clip đồng nhất).
+        </div>
+
+        <div class="ffmpeg-box">
+          <div class="ffmpeg-head">
+            <span class="label" style="margin: 0;">{$t("settings.ffmpegTitle")}</span>
+            {#if ffmpegStatus}
+              <span class="badge" class:badge-video={ffmpegStatus.available} class:badge-loi-tam-thoi={!ffmpegStatus.available}>
+                {ffmpegStatus.available
+                  ? `${$t("settings.ffmpegOk")}${ffmpegStatus.version ? ` · ${ffmpegStatus.version}` : ""}`
+                  : $t("settings.ffmpegMissing")}
+              </span>
+            {/if}
+          </div>
+          <label class="hint" for="cfg-ffmpeg-path">{$t("settings.ffmpegPathLabel")}</label>
+          <div class="ffmpeg-row">
+            <input
+              id="cfg-ffmpeg-path"
+              class="input"
+              type="text"
+              placeholder={ffmpegStatus?.resolved_path || "ffmpeg (tự dò trong PATH)"}
+              bind:value={s.ffmpeg_path}
+              on:input={mark}
+              disabled={$running}
+            />
+            <button
+              type="button"
+              class="btn-secondary small-btn"
+              disabled={$running}
+              on:click={browseFfmpegBinary}
+            >
+              {$t("settings.ffmpegBrowse")}
+            </button>
+            <button
+              type="button"
+              class="btn-secondary small-btn"
+              disabled={checkingFfmpeg}
+              on:click={runCheckFfmpeg}
+            >
+              {checkingFfmpeg ? $t("settings.ffmpegTesting") : $t("settings.ffmpegTest")}
+            </button>
+          </div>
+          {#if ffmpegStatus && !ffmpegStatus.available}
+            <div class="hint warn-hint">
+              {ffmpegStatus.error || $t("settings.ffmpegHint")}
+            </div>
+          {:else}
+            <div class="hint">{$t("settings.ffmpegHint")}</div>
+          {/if}
         </div>
 
       {:else}
@@ -1698,6 +1828,39 @@
           />
           <span>Khởi động VideoFlow Desktop cùng Windows</span>
         </label>
+
+        <div class="section-divider"></div>
+
+        <div class="label">{$t("settings.appearance")}</div>
+        <div class="grid-2">
+          <div>
+            <label class="hint" for="cfg-theme">{$t("settings.themeLabel")}</label>
+            <select
+              id="cfg-theme"
+              class="input"
+              bind:value={s.theme}
+              on:change={onThemeChange}
+              disabled={$running}
+            >
+              <option value="system">{$t("settings.theme.system")}</option>
+              <option value="light">{$t("settings.theme.light")}</option>
+              <option value="dark">{$t("settings.theme.dark")}</option>
+            </select>
+          </div>
+          <div>
+            <label class="hint" for="cfg-lang">{$t("settings.langLabel")}</label>
+            <select
+              id="cfg-lang"
+              class="input"
+              bind:value={s.language}
+              on:change={onLanguageChange}
+              disabled={$running}
+            >
+              <option value="vi">Tiếng Việt (VI)</option>
+              <option value="en">English (EN)</option>
+            </select>
+          </div>
+        </div>
 
         <div class="hint" style="margin-top: 12px;">
           Tệp cấu hình lưu an toàn tại <code>%APPDATA%/VideoFlowDesktop/settings.json</code> (không bao giờ chứa API key).
@@ -1992,7 +2155,7 @@
     align-items: center;
     gap: 8px;
     font-size: var(--fs-label);
-    background: #fff;
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     border-radius: 8px;
     padding: 7px 10px;
@@ -2372,6 +2535,37 @@
     text-decoration: underline;
     display: inline;
     cursor: pointer;
+  }
+  .ffmpeg-box {
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px solid var(--c-border);
+    border-radius: 10px;
+    background: var(--c-surface-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .ffmpeg-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ffmpeg-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ffmpeg-row .input {
+    flex: 1;
+    min-width: 200px;
+  }
+  .warn-hint {
+    color: var(--c-warn-dark);
+    font-weight: 500;
   }
   .btn-link:hover:not(:disabled) {
     color: var(--c-teal-dark);

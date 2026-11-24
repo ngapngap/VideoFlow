@@ -845,7 +845,7 @@
     border: 1px solid var(--c-border);
     border-radius: 10px;
     overflow: hidden;
-    background: #fff;
+    background: var(--c-card);
   }
   .recent-item.active-item {
     border-color: var(--c-teal);
@@ -905,7 +905,7 @@
     font-size: var(--fs-hint);
     font-weight: 600;
     color: var(--c-muted);
-    background: #fff;
+    background: var(--c-card);
     border: 1px solid var(--c-border);
     padding: 2px 10px;
     border-radius: 999px;
@@ -962,7 +962,7 @@
     padding: 8px 12px;
     border: 1px solid var(--c-border);
     border-radius: 8px;
-    background: #fff;
+    background: var(--c-card);
   }
   .probe-check-item {
     display: flex;
@@ -1003,7 +1003,7 @@
     border: 1px solid var(--c-border);
     border-radius: 8px;
     cursor: pointer;
-    background: #fff;
+    background: var(--c-card);
   }
   .choice-box.active {
     border-color: var(--c-teal);

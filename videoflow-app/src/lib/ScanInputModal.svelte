@@ -242,7 +242,7 @@
     align-items: center;
     gap: 8px;
     cursor: pointer;
-    background: #fff;
+    background: var(--c-card);
   }
   .scan-item.picked {
     border-color: var(--c-teal);

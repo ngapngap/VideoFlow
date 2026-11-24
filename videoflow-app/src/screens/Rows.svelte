@@ -30,12 +30,16 @@
     type DryRunResult,
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
-  import Modal from "../lib/Modal.svelte";
+  import ActionMenu, { type ActionMenuItem } from "../lib/ActionMenu.svelte";
+  import RowVersionsTimeline from "../lib/RowVersionsTimeline.svelte";
+  import RowConfirmModals from "../lib/RowConfirmModals.svelte";
   import ScanInputModal from "../lib/ScanInputModal.svelte";
   import RowCompareModal from "../lib/RowCompareModal.svelte";
   import ImageLightboxModal from "../lib/ImageLightboxModal.svelte";
   import RowVideoModal from "../lib/RowVideoModal.svelte";
+  import { locale, t, translateStatus } from "../lib/preferences";
   import {
+    createCoalescedScheduler,
     createSeqGuard,
     isRowLockedForBatch,
     pruneSelectedKeys,
@@ -260,6 +264,15 @@
     return c[key] ?? 0;
   }
 
+  const tickReloadScheduler = createCoalescedScheduler(250, () => {
+    if (destroyed || !$project?.path) return;
+    brokenThumbs = {};
+    void load({ silent: true });
+    if (detail && !detailLoading) {
+      void refreshOpenDetailSilently(detail.row.row_key);
+    }
+  });
+
   onMount(async () => {
     mounted = true;
     lastProjectPath = $project?.path ?? null;
@@ -269,6 +282,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    tickReloadScheduler.cancel();
     videoModalGuard.invalidate();
     ++detailReqSeq;
     loadGuard.invalidate();
@@ -285,6 +299,7 @@
     const curPath = $project?.path ?? null;
     const curTick = $rowChangedTick;
     if (curPath !== lastProjectPath) {
+      tickReloadScheduler.cancel();
       lastProjectPath = curPath;
       lastTick = curTick;
       hasLoadedRows = false;
@@ -314,12 +329,8 @@
       }
     } else if (curTick !== lastTick) {
       lastTick = curTick;
-      brokenThumbs = {};
       if (curPath) {
-        void load({ silent: true });
-        if (detail && !detailLoading) {
-          void refreshOpenDetailSilently(detail.row.row_key);
-        }
+        tickReloadScheduler.schedule();
       }
     }
   }
@@ -1047,23 +1058,115 @@
     return "badge-cho";
   }
 
-  function formatBytes(bytes?: number | null): string {
-    if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return "";
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  function buildRowMenuItems(r: RowSummary, isBusy: boolean): ActionMenuItem[] {
+    const items: ActionMenuItem[] = [
+      { id: "detail", label: $t("rows.detail"), icon: "eye" },
+    ];
+    if (r.video_file) {
+      items.push({ id: "video", label: $t("rows.openVideo"), icon: "video" });
+    }
+    items.push(
+      {
+        id: "remap",
+        label: $t("rows.remapImage"),
+        icon: "link",
+        disabled: isBusy,
+        dividerBefore: true,
+      },
+      {
+        id: "delete",
+        label: $t("rows.deleteRow"),
+        icon: "trash",
+        danger: true,
+        disabled: isBusy,
+      }
+    );
+    return items;
   }
 
-  function formatTimelineTs(ts: string): string {
-    if (!ts) return "—";
-    return ts.replace("T", " ").slice(0, 19);
+  function handleRowMenuSelect(r: RowSummary, actionId: string): void {
+    if (actionId === "detail") {
+      void requestOpenDetail(r.row_key);
+    } else if (actionId === "video") {
+      void openVideoModalByKey(r.row_key);
+    } else if (actionId === "remap") {
+      void remapRowByKey(r.row_key);
+    } else if (actionId === "delete") {
+      openDeleteModalForKey(r.row_key);
+    }
   }
 
-  function formatDuration(ms?: number | null): string {
-    if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "";
-    if (ms < 1000) return `${ms}ms`;
-    const s = Math.round(ms / 1000);
-    return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+  $: drawerMenuItems = (() => {
+    if (!detail) return [] as ActionMenuItem[];
+    const items: ActionMenuItem[] = [];
+    if (detail.row.status !== "Đã tạo video") {
+      items.push(
+        {
+          id: "rerun-anh",
+          label: "Chạy lại bước ảnh (B2+B3)",
+          icon: "redo",
+          disabled: $running || actionBusy,
+        },
+        {
+          id: "rerun-video",
+          label: "Chạy lại bước video (B3)",
+          icon: "video",
+          disabled: $running || actionBusy || !detail.row.image_file || imgPromptEdited,
+          title: imgPromptEdited
+            ? "Bạn đã sửa Prompt tạo ảnh — cần chạy lại bước ảnh (B2+B3)"
+            : !detail.row.image_file
+              ? "Cần có ảnh sản phẩm trước khi chạy riêng bước video"
+              : "Chạy lại riêng bước tạo video (B3) từ ảnh hiện có",
+        }
+      );
+    }
+    items.push(
+      {
+        id: "reset",
+        label: $t("rows.resetStatus"),
+        icon: "refresh",
+        disabled: $running || actionBusy,
+        dividerBefore: items.length > 0,
+      },
+      {
+        id: "skip",
+        label: $t("rows.skipRow"),
+        icon: "x",
+        disabled: $running || actionBusy || detail.row.status === "Bỏ qua",
+      },
+      {
+        id: "remap",
+        label: $t("rows.remapImage"),
+        icon: "link",
+        disabled: $running || actionBusy,
+        dividerBefore: true,
+      },
+      {
+        id: "delete",
+        label: $t("rows.deleteRow"),
+        icon: "trash",
+        danger: true,
+        disabled: $running || actionBusy,
+      }
+    );
+    return items;
+  })();
+
+  function handleDrawerMenuSelect(actionId: string): void {
+    if (!detail) return;
+    if (actionId === "rerun-anh") {
+      void rerunStep("anh");
+    } else if (actionId === "rerun-video") {
+      void rerunStep("video");
+    } else if (actionId === "reset") {
+      resetConfirmOpen = true;
+    } else if (actionId === "skip") {
+      void skipRow();
+    } else if (actionId === "remap") {
+      void remapRowByKey(detail.row.row_key);
+    } else if (actionId === "delete") {
+      openDeleteModalForKey(detail.row.row_key);
+    }
   }
 </script>
 
@@ -1402,7 +1505,7 @@
                       </span>
                     {:else}
                       <span class="badge {badgeClass(r.status)}">
-                        {r.status}
+                        {translateStatus(r.status, $locale)}
                       </span>
                     {/if}
                   </td>
@@ -1423,29 +1526,36 @@
                       on:click={() => requestOpenDetail(r.row_key)}
                     >
                       <Icons name="eye" size={14} />
-                      Chi tiết
+                      {$t("rows.detail")}
                     </button>
                   </td>
 
                   <td>
-                    <button
-                      type="button"
-                      class="btn-secondary run-one"
-                      disabled={$running || isLockedRow}
-                      title={$running
-                        ? "Đang có lượt chạy — chờ chạy xong hoặc bấm STOP"
-                        : r.status === "Đã tạo video"
-                          ? "Dòng đã xong — mở Chi tiết để tạo phiên bản mới (_vN)"
-                          : r.status === "Bỏ qua"
-                            ? "Dòng đang bỏ qua — mở Chi tiết để đặt lại trạng thái"
-                            : r.attempts_count >= $maxAttemptsStore && !r.prompt_modified
-                              ? `Đã chạm ${$maxAttemptsStore}/${$maxAttemptsStore} lần thử — mở Chi tiết để đặt lại hoặc sửa prompt`
-                              : `Chạy riêng dòng ${r.image_name}`}
-                      on:click={() => runOne(r.row_key)}
-                    >
-                      <Icons name="play" size={12} />
-                      Start
-                    </button>
+                    <div class="row-actions-inline">
+                      <button
+                        type="button"
+                        class="btn-secondary run-one"
+                        disabled={$running || isLockedRow}
+                        title={$running
+                          ? "Đang có lượt chạy — chờ chạy xong hoặc bấm STOP"
+                          : r.status === "Đã tạo video"
+                            ? "Dòng đã xong — mở Chi tiết để tạo phiên bản mới (_vN)"
+                            : r.status === "Bỏ qua"
+                              ? "Dòng đang bỏ qua — mở Chi tiết để đặt lại trạng thái"
+                              : r.attempts_count >= $maxAttemptsStore && !r.prompt_modified
+                                ? `Đã chạm ${$maxAttemptsStore}/${$maxAttemptsStore} lần thử — mở Chi tiết để đặt lại hoặc sửa prompt`
+                                : `Chạy riêng dòng ${r.image_name}`}
+                        on:click={() => runOne(r.row_key)}
+                      >
+                        <Icons name="play" size={12} />
+                        Start
+                      </button>
+                      <ActionMenu
+                        items={buildRowMenuItems(r, $running || actionBusy)}
+                        label={$t("common.moreActions")}
+                        on:select={(e) => handleRowMenuSelect(r, e.detail)}
+                      />
+                    </div>
                   </td>
                 </tr>
               {:else}
@@ -1577,7 +1687,7 @@
                           <span class="live-badge-text">{formatActiveLabel(activeInfo)}</span>
                         </span>
                       {:else}
-                        <span class="badge {badgeClass(r.status)}">{r.status}</span>
+                        <span class="badge {badgeClass(r.status)}">{translateStatus(r.status, $locale)}</span>
                       {/if}
                       {#if r.prompt_modified}
                         <span class="badge badge-sua-prompt mini-badge">Đã sửa</span>
@@ -1594,36 +1704,7 @@
                       </div>
                     {/if}
 
-                    {#if orphanRow}
-                      <div class="grid-orphan-row">
-                        <button
-                          type="button"
-                          class="btn-secondary orphan-inline-btn"
-                          disabled={$running || actionBusy}
-                          on:click={() => remapRowByKey(r.row_key)}
-                        >
-                          Chọn lại ảnh
-                        </button>
-                        <button
-                          type="button"
-                          class="btn-ghost orphan-inline-btn danger-text"
-                          disabled={$running || actionBusy}
-                          on:click={() => openDeleteModalForKey(r.row_key)}
-                        >
-                          Xóa
-                        </button>
-                      </div>
-                    {/if}
-
                     <div class="grid-card-actions">
-                      <button
-                        type="button"
-                        class="btn-ghost grid-act-btn"
-                        on:click={() => requestOpenDetail(r.row_key)}
-                      >
-                        <Icons name="eye" size={13} />
-                        Chi tiết
-                      </button>
                       <button
                         type="button"
                         class="btn-secondary grid-act-btn"
@@ -1633,6 +1714,19 @@
                         <Icons name="play" size={12} />
                         Start
                       </button>
+                      <button
+                        type="button"
+                        class="btn-ghost grid-act-btn"
+                        on:click={() => requestOpenDetail(r.row_key)}
+                      >
+                        <Icons name="eye" size={13} />
+                        {$t("rows.detail")}
+                      </button>
+                      <ActionMenu
+                        items={buildRowMenuItems(r, $running || actionBusy)}
+                        label={$t("common.moreActions")}
+                        on:select={(e) => handleRowMenuSelect(r, e.detail)}
+                      />
                     </div>
                   </div>
                 </div>
@@ -2117,381 +2211,95 @@
           </div>
         {/if}
 
-        <!-- (C) Lịch sử các phiên bản sản phẩm + Đặt bản chính + So sánh v1 vs v2 -->
-        <details class="drawer-section" open={detail.files.length > 0}>
-          <summary class="section-summary">
-            <span>Phiên bản sản phẩm ({detail.files.length})</span>
-          </summary>
-          {#if canCompareVersions}
-            <div class="section-actions-header">
-              <span class="section-actions-note">Đối chiếu trực quan các phiên bản</span>
-              <button
-                type="button"
-                class="btn-secondary compare-trigger-btn"
-                on:click={() => openCompareModal()}
-              >
-                <Icons name="columns" size={13} />
-                So sánh phiên bản
-              </button>
-            </div>
-          {/if}
-          {#if detail.files.length > 0}
-            <div class="version-list">
-              {#each detail.files as f (`${f.kind}-${f.version}-${f.file_name}`)}
-                <div class="version-item" class:active-ver={previewFileOverride?.abs_path === f.abs_path}>
-                  <div class="version-main">
-                    <span class="ver-tag">v{f.version}</span>
-                    <span class="kind-tag" class:vid={f.kind === "video"}>
-                      {f.kind === "video" ? "Video" : "Ảnh"}
-                    </span>
-                    <span class="ver-name selectable" title={f.file_path}>{f.file_name}</span>
-                    {#if f.is_current}
-                      <span class="current-pill">Bản chính</span>
-                    {/if}
-                    {#if f.size_bytes}
-                      <span class="ver-size">{formatBytes(f.size_bytes)}</span>
-                    {/if}
-                  </div>
-                  <div class="version-btns">
-                    {#if !f.is_current}
-                      <button
-                        type="button"
-                        class="btn-ghost set-main-btn"
-                        disabled={$running || switchingVersion}
-                        title="Đặt phiên bản này làm bản chính trong prompts.csv"
-                        on:click={() => setAsCurrentVersion(f.kind, f.version)}
-                      >
-                        Đặt chính
-                      </button>
-                    {/if}
-                    <button
-                      type="button"
-                      class="btn-ghost icon-mini"
-                      aria-label={`Xem phiên bản v${f.version} (${f.file_name}) trong khung xem trước`}
-                      title="Xem phiên bản này trong khung xem trước"
-                      on:click={() => previewVersionFile(f)}
-                    >
-                      <Icons name="eye" size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      class="btn-ghost icon-mini"
-                      aria-label={`Hiện ${f.file_name} trong thư mục Explorer`}
-                      title="Hiện file trong thư mục Explorer"
-                      on:click={() => revealInExplorer(f.abs_path)}
-                    >
-                      <Icons name="external" size={13} />
-                    </button>
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {:else}
-            <div class="section-empty">Chưa có file sản phẩm nào được ghi nhận.</div>
-          {/if}
-        </details>
-
-        <!-- Nhật ký các lần thử của dòng (detail.timeline) -->
-        <details class="drawer-section" open={detail.timeline.length > 0}>
-          <summary class="section-summary">
-            <span>Lịch sử chạy dòng ({detail.timeline.length})</span>
-          </summary>
-          {#if detail.timeline.length > 0}
-            <div class="timeline-list">
-              {#each detail.timeline as t, idx (idx)}
-                <div class="timeline-item">
-                  <div class="tl-top">
-                    <div class="tl-badges">
-                      {#if t.run_id}
-                        <span class="tl-run">#{t.run_id}</span>
-                      {/if}
-                      <span class="tl-step">
-                        {t.step}{t.attempt_no ? ` · lần ${t.attempt_no}` : ""}
-                      </span>
-                      <span
-                        class="tl-res"
-                        class:ok={t.result === "ok"}
-                        class:warn={t.result === "loi_tam_thoi"}
-                        class:err={t.result !== "ok" && t.result !== "loi_tam_thoi"}
-                      >
-                        {t.result === "ok"
-                          ? "Thành công"
-                          : t.result === "loi_tam_thoi"
-                            ? "Lỗi tạm thời"
-                            : t.result === "loi_nghiep_vu"
-                              ? "Lỗi nghiệp vụ"
-                              : t.result}
-                      </span>
-                      {#if t.http_status}
-                        <span class="tl-dur">HTTP {t.http_status}</span>
-                      {/if}
-                      {#if t.duration_ms}
-                        <span class="tl-dur">{formatDuration(t.duration_ms)}</span>
-                      {/if}
-                    </div>
-                    <span class="tl-time">{formatTimelineTs(t.ts)}</span>
-                  </div>
-                  {#if t.error}
-                    <div class="tl-err selectable">{t.error}</div>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          {:else}
-            <div class="section-empty">Dòng này chưa có lượt thực thi nào.</div>
-          {/if}
-        </details>
-
-        {#if detail.ref_exists}
-          <div class="extra-row-tools">
-            <button
-              type="button"
-              class="btn-ghost tiny-btn"
-              disabled={$running || actionBusy}
-              on:click={() => detail && remapRowByKey(detail.row.row_key)}
-            >
-              <Icons name="link" size={13} />
-              Chọn lại ảnh tham chiếu...
-            </button>
-            <button
-              type="button"
-              class="btn-ghost tiny-btn danger-text"
-              disabled={$running || actionBusy}
-              on:click={() => detail && openDeleteModalForKey(detail.row.row_key)}
-            >
-              <Icons name="trash" size={13} />
-              Xóa dòng khỏi CSV
-            </button>
-          </div>
-        {/if}
+        <RowVersionsTimeline
+          files={detail.files}
+          timeline={detail.timeline}
+          {canCompareVersions}
+          {previewFileOverride}
+          running={$running}
+          {switchingVersion}
+          on:openCompare={() => openCompareModal()}
+          on:setCurrent={(e) => void setAsCurrentVersion(e.detail.kind, e.detail.version)}
+          on:previewVersion={(e) => previewVersionFile(e.detail)}
+          on:reveal={(e) => void revealInExplorer(e.detail)}
+        />
       </div>
 
-      <!-- Chân ngăn cố định (mục 6.3c & 6.10) -->
+      <!-- Chân ngăn gọn gàng: 1 nút chính + menu ⋯ gom các thao tác phụ -->
       <div class="drawer-foot">
-        {#if detail.row.status !== "Đã tạo video"}
-          <button
-            type="button"
-            class="btn-primary full"
-            disabled={$running || actionBusy || detail.row.status === "Bỏ qua"}
-            title={detail.row.status === "Bỏ qua"
-              ? "Đặt lại trạng thái về Đang chờ trước khi chạy"
-              : "Chạy riêng dòng này từ bước tiếp theo"}
-            on:click={runOneFromDrawer}
-          >
-            <Icons name="play" size={15} />
-            Start dòng này
-          </button>
-
-          <div class="two">
+        <div class="drawer-foot-row">
+          {#if detail.row.status !== "Đã tạo video"}
             <button
               type="button"
-              class="btn-secondary"
-              disabled={$running || actionBusy}
-              title="Chạy lại từ bước tạo ảnh (B2) rồi tiếp tục tạo video (B3)"
-              on:click={() => rerunStep("anh")}
+              class="btn-primary drawer-primary-btn"
+              disabled={$running || actionBusy || detail.row.status === "Bỏ qua"}
+              title={detail.row.status === "Bỏ qua"
+                ? "Đặt lại trạng thái về Đang chờ trước khi chạy"
+                : "Chạy riêng dòng này từ bước tiếp theo"}
+              on:click={runOneFromDrawer}
             >
-              <Icons name="redo" size={14} />
-              Chạy lại bước ảnh (B2+B3)
+              <Icons name="play" size={15} />
+              Start dòng này
             </button>
+          {:else}
             <button
               type="button"
-              class="btn-secondary"
+              class="btn-primary drawer-primary-btn"
               disabled={$running || actionBusy || !detail.row.image_file || imgPromptEdited}
               title={imgPromptEdited
-                ? "Bạn đã sửa Prompt tạo ảnh — cần chạy lại bước ảnh (B2+B3)"
-                : !detail.row.image_file
-                  ? "Cần có ảnh sản phẩm trước khi chạy riêng bước video"
-                  : "Chạy lại riêng bước tạo video (B3) từ ảnh hiện có"}
+                ? "Prompt tạo ảnh đã sửa — hãy dùng 'Chạy lại bước ảnh (B2+B3)'"
+                : "Tạo video phiên bản mới (_vN) từ ảnh sản phẩm hiện có"}
               on:click={() => rerunStep("video")}
             >
-              <Icons name="video" size={14} />
-              Chạy lại bước video (B3)
+              <Icons name="video" size={15} />
+              Tạo lại Video (_vN)
             </button>
-          </div>
-        {/if}
+          {/if}
 
-        <div class="two">
-          <button
-            type="button"
-            class="btn-secondary"
+          <ActionMenu
+            items={drawerMenuItems}
+            label={$t("common.moreActions")}
+            buttonText={$t("common.moreActions")}
+            direction="up"
+            align="right"
             disabled={$running || actionBusy}
-            on:click={() => (resetConfirmOpen = true)}
-          >
-            <Icons name="refresh" size={14} />
-            Đặt lại về Đang chờ
-          </button>
-          <button
-            type="button"
-            class="btn-ghost danger-text"
-            disabled={$running || actionBusy || detail.row.status === "Bỏ qua"}
-            on:click={skipRow}
-          >
-            Bỏ qua dòng này
-          </button>
+            on:select={(e) => handleDrawerMenuSelect(e.detail)}
+          />
         </div>
       </div>
     {/if}
   </aside>
 {/if}
 
-<!-- Modal Cảnh báo Prompt chưa lưu khi đóng hoặc đổi dòng trong Drawer -->
-<Modal
-  open={unsavedPromptModalOpen}
-  title="Prompt đang sửa chưa lưu"
-  width="440px"
-  disableClose={savingPrompts}
-  on:close={() => {
+<RowConfirmModals
+  {unsavedPromptModalOpen}
+  {resetConfirmOpen}
+  {batchConfirmOpen}
+  {deleteConfirmOpen}
+  detailRowKey={detail?.row.row_key ?? ""}
+  {deleteTargetKey}
+  projectName={$project?.name ?? ""}
+  selectedCount={selected.size}
+  maxAttempts={$maxAttemptsStore}
+  running={$running}
+  {actionBusy}
+  {savingPrompts}
+  {batchStarting}
+  endpointsConfigured={$endpointStatus.imageConfigured && $endpointStatus.videoConfigured}
+  {batchDryRunProbe}
+  on:cancelUnsaved={() => {
     unsavedPromptModalOpen = false;
     pendingDrawerAction = null;
   }}
->
-  <p class="confirm-text">
-    Bạn đang sửa nháp prompt của dòng <strong class="selectable">{detail?.row.row_key ?? ""}</strong> nhưng chưa bấm <strong>Lưu prompt</strong>. Bạn muốn lưu lại trước khi rời ngăn chi tiết?
-  </p>
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-ghost"
-      disabled={savingPrompts}
-      on:click={() => {
-        unsavedPromptModalOpen = false;
-        pendingDrawerAction = null;
-      }}
-    >
-      Tiếp tục sửa
-    </button>
-    <button
-      type="button"
-      class="btn-secondary"
-      disabled={savingPrompts}
-      on:click={discardPromptAndProceed}
-    >
-      Bỏ thay đổi
-    </button>
-    <button
-      type="button"
-      class="btn-primary"
-      disabled={savingPrompts || $running}
-      on:click={savePromptAndProceed}
-    >
-      <Icons name="check" size={14} />
-      {savingPrompts ? "Đang lưu..." : "Lưu & Tiếp tục"}
-    </button>
-  </div>
-</Modal>
-
-<!-- Modal Xác nhận Đặt lại trạng thái về Đang chờ (mục 6.3c - 420px) -->
-<Modal
-  open={resetConfirmOpen}
-  title="Đặt lại trạng thái về Đang chờ"
-  width="420px"
-  disableClose={actionBusy}
-  on:close={() => (resetConfirmOpen = false)}
->
-  <p class="confirm-text">
-    Đặt lại dòng <strong class="selectable">{detail?.row.row_key ?? ""}</strong> về trạng thái <strong>Đang chờ</strong> và xóa bộ đếm lỗi về <code>0 / {$maxAttemptsStore}</code>? Các file ảnh/video đã tạo trước đó vẫn được giữ nguyên.
-  </p>
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-secondary"
-      disabled={actionBusy}
-      on:click={() => (resetConfirmOpen = false)}
-    >
-      Hủy
-    </button>
-    <button
-      type="button"
-      class="btn-primary"
-      disabled={$running || actionBusy}
-      on:click={confirmResetStatus}
-    >
-      <Icons name="refresh" size={14} />
-      Xác nhận đặt lại
-    </button>
-  </div>
-</Modal>
-
-<!-- Modal Xác nhận Chạy các dòng đã chọn -->
-<Modal
-  open={batchConfirmOpen}
-  title="Xác nhận chạy dòng đã chọn"
-  width="480px"
-  disableClose={batchStarting}
-  on:close={() => (batchConfirmOpen = false)}
->
-  <div class="modal-stack">
-    <p class="confirm-text">
-      Chuẩn bị chạy <strong>{selected.size} dòng đã chọn</strong> trong dự án <strong>{$project?.name ?? ""}</strong>.
-    </p>
-    {#if !$endpointStatus.imageConfigured || !$endpointStatus.videoConfigured}
-      <div class="warn-inline-box">
-        <Icons name="alert" size={16} />
-        <span>Chưa cấu hình đủ API key ảnh/video — vui lòng kiểm tra mục Cài đặt nếu chưa nhập khóa.</span>
-      </div>
-    {/if}
-    {#if batchDryRunProbe?.is_csv_locked}
-      <div class="warn-inline-box selectable">
-        <Icons name="alert" size={16} />
-        <span>
-          <strong>prompts.csv đang bị khóa ghi</strong> (mở trong Excel) — kết quả sẽ lưu vào <code>state.db</code> và đồng bộ sau khi đóng Excel.
-        </span>
-      </div>
-    {/if}
-  </div>
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-secondary"
-      disabled={batchStarting}
-      on:click={() => (batchConfirmOpen = false)}
-    >
-      Hủy
-    </button>
-    <button
-      type="button"
-      class="btn-primary"
-      disabled={$running || batchStarting}
-      on:click={executeRunSelected}
-    >
-      <Icons name="play" size={15} />
-      Xác nhận chạy ({selected.size})
-    </button>
-  </div>
-</Modal>
-
-<!-- Modal Xác nhận xóa dòng khỏi CSV (TC-49) -->
-<Modal
-  open={deleteConfirmOpen}
-  title="Xác nhận xóa dòng khỏi CSV"
-  width="440px"
-  disableClose={actionBusy}
-  on:close={() => (deleteConfirmOpen = false)}
->
-  <p class="confirm-text">
-    Bạn có chắc chắn muốn xóa dòng <strong class="selectable">{deleteTargetKey}</strong> khỏi <code>prompts.csv</code>?
-    Các file ảnh/video đã sinh ra trong thư mục đầu ra (nếu có) vẫn được giữ nguyên trên đĩa.
-  </p>
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-secondary"
-      disabled={actionBusy}
-      on:click={() => (deleteConfirmOpen = false)}
-    >
-      Hủy
-    </button>
-    <button
-      type="button"
-      class="btn-danger"
-      disabled={$running || actionBusy}
-      on:click={confirmDeleteRow}
-    >
-      <Icons name="trash" size={15} />
-      Xác nhận xóa
-    </button>
-  </div>
-</Modal>
+  on:discardPrompt={discardPromptAndProceed}
+  on:savePrompt={() => void savePromptAndProceed()}
+  on:closeReset={() => (resetConfirmOpen = false)}
+  on:confirmReset={() => void confirmResetStatus()}
+  on:closeBatch={() => (batchConfirmOpen = false)}
+  on:confirmBatch={() => void executeRunSelected()}
+  on:closeDelete={() => (deleteConfirmOpen = false)}
+  on:confirmDelete={() => void confirmDeleteRow()}
+/>
 
 <!-- (A) Modal Quét & Nhập hàng loạt ảnh từ input/ -->
 <ScanInputModal
@@ -3550,206 +3358,10 @@
     flex: 1;
   }
 
-  /* Danh sách phiên bản & Timeline */
-  .drawer-section {
-    border: 1px solid var(--c-border);
-    border-radius: 8px;
-    background: var(--c-card);
-    overflow: hidden;
-  }
-  .section-summary {
-    padding: 8px 12px;
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--c-text);
-    background: var(--c-surface-subtle);
-    cursor: pointer;
-    list-style: none;
-    display: flex;
+  .row-actions-inline {
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  .section-summary::-webkit-details-marker {
-    display: none;
-  }
-  .section-actions-header {
-    padding: 6px 12px;
-    border-top: 1px solid #eef2f5;
-    background: var(--c-surface-subtle);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  .section-actions-note {
-    font-size: 11px;
-    color: var(--c-muted);
-  }
-  .compare-trigger-btn {
-    height: 24px;
-    padding: 0 8px;
-    font-size: 11px;
     gap: 4px;
-  }
-  .section-empty {
-    padding: 12px;
-    font-size: 12px;
-    color: var(--c-muted);
-    text-align: center;
-  }
-
-  .version-list,
-  .timeline-list {
-    display: flex;
-    flex-direction: column;
-  }
-  .version-item {
-    padding: 7px 10px;
-    border-top: 1px solid #eef2f5;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    font-size: 12px;
-  }
-  .version-item.active-ver {
-    background: var(--c-teal-subtle);
-  }
-  .version-main {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    flex-wrap: wrap;
-  }
-  .ver-tag {
-    font-weight: 700;
-    color: var(--c-teal);
-    background: var(--c-teal-light);
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-size: 11px;
-  }
-  .kind-tag {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--c-muted);
-    background: var(--c-surface-subtle);
-    padding: 1px 6px;
-    border-radius: 4px;
-  }
-  .kind-tag.vid {
-    color: var(--c-green);
-    background: var(--c-green-bg);
-  }
-  .ver-name {
-    color: var(--c-text);
-    font-weight: 500;
-    word-break: break-all;
-  }
-  .current-pill {
-    font-size: 10px;
-    font-weight: 700;
-    color: var(--c-green);
-    background: var(--c-green-bg);
-    padding: 1px 6px;
-    border-radius: 999px;
-  }
-  .ver-size {
-    font-size: 11px;
-    color: var(--c-muted);
-  }
-  .version-btns {
-    display: flex;
-    align-items: center;
-    gap: 3px;
-    flex-shrink: 0;
-  }
-  .set-main-btn {
-    height: 24px;
-    padding: 0 7px;
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--c-teal);
-  }
-  .icon-mini {
-    width: 26px;
-    height: 26px;
-    padding: 0;
-  }
-
-  .timeline-item {
-    padding: 8px 10px;
-    border-top: 1px solid #eef2f5;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-  }
-  .tl-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .tl-badges {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    flex-wrap: wrap;
-  }
-  .tl-run {
-    font-weight: 700;
-    color: var(--c-text);
-  }
-  .tl-step {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: var(--c-surface-subtle);
-    color: var(--c-text);
-  }
-  .tl-res {
-    font-size: 11px;
-    font-weight: 700;
-    padding: 1px 6px;
-    border-radius: 4px;
-  }
-  .tl-res.ok {
-    background: var(--c-green-bg);
-    color: var(--c-green);
-  }
-  .tl-res.warn {
-    background: var(--c-warn-bg);
-    color: var(--c-warn-dark);
-  }
-  .tl-res.err {
-    background: var(--c-danger-bg);
-    color: var(--c-danger);
-  }
-  .tl-dur,
-  .tl-time {
-    font-size: 11px;
-    color: var(--c-muted);
-  }
-  .tl-err {
-    font-size: 11px;
-    color: var(--c-danger);
-    background: #fdf3f2;
-    padding: 4px 8px;
-    border-radius: 4px;
-    word-break: break-word;
-  }
-
-  .extra-row-tools {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding-top: 2px;
   }
 
   /* Chân ngăn cố định */
@@ -3762,56 +3374,14 @@
     gap: 8px;
     flex-shrink: 0;
   }
-  .full {
-    width: 100%;
-  }
-  .two {
-    display: flex;
-    gap: 8px;
-  }
-  .two > button {
-    flex: 1;
-    padding: 0 10px;
-    font-size: 12px;
-  }
-  .danger-text {
-    color: var(--c-danger);
-  }
-  .danger-text:hover:not(:disabled) {
-    background: var(--c-danger-bg);
-    color: var(--c-danger);
-  }
-
-  /* Modal chung, Quét input/, So sánh v1/v2 & Lightbox Zoom/Pan */
-  .modal-stack {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .confirm-text {
-    font-size: var(--fs-body);
-    color: var(--c-text);
-    line-height: 1.5;
-  }
-  .warn-inline-box {
-    background: var(--c-warn-bg);
-    border: 1px solid #f4d39b;
-    color: var(--c-warn-dark);
-    border-radius: 8px;
-    padding: 9px 12px;
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    font-size: 12.5px;
-  }
-  .modal-footer-bar {
+  .drawer-foot-row {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
     gap: 8px;
-    width: 100%;
   }
-
+  .drawer-primary-btn {
+    flex: 1;
+  }
   .grid-err-text {
     overflow: hidden;
     text-overflow: ellipsis;

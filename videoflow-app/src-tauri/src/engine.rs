@@ -19,7 +19,11 @@ use tauri::{AppHandle, Emitter};
 const MAX_RETRY_AFTER_S: u64 = 600;
 
 mod auto_merge;
+mod pipeline;
+mod planner;
 pub use auto_merge::*;
+pub use pipeline::*;
+pub use planner::*;
 
 // ━━ Sự kiện theo hợp đồng 13.2 ━━
 
@@ -834,1196 +838,6 @@ fn format_rfc3339_to_csv_time(rfc_ts: &str) -> String {
         .unwrap_or_else(|_| rfc_ts.to_string())
 }
 
-// ━━ Lập kế hoạch chạy cho từng dòng (B1 + 13.4 + 6.10 + TC-45) ━━
-
-#[derive(Debug, Clone, Default)]
-pub struct EngineConfig {
-    pub kind: &'static str,         // chung | rieng | lich | lam_lai
-    pub row_keys: Vec<String>,      // rỗng = tất cả dòng đủ điều kiện
-    pub force_step: Option<Step>,   // Some(B2) = ép chạy lại B2+B3 (_vN); Some(B3) = ép chạy lại B3 (_vN)
-    pub reset_error_attempts: bool, // true cho rerun_error_rows (TC-45) để mở khóa dòng 3/3 lỗi của lượt đó
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowPlan {
-    pub steps: Vec<Step>,
-    pub force_new_image: bool,
-    pub force_new_video: bool,
-    pub carried_attempts: i64,
-    pub prev_img_hash: Option<String>,
-    pub prev_vid_hash: Option<String>,
-    pub resume_task_id: Option<String>,
-    pub resume_download_url: Option<String>,
-}
-
-/// Quyết định một dòng có chạy trong lượt này không và chạy những bước nào.
-pub fn plan_row(
-    row: &prompts_csv::Row,
-    prev: Option<&LatestJobInfo>,
-    _cfg: &Settings,
-    engine_cfg: &EngineConfig,
-    image_out: &Path,
-    latest_current_image_in_db: Option<&str>,
-    same_image: usize,
-) -> Option<RowPlan> {
-    if row.is_example() || row.is_empty_content() || row.anh_tham_chieu.trim().is_empty() {
-        return None;
-    }
-
-    // `row_keys` đến từ UI = khoá dòng (tên ảnh#hash prompt); chỉ cho phép khớp tên ảnh trần
-    // khi ảnh dùng cho ĐÚNG một dòng (`same_image == 1`), hoặc khớp chính xác `prev.row_key`.
-    if !engine_cfg.row_keys.is_empty() {
-        let current = row_key_low(row);
-        let image = row.anh_tham_chieu.trim();
-        let matched = engine_cfg.row_keys.iter().any(|k| {
-            let k = k.trim();
-            k.eq_ignore_ascii_case(&current)
-                || (same_image == 1 && k.eq_ignore_ascii_case(image))
-                || prev.is_some_and(|p| k.eq_ignore_ascii_case(&p.row_key))
-        });
-        if !matched {
-            return None;
-        }
-    }
-
-    let prev_img_hash = prev.and_then(|p| p.image_prompt_hash.clone());
-    let prev_vid_hash = prev.and_then(|p| p.video_prompt_hash.clone());
-
-    // Chế độ làm lại chủ động (rerun_row_step 6.10): ép bước và reset số lần thử về 0,
-    // NHƯNG bảo toàn prev_img_hash / prev_vid_hash cho tới khi bước tương ứng thực sự hoàn tất ([P0-2])!
-    if let Some(forced) = engine_cfg.force_step {
-        return match forced {
-            Step::B2 => Some(RowPlan {
-                steps: vec![Step::B2, Step::B3],
-                force_new_image: true,
-                force_new_video: true,
-                carried_attempts: 0,
-                prev_img_hash,
-                prev_vid_hash,
-                resume_task_id: None,
-                resume_download_url: None,
-            }),
-            Step::B3 => Some(RowPlan {
-                steps: vec![Step::B3],
-                force_new_image: false,
-                force_new_video: true,
-                carried_attempts: 0,
-                prev_img_hash,
-                prev_vid_hash,
-                resume_task_id: None,
-                resume_download_url: None,
-            }),
-        };
-    }
-
-    // Không bao giờ chạy dòng `bo_qua` trừ khi người dùng Đặt lại trạng thái hoặc bấm rerun_row_step (6.12)
-    if prev.is_some_and(|p| p.status == "bo_qua") {
-        return None;
-    }
-
-    let (img_changed, vid_changed) = detect_prompt_change(row, prev);
-    let prev_attempts = prev.map(|p| p.attempts_count).unwrap_or(0);
-
-    let base_status = effective_row_status(row, prev).unwrap_or_else(|| row.status());
-
-    // 13.4: phát hiện sửa prompt (ngoài app hoặc qua Lưu prompt)
-    if img_changed {
-        return Some(RowPlan {
-            steps: vec![Step::B2, Step::B3],
-            force_new_image: true,
-            force_new_video: true,
-            carried_attempts: 0,
-            prev_img_hash,
-            prev_vid_hash,
-            resume_task_id: None,
-            resume_download_url: None,
-        });
-    }
-
-    if vid_changed {
-        let has_valid_img = matches!(
-            base_status,
-            RowStatus::DaTaoImage | RowStatus::DaTaoVideo | RowStatus::LoiVideo | RowStatus::LoiTamThoi
-        ) && !row.anh_da_tao.is_empty()
-            && image_out.join(&row.anh_da_tao).is_file();
-
-        return if has_valid_img || row.promt_tao_image.trim().is_empty() {
-            Some(RowPlan {
-                steps: vec![Step::B3],
-                force_new_image: false,
-                force_new_video: true,
-                carried_attempts: 0,
-                prev_img_hash,
-                prev_vid_hash,
-                resume_task_id: None,
-                resume_download_url: None,
-            })
-        } else {
-            Some(RowPlan {
-                steps: vec![Step::B2, Step::B3],
-                force_new_image: true,
-                force_new_video: true,
-                carried_attempts: 0,
-                prev_img_hash,
-                prev_vid_hash,
-                resume_task_id: None,
-                resume_download_url: None,
-            })
-        };
-    }
-
-    let steps = if base_status == RowStatus::LoiTamThoi {
-        let has_valid_img = !row.anh_da_tao.is_empty() && image_out.join(&row.anh_da_tao).is_file();
-        if has_valid_img || row.promt_tao_image.trim().is_empty() {
-            vec![Step::B3]
-        } else {
-            vec![Step::B2, Step::B3]
-        }
-    } else if base_status == RowStatus::Cho && row.promt_tao_image.trim().is_empty() {
-        vec![Step::B3]
-    } else {
-        start_steps(base_status)
-    };
-    if steps.is_empty() {
-        return None;
-    }
-
-    let carried_attempts = if engine_cfg.reset_error_attempts {
-        0
-    } else {
-        prev_attempts
-    };
-
-    let mut resume_task_id = None;
-    let mut resume_download_url = None;
-    if steps == vec![Step::B3] {
-        if let Some(p) = prev {
-            let cur_vid_hash = sha2hex(row.promt_tao_video.trim());
-            let same_vid_prompt = p.video_prompt_hash.as_deref() == Some(cur_vid_hash.as_str());
-            let same_image_file = match latest_current_image_in_db {
-                Some(db_img) => db_img.eq_ignore_ascii_case(&row.anh_da_tao),
-                None => !row.anh_da_tao.is_empty() || row.promt_tao_image.trim().is_empty(),
-            };
-            if p.video_status != "xong" && same_vid_prompt && same_image_file {
-                resume_task_id = p.video_task_id.clone().filter(|s| !s.trim().is_empty());
-                resume_download_url = p
-                    .video_download_url
-                    .clone()
-                    .filter(|s| !s.trim().is_empty());
-            }
-        }
-    }
-
-    Some(RowPlan {
-        steps,
-        force_new_image: false,
-        force_new_video: false,
-        carried_attempts,
-        prev_img_hash,
-        prev_vid_hash,
-        resume_task_id,
-        resume_download_url,
-    })
-}
-
-/// Phân loại hậu quả khi một bước trả `Err(fail)` ([P0-2], [P0-4], [P0-7])
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FailureResolution {
-    pub db_status: &'static str,
-    pub csv_label: &'static str,
-    pub image_status: &'static str,
-    pub video_status: &'static str,
-    pub last_error: Option<String>,
-    pub count_as_run_error: bool,
-    pub trigger_stop: bool,
-}
-
-pub fn is_transient_error(fail: &ApiFail) -> bool {
-    match fail.kind {
-        ApiFailKind::NghiepVu | ApiFailKind::HetQuota => return false,
-        ApiFailKind::TamThoi { .. } => {}
-    }
-    if let Some(status) = fail.http_status {
-        if status == 429 || (500..=599).contains(&status) {
-            return true;
-        }
-    }
-    let code_low = fail.code.to_lowercase();
-    let msg_low = fail.message.to_lowercase();
-    let transient_keywords = [
-        "cdp",
-        "cdperror",
-        "connection closed",
-        "timeout",
-        "timed out",
-        "rate_limit",
-        "overloaded",
-        "502",
-        "503",
-        "504",
-        "poll_timeout",
-        "task_transient_error",
-        "task_gone",
-        "tam_thoi",
-    ];
-    transient_keywords.iter().any(|kw| code_low.contains(kw) || msg_low.contains(kw))
-        || matches!(fail.kind, ApiFailKind::TamThoi { .. })
-}
-
-pub fn resolve_step_failure(
-    step: Step,
-    fail: &ApiFail,
-    has_existing_image: bool,
-    b2_needs_fresh_image: bool,
-) -> FailureResolution {
-    if fail.code == "STOPPED" {
-        // [P0-2]: Nếu dừng ngay giữa lúc B2 đang cần sinh ảnh mới (redo / sửa prompt ảnh / chưa có ảnh),
-        // giữ trạng thái `dang_cho` + `prev_img_hash` chưa đổi để lần START kế tiếp BẮT BUỘC chạy lại B2!
-        if step == Step::B2 && b2_needs_fresh_image {
-            return FailureResolution {
-                db_status: "dang_cho",
-                csv_label: "Đang chờ",
-                image_status: "chua_chay",
-                video_status: "chua_chay",
-                last_error: None,
-                count_as_run_error: false,
-                trigger_stop: true,
-            };
-        }
-        if has_existing_image {
-            return FailureResolution {
-                db_status: "da_tao_image",
-                csv_label: "Đã tạo image",
-                image_status: "xong",
-                video_status: "chua_chay",
-                last_error: None,
-                count_as_run_error: false,
-                trigger_stop: true,
-            };
-        }
-        return FailureResolution {
-            db_status: "dang_cho",
-            csv_label: "Đang chờ",
-            image_status: "chua_chay",
-            video_status: "chua_chay",
-            last_error: None,
-            count_as_run_error: false,
-            trigger_stop: true,
-        };
-    }
-
-    if fail.code == "REF_IMAGE_MISSING" {
-        return FailureResolution {
-            db_status: "dang_cho",
-            csv_label: "Đang chờ",
-            image_status: "chua_chay",
-            video_status: "chua_chay",
-            last_error: Some(fail.message.clone()),
-            count_as_run_error: false,
-            trigger_stop: false,
-        };
-    }
-
-    let is_transient = is_transient_error(fail);
-    if is_transient {
-        match step {
-            Step::B2 => FailureResolution {
-                db_status: "loi_tam_thoi",
-                csv_label: "Lỗi tạm thời",
-                image_status: "chua_chay",
-                video_status: "chua_chay",
-                last_error: Some(fail.message.clone()),
-                count_as_run_error: true,
-                trigger_stop: false,
-            },
-            Step::B3 => FailureResolution {
-                db_status: "loi_tam_thoi",
-                csv_label: "Lỗi tạm thời",
-                image_status: "xong",
-                video_status: "loi",
-                last_error: Some(fail.message.clone()),
-                count_as_run_error: true,
-                trigger_stop: false,
-            },
-        }
-    } else {
-        match step {
-            Step::B2 => FailureResolution {
-                db_status: "loi_tao_image",
-                csv_label: "Lỗi tạo image",
-                image_status: "loi",
-                video_status: "chua_chay",
-                last_error: Some(fail.message.clone()),
-                count_as_run_error: true,
-                trigger_stop: fail.kind == ApiFailKind::HetQuota,
-            },
-            Step::B3 => FailureResolution {
-                db_status: "loi_tao_video",
-                csv_label: "Lỗi tạo video",
-                image_status: "xong",
-                video_status: "loi",
-                last_error: Some(fail.message.clone()),
-                count_as_run_error: true,
-                trigger_stop: fail.kind == ApiFailKind::HetQuota,
-            },
-        }
-    }
-}
-
-fn finish_job_status(
-    ctx: &WorkerRowCtx<'_>,
-    row: &mut prompts_csv::Row,
-    res: &FailureResolution,
-    duration_ms: i64,
-) {
-    let ts = chrono::Local::now().to_rfc3339();
-    let _ = ctx.conn.execute(
-        "UPDATE jobs
-         SET status = ?1, image_status = ?2, video_status = ?3,
-             last_error = ?4, finished_at = ?5, duration_ms = ?6
-         WHERE id = ?7",
-        rusqlite::params![
-            res.db_status,
-            res.image_status,
-            res.video_status,
-            res.last_error,
-            ts,
-            duration_ms,
-            ctx.job_id
-        ],
-    );
-
-    let new_note = res.last_error.clone().unwrap_or_default();
-    if row.trang_thai != res.csv_label || row.ghi_chu_loi != new_note {
-        row.trang_thai = res.csv_label.to_string();
-        row.ghi_chu_loi = new_note.clone();
-        let row_key = crate::prompts_csv::row_key_of(
-            &row.anh_tham_chieu,
-            &row.promt_tao_image,
-            &row.promt_tao_video,
-        );
-        let label = res.csv_label;
-        if let Err(e) = prompts_csv::update_row(ctx.csv_path, &row_key, |r| {
-            r.trang_thai = label.into();
-            r.ghi_chu_loi = new_note;
-        }) {
-            crate::settings::log(
-                ctx.conn,
-                "warn",
-                Some(ctx.run_id),
-                Some(&row_key),
-                Some("ghi_sheet"),
-                &e.message,
-            );
-        }
-    }
-}
-
-/// Tên file & thời điểm tạo của ảnh/video hiện hành (`is_current = 1`) trong `file_refs`
-#[derive(Debug, Clone, Default)]
-pub struct CurrentMediaRefs {
-    pub image_file: Option<String>,
-    pub image_created_at: Option<String>,
-    pub video_file: Option<String>,
-    pub video_created_at: Option<String>,
-}
-
-/// Nạp toàn bộ `file_refs` hiện hành (`is_current = 1`) bằng MỘT câu SQL duy nhất.
-pub fn load_current_media_map(conn: &Connection) -> HashMap<String, CurrentMediaRefs> {
-    let mut map: HashMap<String, CurrentMediaRefs> = HashMap::new();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT row_key, kind, file_name, created_at
-         FROM file_refs
-         WHERE is_current = 1 AND kind IN ('anh', 'video')
-         ORDER BY version ASC, id ASC",
-    ) else {
-        return map;
-    };
-    let Ok(it) = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?,
-        ))
-    }) else {
-        return map;
-    };
-    for (rk, kind, fname, created_at) in it.flatten() {
-        let entry = map.entry(rk.to_lowercase()).or_default();
-        let formatted_time = created_at
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(format_rfc3339_to_csv_time);
-        match kind.as_str() {
-            "anh" => {
-                entry.image_file = Some(fname);
-                entry.image_created_at = formatted_time;
-            }
-            "video" => {
-                entry.video_file = Some(fname);
-                entry.video_created_at = formatted_time;
-            }
-            _ => {}
-        }
-    }
-    map
-}
-
-/// Đồng bộ toàn bộ cột D (`anh_da_Tao`), E (`video_da_tao`), G (`ngay_tao_anh`), H (`ngay_tao_video`),
-/// I (`trang_thai`), J (`ghi_chu_loi`) từ `state.db` sang `rows` + `prompts.csv` (13.4 + TC-44).
-pub fn sync_rows_from_state_db(
-    project_path: &Path,
-    conn: &Connection,
-    rows: &mut [prompts_csv::Row],
-) -> usize {
-    let csv_path = project_path.join("prompts.csv");
-    let image_out = project_path.join("image_out");
-    let video_out = project_path.join("video_out");
-    let latest_map = load_latest_jobs_map(conn);
-    let media_map = load_current_media_map(conn);
-
-    let mut synced = 0usize;
-    // Đếm số dòng dùng mỗi ảnh TRƯỚC khi iter_mut (fallback legacy cần thông tin này
-    // mà không được mượn `rows` cùng lúc với `iter_mut`).
-    let image_counts: HashMap<String, usize> = rows
-        .iter()
-        .filter(|r| !r.is_example() && !r.is_empty_content())
-        .fold(HashMap::new(), |mut acc, r| {
-            *acc.entry(r.anh_tham_chieu.trim().to_lowercase()).or_insert(0) += 1;
-            acc
-        });
-
-    for r in rows.iter_mut() {
-        if r.is_example() || r.is_empty_content() {
-            continue;
-        }
-        let key_low = row_key_low(r);
-        // Fallback dữ liệu cũ: jobs/file_refs lưu theo tên ảnh hoặc thông qua file_refs hiện có.
-        let legacy_key = r.anh_tham_chieu.trim().to_lowercase();
-        let legacy_only = image_counts.get(&legacy_key).copied().unwrap_or(0) == 1;
-        let prev = latest_job_for_csv_row(conn, r, &latest_map, &image_counts);
-        let media_entry = media_map
-            .get(&key_low)
-            .or_else(|| prev.as_ref().and_then(|p| media_map.get(&p.row_key.to_lowercase())))
-            .or_else(|| {
-                if legacy_only && !legacy_key.is_empty() {
-                    media_map.get(&legacy_key)
-                } else {
-                    None
-                }
-            });
-        let mut changed = false;
-
-        if let Some(m) = media_entry {
-            if let Some(ref img_f) = m.image_file {
-                if !img_f.is_empty() && image_out.join(img_f).is_file() {
-                    if r.anh_da_tao != *img_f {
-                        r.anh_da_tao = img_f.clone();
-                        changed = true;
-                        if let Some(ref t) = m.image_created_at {
-                            r.ngay_tao_anh = t.clone();
-                        }
-                    } else if r.ngay_tao_anh.trim().is_empty() {
-                        if let Some(ref t) = m.image_created_at {
-                            r.ngay_tao_anh = t.clone();
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            if let Some(ref vid_f) = m.video_file {
-                if !vid_f.is_empty() && video_out.join(vid_f).is_file() {
-                    if r.video_da_tao != *vid_f {
-                        r.video_da_tao = vid_f.clone();
-                        changed = true;
-                        if let Some(ref t) = m.video_created_at {
-                            r.ngay_tao_video = t.clone();
-                        }
-                    } else if r.ngay_tao_video.trim().is_empty() {
-                        if let Some(ref t) = m.video_created_at {
-                            r.ngay_tao_video = t.clone();
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(ref j) = prev {
-            let csv_label = match j.status.as_str() {
-                "dang_cho" | "bo_qua" => Some("Đang chờ"),
-                "da_tao_image" => Some("Đã tạo image"),
-                "da_tao_video" => Some("Đã tạo video"),
-                "loi_tao_image" => Some("Lỗi tạo image"),
-                "loi_tao_video" => Some("Lỗi tạo video"),
-                "loi_tam_thoi" => Some("Lỗi tạm thời"),
-                _ => None,
-            };
-            if let Some(lbl) = csv_label {
-                if r.trang_thai != lbl {
-                    r.trang_thai = lbl.to_string();
-                    changed = true;
-                }
-            }
-            let expected_note = if j.status == "bo_qua" {
-                "Bị bỏ qua bởi người dùng (Bỏ qua dòng)".to_string()
-            } else {
-                j.last_error.clone().unwrap_or_default()
-            };
-            if r.ghi_chu_loi != expected_note {
-                r.ghi_chu_loi = expected_note;
-                changed = true;
-            }
-        }
-
-        if changed {
-            synced += 1;
-        }
-    }
-
-    if synced > 0 {
-        match prompts_csv::write_all(&csv_path, rows) {
-            Ok(()) => crate::settings::log(
-                conn,
-                "info",
-                None,
-                None,
-                Some("dong_bo"),
-                &format!(
-                    "Đồng bộ {synced} dòng (trạng thái, thời gian & tên file) từ state.db vào prompts.csv (13.4)"
-                ),
-            ),
-            Err(e) => crate::settings::log(conn, "warn", None, None, Some("ghi_sheet"), &e.message),
-        }
-    }
-
-    synced
-}
-
-/// Đồng bộ ngầm từ `state.db -> prompts.csv` khi mở dự án / nạp lại bảng nếu `prompts.csv` không bị khóa.
-pub fn sync_csv_if_unlocked(project_path: &Path) -> usize {
-    let csv_path = project_path.join("prompts.csv");
-    if is_csv_write_locked(&csv_path) {
-        return 0;
-    }
-    let Ok(mut rows) = prompts_csv::read_all(&csv_path) else {
-        return 0;
-    };
-    let Ok(conn) = crate::state_db::open(project_path) else {
-        return 0;
-    };
-    sync_rows_from_state_db(project_path, &conn, &mut rows)
-}
-
-// ━━ Engine chính (Pipeline 2 tầng song song, `concurrency = 1..=MAX_CONCURRENCY`) ━━
-
-#[derive(Debug, Clone)]
-pub struct EngineOutcome {
-    pub run_id: i64,
-    pub status: String,
-    pub done: usize,
-    pub errors: usize,
-    pub stopped: bool,
-    pub duration_ms: i64,
-}
-
-pub fn build_run_finished_payload(outcome: &EngineOutcome) -> serde_json::Value {
-    serde_json::to_value(RunFinishedEvent {
-        run_id: outcome.run_id,
-        status: outcome.status.clone(),
-        done_count: outcome.done,
-        error_count: outcome.errors,
-        duration_ms: outcome.duration_ms,
-    })
-    .unwrap_or_else(|_| {
-        serde_json::json!({
-            "run_id": outcome.run_id,
-            "status": outcome.status,
-            "done_count": outcome.done,
-            "error_count": outcome.errors,
-            "duration_ms": outcome.duration_ms,
-        })
-    })
-}
-
-struct WorkerRowCtx<'a> {
-    emitter: EventEmitter<'a>,
-    cfg: &'a Settings,
-    conn: &'a Connection,
-    csv_path: &'a Path,
-    image_out: &'a Path,
-    video_out: &'a Path,
-    stop_flag: &'a AtomicBool,
-    run_id: i64,
-    job_id: i64,
-    total: usize,
-    done_count: &'a AtomicUsize,
-    active_rows: &'a parking_lot::Mutex<Vec<ActiveRowProgress>>,
-}
-
-impl WorkerRowCtx<'_> {
-    fn emit_step_progress(&self, row_key: &str, step: &str, detail: String) {
-        let snap = {
-            let mut active = self.active_rows.lock();
-            if step == "done" {
-                active.retain(|item| !item.row_key.eq_ignore_ascii_case(row_key));
-            } else if let Some(existing) = active
-                .iter_mut()
-                .find(|item| item.row_key.eq_ignore_ascii_case(row_key))
-            {
-                existing.step = step.to_string();
-                existing.detail = detail.clone();
-            } else {
-                active.push(ActiveRowProgress {
-                    row_key: row_key.to_string(),
-                    step: step.to_string(),
-                    detail: detail.clone(),
-                });
-            }
-            active.clone()
-        };
-        let done = self.done_count.load(Ordering::SeqCst);
-        emit(
-            self.emitter,
-            "progress",
-            &ProgressEvent {
-                run_id: self.run_id,
-                done,
-                total: self.total,
-                percent: (done as f64 / self.total.max(1) as f64) * 100.0,
-                current_row_key: row_key.to_string(),
-                current_step: step.to_string(),
-                step_detail: detail,
-                active_count: snap.len(),
-                active_rows: snap,
-            },
-        );
-    }
-
-    fn clear_active_row(&self, row_key: &str) {
-        self.active_rows
-            .lock()
-            .retain(|item| !item.row_key.eq_ignore_ascii_case(row_key));
-    }
-
-    /// Phát sự kiện `progress` phản ánh đúng danh sách dòng còn đang chạy sau khi một bước kết thúc.
-    fn emit_active_snapshot(&self, fallback_row_key: &str) {
-        let snap = self.active_rows.lock().clone();
-        let done = self.done_count.load(Ordering::SeqCst);
-        let (cur_key, cur_step, cur_detail) = if let Some(first) = snap.first() {
-            (
-                first.row_key.clone(),
-                first.step.clone(),
-                first.detail.clone(),
-            )
-        } else {
-            (
-                fallback_row_key.to_string(),
-                "done".to_string(),
-                format!("{done}/{} dòng", self.total),
-            )
-        };
-        emit(
-            self.emitter,
-            "progress",
-            &ProgressEvent {
-                run_id: self.run_id,
-                done,
-                total: self.total,
-                percent: (done as f64 / self.total.max(1) as f64) * 100.0,
-                current_row_key: cur_key,
-                current_step: cur_step,
-                step_detail: cur_detail,
-                active_count: snap.len(),
-                active_rows: snap,
-            },
-        );
-    }
-}
-
-/// Mỗi tài khoản Muse nội bộ chạy tối đa `MUSE2API_ACCOUNT_MAX_CONCURRENCY = 4` tác vụ đồng thời.
-const MUSE_INTERNAL_SLOTS_PER_ACCOUNT: usize = 4;
-
-/// Tính số luồng worker cho hai tầng pipeline tách rời `(image_workers, video_workers)`:
-/// - Tầng tạo ảnh (B2) không phụ thuộc video nên chạy song song độc lập và cấp đầu vào cho tầng video.
-/// - Tầng tạo video (B3) đợi ảnh xong; nếu có `noi_canh = true`, video ép về 1 luồng theo đúng thứ tự CSV,
-///   trong khi luồng ảnh vẫn tiếp tục chạy song song phía trước.
-/// - Khi nguồn video là Muse nội bộ (`video_source == "internal"`), số luồng video TUYỆT ĐỐI không được
-///   vượt quá số tài khoản Muse khả dụng để bảo đảm mỗi tài khoản chỉ chạy tối đa 1 luồng video duy nhất.
-/// - Nếu cả ảnh lẫn video cùng dùng sidecar Muse nội bộ, tổng luồng B2 + B3 được giữ trong ngưỡng slot
-///   của các tài khoản khả dụng (`accounts * 4`) để tránh lỗi 503 "all accounts are busy".
-pub fn compute_pipeline_workers(
-    cfg: &Settings,
-    b2_count: usize,
-    b3_count: usize,
-    has_noi_canh: bool,
-    muse_available_accounts: Option<usize>,
-) -> (usize, usize) {
-    let base = cfg.concurrency.clamp(1, crate::settings::MAX_CONCURRENCY) as usize;
-    let effective_base = if cfg.video_source == "internal" {
-        base.min(muse_available_accounts.unwrap_or(1).max(1))
-    } else {
-        base
-    };
-
-    let video_workers = if b3_count == 0 {
-        0
-    } else if has_noi_canh {
-        1
-    } else {
-        effective_base.min(b3_count)
-    };
-
-    let mut image_workers = if b2_count == 0 {
-        0
-    } else {
-        effective_base.min(b2_count)
-    };
-
-    if image_workers > 0 && cfg.image_source == "internal" {
-        let accounts = muse_available_accounts.unwrap_or(1).max(1);
-        let max_total_slots = accounts.saturating_mul(MUSE_INTERNAL_SLOTS_PER_ACCOUNT);
-        let used_by_video = if cfg.video_source == "internal" {
-            video_workers
-        } else {
-            0
-        };
-        let max_img_slots = max_total_slots.saturating_sub(used_by_video).max(1);
-        image_workers = image_workers.min(max_img_slots);
-    }
-
-    (image_workers, video_workers)
-}
-
-struct ImageWorkItem {
-    seq_idx: usize,
-    row: prompts_csv::Row,
-    plan: RowPlan,
-}
-
-struct VideoWorkItem {
-    seq_idx: usize,
-    row: prompts_csv::Row,
-    plan: RowPlan,
-    job_id: Option<i64>,
-    b2_duration_ms: i64,
-    b2_completed: bool,
-}
-
-enum VideoSlot {
-    PendingB2,
-    Ready(Box<VideoWorkItem>),
-    Skipped,
-}
-
-struct VideoQueueInner {
-    ordered: bool,
-    slots: Vec<VideoSlot>,
-    next_seq: usize,
-    ready_fifo: VecDeque<VideoWorkItem>,
-    active_image_workers: usize,
-    stop_requested: bool,
-}
-
-struct VideoPipelineQueue {
-    state: parking_lot::Mutex<VideoQueueInner>,
-    cv: parking_lot::Condvar,
-}
-
-impl VideoPipelineQueue {
-    fn new(ordered: bool, total_slots: usize, active_image_workers: usize) -> Self {
-        let slots = if ordered {
-            (0..total_slots).map(|_| VideoSlot::PendingB2).collect()
-        } else {
-            Vec::new()
-        };
-        Self {
-            state: parking_lot::Mutex::new(VideoQueueInner {
-                ordered,
-                slots,
-                next_seq: 0,
-                ready_fifo: VecDeque::new(),
-                active_image_workers,
-                stop_requested: false,
-            }),
-            cv: parking_lot::Condvar::new(),
-        }
-    }
-
-    fn push_ready(&self, item: VideoWorkItem) {
-        let mut st = self.state.lock();
-        if st.ordered {
-            let idx = item.seq_idx;
-            if idx < st.slots.len() {
-                st.slots[idx] = VideoSlot::Ready(Box::new(item));
-            }
-        } else {
-            st.ready_fifo.push_back(item);
-        }
-        self.cv.notify_one();
-    }
-
-    fn mark_skipped(&self, seq_idx: usize) {
-        let mut st = self.state.lock();
-        if st.ordered && seq_idx < st.slots.len() {
-            st.slots[seq_idx] = VideoSlot::Skipped;
-            self.cv.notify_all();
-        }
-    }
-
-    fn finish_image_worker(&self) {
-        let mut st = self.state.lock();
-        st.active_image_workers = st.active_image_workers.saturating_sub(1);
-        if st.active_image_workers == 0 {
-            self.cv.notify_all();
-        }
-    }
-
-    fn request_stop(&self) {
-        let mut st = self.state.lock();
-        st.stop_requested = true;
-        self.cv.notify_all();
-    }
-
-    fn pop_next(
-        &self,
-        stop_flag: &AtomicBool,
-        stopped_flag: &AtomicBool,
-    ) -> Option<VideoWorkItem> {
-        let mut st = self.state.lock();
-        loop {
-            if stop_flag.load(Ordering::SeqCst)
-                || stopped_flag.load(Ordering::SeqCst)
-                || st.stop_requested
-            {
-                stopped_flag.store(true, Ordering::SeqCst);
-                st.stop_requested = true;
-                self.cv.notify_all();
-                return None;
-            }
-
-            if st.ordered {
-                while st.next_seq < st.slots.len()
-                    && matches!(st.slots[st.next_seq], VideoSlot::Skipped)
-                {
-                    st.next_seq += 1;
-                }
-                if st.next_seq >= st.slots.len() {
-                    return None;
-                }
-                if matches!(st.slots[st.next_seq], VideoSlot::Ready(_)) {
-                    let idx = st.next_seq;
-                    let slot = std::mem::replace(&mut st.slots[idx], VideoSlot::Skipped);
-                    st.next_seq += 1;
-                    if let VideoSlot::Ready(item) = slot {
-                        return Some(*item);
-                    }
-                }
-                if st.active_image_workers == 0 {
-                    // Không còn luồng ảnh nào chạy; mọi slot PendingB2 còn lại không thể hoàn tất.
-                    let idx = st.next_seq;
-                    st.slots[idx] = VideoSlot::Skipped;
-                    continue;
-                }
-            } else {
-                if let Some(item) = st.ready_fifo.pop_front() {
-                    return Some(item);
-                }
-                if st.active_image_workers == 0 {
-                    return None;
-                }
-            }
-
-            let _ = self.cv.wait_for(&mut st, Duration::from_millis(200));
-        }
-    }
-}
-
-struct ImageWorkerDropGuard<'a>(&'a VideoPipelineQueue);
-
-impl Drop for ImageWorkerDropGuard<'_> {
-    fn drop(&mut self) {
-        self.0.finish_image_worker();
-    }
-}
-
-struct PipelineShared<'a> {
-    emitter: EventEmitter<'a>,
-    cfg: &'a Settings,
-    project_path: &'a Path,
-    csv_path: &'a Path,
-    image_out: &'a Path,
-    video_out: &'a Path,
-    stop_flag: &'a AtomicBool,
-    run_id: i64,
-    total: usize,
-    done_count: &'a AtomicUsize,
-    error_count: &'a AtomicUsize,
-    stopped: &'a AtomicBool,
-    active_rows: &'a parking_lot::Mutex<Vec<ActiveRowProgress>>,
-    fatal_err: &'a parking_lot::Mutex<Option<AppError>>,
-    video_queue: &'a VideoPipelineQueue,
-}
-
-fn update_runs_progress(
-    conn: &Connection,
-    run_id: i64,
-    done_count: &AtomicUsize,
-    error_count: &AtomicUsize,
-) {
-    let d_now = done_count.load(Ordering::SeqCst) as i64;
-    let e_now = error_count.load(Ordering::SeqCst) as i64;
-    let _ = conn.execute(
-        "UPDATE runs
-         SET done_count = MAX(done_count, ?1), error_count = MAX(error_count, ?2)
-         WHERE id = ?3",
-        rusqlite::params![d_now, e_now, run_id],
-    );
-}
-
-fn insert_job_for_row(
-    conn: &Connection,
-    run_id: i64,
-    row: &prompts_csv::Row,
-    row_key: &str,
-    plan: &RowPlan,
-    img_ref: &Path,
-) -> Result<i64, rusqlite::Error> {
-    let prev_before_insert = latest_job_info(conn, row_key);
-    let base_st = effective_row_status(row, prev_before_insert.as_ref())
-        .unwrap_or_else(|| row.status());
-    let (init_img_status, init_db_status) =
-        initial_job_image_state(row, base_st, plan, img_ref);
-
-    // [P0-2]: Khởi tạo `image_prompt_hash` và `video_prompt_hash` bằng hash LỊCH SỬ (`prev_*_hash`),
-    // CHỈ cập nhật sang hash mới sau khi từng bước thực sự hoàn tất!
-    let ts_job = chrono::Local::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO jobs(run_id, row_key, row_no, status, image_status, video_status,
-                          image_prompt_hash, video_prompt_hash, video_task_id, video_download_url,
-                          attempts_count, started_at)
-         VALUES (?1,?2,?3,?4,?5,'chua_chay',?6,?7,?8,?9,?10,?11)",
-        rusqlite::params![
-            run_id,
-            row_key,
-            row.row_no as i64,
-            init_db_status,
-            init_img_status,
-            plan.prev_img_hash,
-            plan.prev_vid_hash,
-            plan.resume_task_id,
-            plan.resume_download_url,
-            plan.carried_attempts,
-            ts_job
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-struct StepFailInput<'a> {
-    step: Step,
-    fail: &'a ApiFail,
-    row_key: &'a str,
-    plan: &'a RowPlan,
-    b2_completed_in_this_job: bool,
-    duration_ms: i64,
-}
-
-fn handle_step_failure(
-    shared: &PipelineShared<'_>,
-    ctx: &WorkerRowCtx<'_>,
-    row: &mut prompts_csv::Row,
-    input: StepFailInput<'_>,
-) -> bool {
-    let StepFailInput {
-        step,
-        fail,
-        row_key,
-        plan,
-        b2_completed_in_this_job,
-        duration_ms,
-    } = input;
-    let step_name = if step == Step::B2 { "B2" } else { "B3" };
-    let has_img = !row.anh_da_tao.is_empty() && shared.image_out.join(&row.anh_da_tao).is_file();
-    let b2_needs_fresh =
-        step == Step::B2 && !b2_completed_in_this_job && (plan.force_new_image || !has_img);
-    let res = resolve_step_failure(step, fail, has_img, b2_needs_fresh);
-    finish_job_status(ctx, row, &res, duration_ms);
-    ctx.clear_active_row(row_key);
-
-    if res.count_as_run_error {
-        shared.error_count.fetch_add(1, Ordering::SeqCst);
-        crate::settings::log(
-            ctx.conn,
-            "error",
-            Some(shared.run_id),
-            Some(row_key),
-            Some(step_name),
-            &fail.message,
-        );
-    } else {
-        let lvl = if fail.code == "STOPPED" {
-            "info"
-        } else {
-            "warn"
-        };
-        crate::settings::log(
-            ctx.conn,
-            lvl,
-            Some(shared.run_id),
-            Some(row_key),
-            Some(step_name),
-            &fail.message,
-        );
-    }
-
-    emit(
-        shared.emitter,
-        "row_changed",
-        &RowChangedEvent {
-            row_key: row_key.to_string(),
-            status: res.csv_label.into(),
-            image_status: res.image_status.into(),
-            video_status: res.video_status.into(),
-            attempts_count: current_job_attempts(ctx.conn, ctx.job_id),
-            last_error: res.last_error.clone(),
-        },
-    );
-
-    let mut should_stop = res.trigger_stop;
-
-    if fail.kind == ApiFailKind::HetQuota || fail.code == "VIDEO_LOCKED" {
-        emit(
-            shared.emitter,
-            "run_error",
-            &RunErrorEvent {
-                run_id: shared.run_id,
-                row_key: Some(row_key.to_string()),
-                step: Some(step_name.into()),
-                code: fail.code.clone(),
-                message: fail.message.clone(),
-            },
-        );
-        if fail.code == "VIDEO_LOCKED" {
-            let mut account_id = None;
-            let mut account_label = None;
-            let acc_file = crate::settings::app_data_dir()
-                .join(crate::muse_sidecar::MUSE_DATA_DIR)
-                .join("accounts.json");
-            if let Ok(content) = std::fs::read_to_string(&acc_file) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(arr) = val.as_array() {
-                        if let Some(locked) = arr.iter().find(|a| {
-                            a.get("status").and_then(|s| s.as_str()) == Some("video_locked")
-                        }) {
-                            account_id = locked
-                                .get("id")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string());
-                            account_label = locked
-                                .get("label")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string());
-                        } else if arr.len() == 1 {
-                            account_id = arr[0]
-                                .get("id")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string());
-                            account_label = arr[0]
-                                .get("label")
-                                .and_then(|s| s.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                }
-            }
-            let acc_id_val = account_id.clone().unwrap_or_default();
-            let acc_lbl_val = account_label.or(account_id).unwrap_or_default();
-            emit(
-                shared.emitter,
-                "account_video_locked",
-                &serde_json::json!({
-                    "code": "VIDEO_LOCKED",
-                    "message": fail.message.clone(),
-                    "account_id": acc_id_val,
-                    "id": acc_id_val,
-                    "label": acc_lbl_val,
-                }),
-            );
-        }
-        shared.stop_flag.store(true, Ordering::SeqCst);
-        should_stop = true;
-    }
-
-    if should_stop {
-        shared.stopped.store(true, Ordering::SeqCst);
-        shared.video_queue.request_stop();
-    }
-
-    update_runs_progress(ctx.conn, shared.run_id, shared.done_count, shared.error_count);
-    ctx.emit_active_snapshot(row_key);
-    should_stop
-}
-
-pub fn run(
-    app: &AppHandle,
-    cfg: &Settings,
-    project_path: &Path,
-    engine_cfg: EngineConfig,
-    stop_flag: &Arc<AtomicBool>,
-) -> AppResult<EngineOutcome> {
-    let cb = |name: &str, payload: serde_json::Value| {
-        let _ = app.emit(name, payload);
-    };
-    let outcome =
-        run_with_emitter_and_hook(&cb, None, cfg, project_path, engine_cfg, stop_flag)?;
-    let _ = app.emit("run_finished", build_run_finished_payload(&outcome));
-    Ok(outcome)
-}
-
-pub fn run_with_emitter(
-    emitter: EventEmitter<'_>,
-    cfg: &Settings,
-    project_path: &Path,
-    engine_cfg: EngineConfig,
-    stop_flag: &Arc<AtomicBool>,
-) -> AppResult<EngineOutcome> {
-    let outcome =
-        run_with_emitter_and_hook(emitter, None, cfg, project_path, engine_cfg, stop_flag)?;
-    emitter("run_finished", build_run_finished_payload(&outcome));
-    Ok(outcome)
-}
-
-fn initial_job_image_state(
-    row: &prompts_csv::Row,
-    base_st: prompts_csv::RowStatus,
-    plan: &RowPlan,
-    img_dir: &Path,
-) -> (&'static str, &'static str) {
-    let init_img_status = if !plan.force_new_image
-        && matches!(
-            base_st,
-            prompts_csv::RowStatus::DaTaoImage
-                | prompts_csv::RowStatus::DaTaoVideo
-                | prompts_csv::RowStatus::LoiVideo
-                | prompts_csv::RowStatus::LoiTamThoi
-        )
-        && !row.anh_da_tao.is_empty()
-        && img_dir.join(&row.anh_da_tao).is_file()
-    {
-        "xong"
-    } else {
-        "chua_chay"
-    };
-    let init_db_status = if init_img_status == "xong" {
-        "da_tao_image"
-    } else {
-        "dang_cho"
-    };
-    (init_img_status, init_db_status)
-}
-
 /// Nhân thực thi cốt lõi của Run Engine (hỗ trợ hook nhận `run_id` tức thì và pipeline 2 tầng song song).
 pub fn run_with_emitter_and_hook(
     emitter: EventEmitter<'_>,
@@ -2083,6 +897,23 @@ pub fn run_with_emitter_and_hook(
         ));
     }
 
+    let has_noi_canh = planned_rows.iter().any(|(r, _)| r.noi_canh);
+    let ffmpeg_check = if cfg.auto_merge || has_noi_canh {
+        Some(crate::ffmpeg::resolve_ffmpeg_binary(&cfg.ffmpeg_path))
+    } else {
+        None
+    };
+    if cfg.auto_merge {
+        if let Some(Err(msg)) = &ffmpeg_check {
+            return Err(AppError::new(
+                "FFMPEG_MISSING",
+                format!(
+                    "Đang bật 'Tự động ghép video sau batch' nhưng không tìm thấy FFmpeg: {msg}"
+                ),
+            ));
+        }
+    }
+
     let ts = chrono::Local::now().to_rfc3339();
     let run_kind = if engine_cfg.kind.is_empty() {
         "chung"
@@ -2115,7 +946,20 @@ pub fn run_with_emitter_and_hook(
     // - Nếu batch có ít nhất 1 dòng `noi_canh = true`, riêng tầng video ép 1 luồng theo đúng thứ tự CSV
     //   để đảm bảo video cảnh trước luôn xong trước khi trích frame cuối cho cảnh sau, trong khi luồng ảnh
     //   vẫn tiếp tục chạy song song phía trước.
-    let has_noi_canh = planned_rows.iter().any(|(r, _)| r.noi_canh);
+    if has_noi_canh {
+        if let Some(Err(msg)) = &ffmpeg_check {
+            crate::settings::log(
+                &conn,
+                "warn",
+                Some(run_id),
+                None,
+                Some("B1"),
+                &format!(
+                    "Batch có dòng nối cảnh (noi_canh=1) nhưng chưa tìm thấy FFmpeg ({msg}) — các cảnh nối sẽ fallback dùng ảnh gốc của dòng."
+                ),
+            );
+        }
+    }
 
     let mut image_items: VecDeque<ImageWorkItem> = VecDeque::new();
     let mut initial_video_items: Vec<VideoWorkItem> = Vec::new();
@@ -2576,15 +1420,34 @@ pub fn run_with_emitter_and_hook(
     }
 
     if cfg.auto_merge && !was_stopped {
-        if let Err(e) = auto_merge_batch(project_path, Some(run_id), Some(&conn), cfg) {
-            crate::settings::log(
-                &conn,
-                "warn",
-                Some(run_id),
-                None,
-                Some("auto_merge"),
-                &format!("Tự động ghép nối video thất bại: {e}. Toàn bộ các clip lẻ thành phẩm vẫn được giữ nguyên."),
-            );
+        match auto_merge_batch_with_stop(
+            project_path,
+            Some(run_id),
+            Some(&conn),
+            cfg,
+            Some(stop_flag.as_ref()),
+        ) {
+            Ok(_) => {}
+            Err(e) if e.starts_with("STOPPED:") => {
+                crate::settings::log(
+                    &conn,
+                    "info",
+                    Some(run_id),
+                    None,
+                    Some("auto_merge"),
+                    "Đã dừng bước tự động ghép video theo yêu cầu người dùng. Các clip lẻ thành phẩm vẫn được giữ nguyên.",
+                );
+            }
+            Err(e) => {
+                crate::settings::log(
+                    &conn,
+                    "warn",
+                    Some(run_id),
+                    None,
+                    Some("auto_merge"),
+                    &format!("Tự động ghép nối video thất bại: {e}. Toàn bộ các clip lẻ thành phẩm vẫn được giữ nguyên."),
+                );
+            }
         }
     }
 
@@ -3166,6 +2029,15 @@ fn find_previous_scene_video(ctx: &WorkerRowCtx<'_>, row: &prompts_csv::Row) -> 
 }
 
 pub fn extract_last_frame_ffmpeg(video_path: &Path, output_frame_path: &Path) -> Result<(), String> {
+    extract_last_frame_ffmpeg_with_options(video_path, output_frame_path, "", None)
+}
+
+pub fn extract_last_frame_ffmpeg_with_options(
+    video_path: &Path,
+    output_frame_path: &Path,
+    ffmpeg_override: &str,
+    stop_flag: Option<&AtomicBool>,
+) -> Result<(), String> {
     if !video_path.is_file() {
         return Err(format!("File video nguồn không tồn tại: {}", video_path.display()));
     }
@@ -3173,23 +2045,24 @@ pub fn extract_last_frame_ffmpeg(video_path: &Path, output_frame_path: &Path) ->
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let mut cmd = std::process::Command::new("ffmpeg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.arg("-y")
-        .arg("-sseof")
-        .arg("-0.5")
-        .arg("-i")
-        .arg(video_path)
-        .arg("-frames:v")
-        .arg("1")
-        .arg(output_frame_path);
+    let bin = crate::ffmpeg::resolve_ffmpeg_binary(ffmpeg_override)?;
+    let args = vec![
+        "-y".to_string(),
+        "-sseof".to_string(),
+        "-0.5".to_string(),
+        "-i".to_string(),
+        video_path.to_string_lossy().to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        output_frame_path.to_string_lossy().to_string(),
+    ];
 
-    let output = cmd.output().map_err(|e| format!("Không thể thực thi lệnh FFmpeg: {e}"))?;
+    let output = crate::ffmpeg::run_command_with_timeout(
+        &bin,
+        &args,
+        crate::ffmpeg::FFMPEG_FRAME_TIMEOUT,
+        stop_flag,
+    )?;
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Lệnh FFmpeg thất bại (code {:?}): {}", output.status.code(), err_msg.trim()));
@@ -3283,7 +2156,12 @@ fn run_b3(
                 let safe_key = sanitize_filename(&row_key);
                 let extracted_frame_path = cache_dir.join(format!("last_frame_{}.png", safe_key));
 
-                match extract_last_frame_ffmpeg(&prev_video_path, &extracted_frame_path) {
+                match extract_last_frame_ffmpeg_with_options(
+                    &prev_video_path,
+                    &extracted_frame_path,
+                    &ctx.cfg.ffmpeg_path,
+                    Some(ctx.stop_flag),
+                ) {
                     Ok(()) => {
                         crate::settings::log(
                             ctx.conn,
@@ -3297,6 +2175,11 @@ fn run_b3(
                             ),
                         );
                         chosen_img_path = Some(extracted_frame_path);
+                    }
+                    Err(err) if err.starts_with("STOPPED:") => {
+                        return Err(ApiFail::stopped(
+                            "Đã dừng an toàn trong lúc trích xuất frame nối cảnh FFmpeg",
+                        ));
                     }
                     Err(err) => {
                         crate::settings::log(
@@ -3702,99 +2585,6 @@ fn run_b3(
     })?;
 
     Ok(RowStatus::DaTaoVideo)
-}
-
-// ━━ Dry-run (6.2b, TC-41) ━━
-
-#[derive(Serialize, Clone)]
-pub struct DryRunGroup {
-    pub status: String,
-    pub count: usize,
-    pub row_keys: Vec<String>,
-}
-
-#[derive(Serialize, Clone)]
-pub struct DryRunResult {
-    pub groups: Vec<DryRunGroup>,
-    pub total: usize,
-    pub is_csv_locked: bool,
-}
-
-pub fn dry_run(project_path: &Path, cfg: &Settings) -> AppResult<DryRunResult> {
-    let csv_path = project_path.join("prompts.csv");
-    let is_csv_locked = is_csv_write_locked(&csv_path);
-    let rows = prompts_csv::read_all(&csv_path)?;
-    let conn = crate::state_db::open(project_path)
-        .map_err(|e| AppError::new("DB_FAIL", format!("{e}")))?;
-
-    let latest_map = load_latest_jobs_map(&conn);
-    let media_map = load_current_media_map(&conn);
-    let image_out = project_path.join("image_out");
-    let default_engine_cfg = EngineConfig {
-        kind: "chung",
-        row_keys: Vec::new(),
-        force_step: None,
-        reset_error_attempts: false,
-    };
-
-    let mut groups: Vec<DryRunGroup> = Vec::new();
-    let mut push = |status: &str, key: &str| {
-        if let Some(g) = groups.iter_mut().find(|g| g.status == status) {
-            g.count += 1;
-            g.row_keys.push(key.to_string());
-        } else {
-            groups.push(DryRunGroup {
-                status: status.into(),
-                count: 1,
-                row_keys: vec![key.to_string()],
-            });
-        }
-    };
-
-    let img_counts = image_counts(&rows);
-    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for r in &rows {
-        if r.is_example() || r.is_empty_content() {
-            continue;
-        }
-        let key_low = row_key_low(r);
-        if !seen_keys.insert(key_low.clone()) {
-            continue;
-        }
-        let prev_owned = latest_job_for_csv_row(&conn, r, &latest_map, &img_counts);
-        let prev = prev_owned.as_ref();
-        let db_img = media_map
-            .get(&key_low)
-            .or_else(|| prev.and_then(|p| media_map.get(&p.row_key.to_lowercase())))
-            .or_else(|| map_lookup_legacy(&media_map, &rows, r))
-            .and_then(|m| m.image_file.as_deref());
-        let mut r_eff = r.clone();
-        if r_eff.anh_da_tao.is_empty() {
-            if let Some(img_f) = db_img {
-                if image_out.join(img_f).is_file() {
-                    r_eff.anh_da_tao = img_f.to_string();
-                }
-            }
-        }
-        let legacy_img = r.anh_tham_chieu.trim().to_lowercase();
-        let same_image = img_counts.get(&legacy_img).copied().unwrap_or(0);
-        if plan_row(&r_eff, prev, cfg, &default_engine_cfg, &image_out, db_img, same_image).is_some() {
-            let eff_label = effective_status_label(&r_eff, prev);
-            let group_label = if eff_label == "Đã tạo video" && is_prompt_modified(&r_eff, prev) {
-                "Đã sửa prompt (chạy lại)"
-            } else {
-                eff_label
-            };
-            push(group_label, &r.anh_tham_chieu);
-        }
-    }
-
-    let total = groups.iter().map(|g| g.count).sum();
-    Ok(DryRunResult {
-        groups,
-        total,
-        is_csv_locked,
-    })
 }
 
 #[cfg(test)]

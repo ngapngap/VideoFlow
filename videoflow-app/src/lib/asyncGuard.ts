@@ -176,3 +176,44 @@ export async function runStartupProjectAutoOpen<
   deps.applyProject(info);
   return true;
 }
+
+export interface CoalescedScheduler {
+  schedule(): void;
+  cancel(): void;
+  flush(): void;
+}
+
+/**
+ * Coalesces bursts of rapid notifications (e.g. concurrent `row_changed` ticks)
+ * into a single trailing callback after `delayMs`, with deterministic cancellation on destroy/switch.
+ */
+export function createCoalescedScheduler(
+  delayMs: number,
+  fn: () => void
+): CoalescedScheduler {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return {
+    schedule() {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        fn();
+      }, delayMs);
+    },
+    cancel() {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+    flush() {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+        fn();
+      }
+    },
+  };
+}
