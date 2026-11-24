@@ -31,6 +31,10 @@
   } from "../lib/api";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
+  import ScanInputModal from "../lib/ScanInputModal.svelte";
+  import RowCompareModal from "../lib/RowCompareModal.svelte";
+  import ImageLightboxModal from "../lib/ImageLightboxModal.svelte";
+  import RowVideoModal from "../lib/RowVideoModal.svelte";
   import {
     createSeqGuard,
     isRowLockedForBatch,
@@ -103,31 +107,17 @@
   // (A) Quét & nhập hàng loạt ảnh từ input/
   let scanModalOpen = false;
   let scanningInput = false;
-  let importingInput = false;
   let untrackedItems: UntrackedImageItem[] = [];
-  let selectedImportNames = new Set<string>();
-  let defaultImportPromptImg = "";
-  let defaultImportPromptVid = "";
 
   // (C) So sánh phiên bản v1 vs v2 cạnh nhau
   let compareModalOpen = false;
-  let compareKind: "image" | "video" = "image";
-  let compareLeftVer = 1;
-  let compareRightVer = 2;
+  let compareInitialKind: "image" | "video" = "image";
   let switchingVersion = false;
 
   // (D) Lightbox xem ảnh phóng lớn 25%–400% + kéo di chuyển (pan)
   let lightboxOpen = false;
   let lightboxAbsPath = "";
   let lightboxTitle = "";
-  let zoomScale = 1;
-  let panX = 0;
-  let panY = 0;
-  let isPanning = false;
-  let panStartX = 0;
-  let panStartY = 0;
-  let panOriginX = 0;
-  let panOriginY = 0;
 
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   const loadGuard = createSeqGuard();
@@ -164,16 +154,6 @@
   );
   $: videoVersions = (detail?.files ?? []).filter((f) => f.kind === "video");
   $: canCompareVersions = imageVersions.length >= 2 || videoVersions.length >= 2;
-
-  $: compareCandidates = compareKind === "video" ? videoVersions : imageVersions;
-  $: compareLeftItem =
-    compareCandidates.find((f) => f.version === compareLeftVer) ??
-    compareCandidates[compareCandidates.length - 1] ??
-    null;
-  $: compareRightItem =
-    compareCandidates.find((f) => f.version === compareRightVer) ??
-    compareCandidates[0] ??
-    null;
 
   // Đường dẫn media đang hiển thị trong ngăn Chi tiết
   $: activeImageVersion =
@@ -214,14 +194,8 @@
   let videoModalPromptImage = "";
   let videoModalPromptVideo = "";
   let videoModalDurationSec: number | null = null;
-  let videoModalWidth: number | null = null;
-  let videoModalHeight: number | null = null;
+  let videoModalResolution: string | null = null;
   let videoModalAccount = "";
-  let videoPlayerEl: HTMLVideoElement | null = null;
-  let copiedImagePrompt = false;
-  let copiedVideoPrompt = false;
-  let copyImgFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
-  let copyVidFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   function rowRev(
     rowKey: string | null | undefined,
@@ -229,23 +203,6 @@
     baseBust: number
   ): number {
     return Math.max((rowKey && revs[rowKey]) || 0, baseBust);
-  }
-
-  function formatAspectRatio(w: number, h: number): string {
-    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return "";
-    let a = Math.round(w);
-    let b = Math.round(h);
-    while (b !== 0) {
-      const t = b;
-      b = a % b;
-      a = t;
-    }
-    const rw = Math.round(w) / a;
-    const rh = Math.round(h) / a;
-    if (rw <= 32 && rh <= 32) {
-      return `${rw}:${rh}`;
-    }
-    return `${(w / h).toFixed(2)}:1`;
   }
 
   $: videoModalUrl = videoModalAbsPath
@@ -316,13 +273,6 @@
     ++detailReqSeq;
     loadGuard.invalidate();
     if (searchTimer) clearTimeout(searchTimer);
-    if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
-    if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
-    if (videoPlayerEl) {
-      try {
-        videoPlayerEl.pause();
-      } catch {}
-    }
   });
 
   // Đọc bộ lọc chuyển tiếp từ Dashboard (ví dụ bấm thẻ "Dòng lỗi cần xem" -> chip = "Lỗi")
@@ -916,9 +866,7 @@
     if (!$project || $running || scanningInput) return;
     scanningInput = true;
     try {
-      const items = await api.scan_untracked_input_images();
-      untrackedItems = items;
-      selectedImportNames = new Set(items.map((i) => i.file_name));
+      untrackedItems = await api.scan_untracked_input_images();
       scanModalOpen = true;
     } catch (e) {
       showToast("error", formatApiError(e));
@@ -927,48 +875,15 @@
     }
   }
 
-  function toggleImportItem(fileName: string): void {
-    const next = new Set(selectedImportNames);
-    if (next.has(fileName)) {
-      next.delete(fileName);
-    } else {
-      next.add(fileName);
-    }
-    selectedImportNames = next;
-  }
-
-  function toggleAllImportItems(): void {
-    if (selectedImportNames.size === untrackedItems.length) {
-      selectedImportNames = new Set();
-    } else {
-      selectedImportNames = new Set(untrackedItems.map((i) => i.file_name));
-    }
-  }
-
-  async function executeBatchImport(): Promise<void> {
-    if (selectedImportNames.size === 0 || importingInput || $running) return;
-    importingInput = true;
-    try {
-      const names = Array.from(selectedImportNames);
-      const count = await api.import_input_images(
-        names,
-        defaultImportPromptImg.trim(),
-        defaultImportPromptVid.trim()
-      );
-      scanModalOpen = false;
-      brokenThumbs = {};
-      assetCacheBust.set(Date.now());
-      project.update((cur) =>
-        cur ? { ...cur, row_count: cur.row_count + count } : cur
-      );
-      rowChangedTick.update((n) => n + 1);
-      showToast("success", `Đã nhập ${count} ảnh mới từ input/ vào prompts.csv.`);
-      await load();
-    } catch (e) {
-      showToast("error", formatApiError(e));
-    } finally {
-      importingInput = false;
-    }
+  async function handleInputImagesImported(count: number): Promise<void> {
+    brokenThumbs = {};
+    assetCacheBust.set(Date.now());
+    project.update((cur) =>
+      cur ? { ...cur, row_count: cur.row_count + count } : cur
+    );
+    rowChangedTick.update((n) => n + 1);
+    showToast("success", `Đã nhập ${count} ảnh mới từ input/ vào prompts.csv.`);
+    await load();
   }
 
   // (C) Đặt phiên bản làm bản chính & Mở cửa sổ so sánh v1 vs v2
@@ -1006,26 +921,8 @@
       initialKind === "video"
         ? videoVersions.length >= 2
         : imageVersions.length < 2 && videoVersions.length >= 2;
-    compareKind = preferVideo ? "video" : "image";
-    initComparePair(compareKind === "video" ? videoVersions : imageVersions);
+    compareInitialKind = preferVideo ? "video" : "image";
     compareModalOpen = true;
-  }
-
-  function switchCompareKind(nextKind: "image" | "video"): void {
-    compareKind = nextKind;
-    initComparePair(nextKind === "video" ? videoVersions : imageVersions);
-  }
-
-  function initComparePair(list: FileVersionItem[]): void {
-    if (list.length >= 2) {
-      // Sắp xếp v cũ ở bên trái, v mới nhất ở bên phải
-      const sortedAsc = [...list].sort((a, b) => a.version - b.version);
-      compareLeftVer = sortedAsc[sortedAsc.length - 2].version;
-      compareRightVer = sortedAsc[sortedAsc.length - 1].version;
-    } else if (list.length === 1) {
-      compareLeftVer = list[0].version;
-      compareRightVer = list[0].version;
-    }
   }
 
   async function revealInExplorer(absPath: string | null | undefined): Promise<void> {
@@ -1056,84 +953,10 @@
     if (!absPath) return;
     lightboxAbsPath = absPath;
     lightboxTitle = title;
-    zoomScale = 1;
-    panX = 0;
-    panY = 0;
-    isPanning = false;
     lightboxOpen = true;
   }
 
-  function clampZoom(next: number): number {
-    return Math.min(4, Math.max(0.25, Math.round(next * 100) / 100));
-  }
-
-  function adjustZoom(delta: number): void {
-    const next = clampZoom(zoomScale + delta);
-    zoomScale = next;
-    if (next <= 1) {
-      panX = 0;
-      panY = 0;
-    }
-  }
-
-  function resetLightboxZoom(): void {
-    zoomScale = 1;
-    panX = 0;
-    panY = 0;
-  }
-
-  function toggleDoubleClickZoom(): void {
-    if (zoomScale === 1) {
-      zoomScale = 2;
-    } else {
-      resetLightboxZoom();
-    }
-  }
-
-  function onLightboxWheel(e: WheelEvent): void {
-    e.preventDefault();
-    const step = e.deltaY < 0 ? 0.25 : -0.25;
-    adjustZoom(step);
-  }
-
-  function onLightboxPointerDown(e: PointerEvent): void {
-    if (e.button !== 0) return;
-    isPanning = true;
-    panStartX = e.clientX;
-    panStartY = e.clientY;
-    panOriginX = panX;
-    panOriginY = panY;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-  }
-
-  function onLightboxPointerMove(e: PointerEvent): void {
-    if (!isPanning) return;
-    panX = panOriginX + (e.clientX - panStartX);
-    panY = panOriginY + (e.clientY - panStartY);
-  }
-
-  function onLightboxPointerUp(e: PointerEvent): void {
-    if (!isPanning) return;
-    isPanning = false;
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      // bỏ qua nếu pointer đã nhả
-    }
-  }
-
   // (E) Modal xem video lớn trong màn Dòng việc (UI-3)
-  function formatSecs(sec?: number | null): string {
-    if (typeof sec !== "number" || !Number.isFinite(sec) || sec < 0) return "—";
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    const ms = Math.floor((sec % 1) * 10);
-    if (m > 0) {
-      return `${m}:${s.toString().padStart(2, "0")}s`;
-    }
-    return `${s}.${ms}s`;
-  }
-
   function openVideoModal(d: RowDetail | null | undefined): void {
     if (!d) return;
     videoModalGuard.invalidate();
@@ -1147,18 +970,8 @@
     videoModalPromptImage = d.prompt_image ?? "";
     videoModalPromptVideo = d.prompt_video ?? "";
     videoModalDurationSec = d.video_duration ?? null;
-    videoModalWidth = null;
-    videoModalHeight = null;
-    if (d.video_resolution) {
-      const parts = d.video_resolution.split("x");
-      if (parts.length === 2) {
-        videoModalWidth = parseInt(parts[0], 10) || null;
-        videoModalHeight = parseInt(parts[1], 10) || null;
-      }
-    }
+    videoModalResolution = d.video_resolution ?? null;
     videoModalAccount = d.account_used || "";
-    copiedImagePrompt = false;
-    copiedVideoPrompt = false;
     videoModalOpen = true;
   }
 
@@ -1192,53 +1005,7 @@
 
   function closeVideoModal(): void {
     videoModalGuard.invalidate();
-    if (videoPlayerEl) {
-      try {
-        videoPlayerEl.pause();
-      } catch {}
-    }
     videoModalOpen = false;
-  }
-
-  function handleModalVideoMetadata(e: Event): void {
-    const el = e.currentTarget as HTMLVideoElement | null;
-    if (!el) return;
-    if (Number.isFinite(el.duration) && el.duration > 0) {
-      videoModalDurationSec = el.duration;
-    }
-    if (el.videoWidth > 0 && el.videoHeight > 0) {
-      videoModalWidth = el.videoWidth;
-      videoModalHeight = el.videoHeight;
-    }
-  }
-
-  async function copyModalPrompt(kind: "image" | "video"): Promise<void> {
-    const text = kind === "image" ? videoModalPromptImage : videoModalPromptVideo;
-    if (!text || !text.trim()) {
-      showToast("warn", `Prompt ${kind === "image" ? "tạo ảnh" : "tạo video"} đang trống.`);
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-      if (kind === "image") {
-        copiedImagePrompt = true;
-        if (copyImgFeedbackTimer) clearTimeout(copyImgFeedbackTimer);
-        copyImgFeedbackTimer = setTimeout(() => {
-          copiedImagePrompt = false;
-          copyImgFeedbackTimer = null;
-        }, 2000);
-      } else {
-        copiedVideoPrompt = true;
-        if (copyVidFeedbackTimer) clearTimeout(copyVidFeedbackTimer);
-        copyVidFeedbackTimer = setTimeout(() => {
-          copiedVideoPrompt = false;
-          copyVidFeedbackTimer = null;
-        }, 2000);
-      }
-      showToast("success", `Đã sao chép prompt ${kind === "image" ? "tạo ảnh" : "tạo video"}.`);
-    } catch (e) {
-      showToast("error", `Không thể sao chép vào clipboard: ${formatApiError(e)}`);
-    }
   }
 
   function projectFileUrl(
@@ -2727,491 +2494,54 @@
 </Modal>
 
 <!-- (A) Modal Quét & Nhập hàng loạt ảnh từ input/ -->
-<Modal
+<ScanInputModal
   open={scanModalOpen}
-  title="Quét & Nhập ảnh mới từ thư mục input/"
-  width="680px"
-  disableClose={importingInput}
+  items={untrackedItems}
+  running={$running}
+  cacheBust={$assetCacheBust}
   on:close={() => (scanModalOpen = false)}
->
-  {#if untrackedItems.length === 0}
-    <div class="scan-empty">
-      <Icons name="check" size={28} />
-      <div class="scan-empty-title">Tất cả ảnh trong <code>input/</code> đã có trong CSV</div>
-      <p>Không phát hiện file ảnh (<code>.png</code>, <code>.jpg</code>, <code>.jpeg</code>, <code>.webp</code>) nào chưa được theo dõi.</p>
-    </div>
-  {:else}
-    <div class="modal-stack">
-      <div class="scan-head-row">
-        <span>
-          Phát hiện <strong>{untrackedItems.length} ảnh mới</strong> trong <code>input/</code> chưa có trong <code>prompts.csv</code>:
-        </span>
-        <button type="button" class="btn-ghost tiny-btn" on:click={toggleAllImportItems}>
-          {selectedImportNames.size === untrackedItems.length ? "Bỏ chọn tất cả" : "Chọn tất cả"}
-        </button>
-      </div>
-
-      <div class="scan-grid">
-        {#each untrackedItems as item (item.file_name)}
-          {@const isPicked = selectedImportNames.has(item.file_name)}
-          <label class="scan-item" class:picked={isPicked}>
-            <input
-              type="checkbox"
-              checked={isPicked}
-              on:change={() => toggleImportItem(item.file_name)}
-            />
-            <span class="scan-thumb">
-              <img
-                src={toAssetUrl(item.abs_path, $assetCacheBust)}
-                alt={item.file_name}
-                loading="lazy"
-              />
-            </span>
-            <span class="scan-meta">
-              <span class="scan-name selectable" title={item.file_name}>{item.file_name}</span>
-              <span class="scan-size">{formatBytes(item.size_bytes)}</span>
-            </span>
-          </label>
-        {/each}
-      </div>
-
-      <div class="scan-prompts">
-        <div>
-          <label class="label" for="import-default-img-prompt">
-            Prompt tạo ảnh mặc định (tùy chọn — áp dụng cho các ảnh nhập)
-          </label>
-          <textarea
-            id="import-default-img-prompt"
-            class="input prompt"
-            rows="2"
-            placeholder="Có thể để trống và sửa riêng từng dòng sau..."
-            bind:value={defaultImportPromptImg}
-          ></textarea>
-        </div>
-        <div>
-          <label class="label" for="import-default-vid-prompt">
-            Prompt tạo video mặc định (tùy chọn)
-          </label>
-          <textarea
-            id="import-default-vid-prompt"
-            class="input prompt"
-            rows="2"
-            placeholder="Nhập prompt chuyển động chung nếu muốn..."
-            bind:value={defaultImportPromptVid}
-          ></textarea>
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-secondary"
-      disabled={importingInput}
-      on:click={() => (scanModalOpen = false)}
-    >
-      Đóng
-    </button>
-    {#if untrackedItems.length > 0}
-      <button
-        type="button"
-        class="btn-primary"
-        disabled={selectedImportNames.size === 0 || importingInput || $running}
-        on:click={executeBatchImport}
-      >
-        <Icons name="plus" size={15} />
-        {importingInput
-          ? "Đang nhập..."
-          : `Nhập ${selectedImportNames.size} ảnh vào CSV`}
-      </button>
-    {/if}
-  </div>
-</Modal>
+  on:imported={(e) => void handleInputImagesImported(e.detail.count)}
+/>
 
 <!-- (C) Modal So sánh phiên bản v1 vs v2 cạnh nhau (mục 6.11, TC-08 - 860px) -->
-<Modal
+<RowCompareModal
   open={compareModalOpen}
-  title={`So sánh phiên bản — ${detail?.row.row_key ?? ""}`}
-  width="860px"
-  disableClose={switchingVersion}
+  rowKey={detail?.row.row_key ?? ""}
+  {imageVersions}
+  {videoVersions}
+  initialKind={compareInitialKind}
+  rev={rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)}
+  running={$running}
+  {switchingVersion}
   on:close={() => (compareModalOpen = false)}
->
-  <div class="modal-stack">
-    {#if imageVersions.length >= 2 && videoVersions.length >= 2}
-      <div class="compare-kind-tabs">
-        <button
-          type="button"
-          class="chip"
-          class:active={compareKind === "image"}
-          on:click={() => switchCompareKind("image")}
-        >
-          <Icons name="image" size={14} />
-          Ảnh sản phẩm ({imageVersions.length})
-        </button>
-        <button
-          type="button"
-          class="chip"
-          class:active={compareKind === "video"}
-          on:click={() => switchCompareKind("video")}
-        >
-          <Icons name="video" size={14} />
-          Video sản phẩm ({videoVersions.length})
-        </button>
-      </div>
-    {/if}
-
-    <div class="compare-grid">
-      <!-- Cột trái -->
-      <div class="compare-pane">
-        <div class="compare-pane-head">
-          <label class="compare-lbl" for="compare-left-select">Phiên bản A:</label>
-          <select id="compare-left-select" bind:value={compareLeftVer}>
-            {#each compareCandidates as v (v.version)}
-              <option value={v.version}>
-                v{v.version} — {v.file_name}{v.is_current ? " (Bản chính)" : ""}
-              </option>
-            {/each}
-          </select>
-        </div>
-
-        {#if compareLeftItem}
-          {@const compareRev = rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)}
-          <div class="compare-stage">
-            {#if compareKind === "video"}
-              {#key `left-${compareLeftItem.abs_path}-${compareRev}`}
-                <video
-                  controls
-                  preload="metadata"
-                  src={toAssetUrl(compareLeftItem.abs_path, compareRev)}
-                >
-                  <track kind="captions" />
-                </video>
-              {/key}
-            {:else}
-              <img
-                src={toAssetUrl(compareLeftItem.abs_path, compareRev)}
-                alt={`Phiên bản v${compareLeftItem.version}`}
-              />
-            {/if}
-          </div>
-          <div class="compare-pane-foot">
-            <div class="compare-meta">
-              <span class="ver-tag">v{compareLeftItem.version}</span>
-              {#if compareLeftItem.is_current}
-                <span class="current-pill">Đang là bản chính</span>
-              {/if}
-              {#if compareLeftItem.size_bytes}
-                <span>{formatBytes(compareLeftItem.size_bytes)}</span>
-              {/if}
-            </div>
-            <button
-              type="button"
-              class="btn-secondary small-btn"
-              disabled={compareLeftItem.is_current || $running || switchingVersion}
-              on:click={() =>
-                compareLeftItem &&
-                setAsCurrentVersion(compareLeftItem.kind, compareLeftItem.version)}
-            >
-              <Icons name="check" size={13} />
-              {compareLeftItem.is_current ? "Đang dùng" : "Chọn bản này làm chính"}
-            </button>
-          </div>
-        {/if}
-      </div>
-
-      <!-- Cột phải -->
-      <div class="compare-pane">
-        <div class="compare-pane-head">
-          <label class="compare-lbl" for="compare-right-select">Phiên bản B:</label>
-          <select id="compare-right-select" bind:value={compareRightVer}>
-            {#each compareCandidates as v (v.version)}
-              <option value={v.version}>
-                v{v.version} — {v.file_name}{v.is_current ? " (Bản chính)" : ""}
-              </option>
-            {/each}
-          </select>
-        </div>
-
-        {#if compareRightItem}
-          {@const compareRev = rowRev(detail?.row.row_key, $rowAssetRevs, $assetCacheBust)}
-          <div class="compare-stage">
-            {#if compareKind === "video"}
-              {#key `right-${compareRightItem.abs_path}-${compareRev}`}
-                <video
-                  controls
-                  preload="metadata"
-                  src={toAssetUrl(compareRightItem.abs_path, compareRev)}
-                >
-                  <track kind="captions" />
-                </video>
-              {/key}
-            {:else}
-              <img
-                src={toAssetUrl(compareRightItem.abs_path, compareRev)}
-                alt={`Phiên bản v${compareRightItem.version}`}
-              />
-            {/if}
-          </div>
-          <div class="compare-pane-foot">
-            <div class="compare-meta">
-              <span class="ver-tag">v{compareRightItem.version}</span>
-              {#if compareRightItem.is_current}
-                <span class="current-pill">Đang là bản chính</span>
-              {/if}
-              {#if compareRightItem.size_bytes}
-                <span>{formatBytes(compareRightItem.size_bytes)}</span>
-              {/if}
-            </div>
-            <button
-              type="button"
-              class="btn-secondary small-btn"
-              disabled={compareRightItem.is_current || $running || switchingVersion}
-              on:click={() =>
-                compareRightItem &&
-                setAsCurrentVersion(compareRightItem.kind, compareRightItem.version)}
-            >
-              <Icons name="check" size={13} />
-              {compareRightItem.is_current ? "Đang dùng" : "Chọn bản này làm chính"}
-            </button>
-          </div>
-        {/if}
-      </div>
-    </div>
-  </div>
-
-  <div slot="footer" class="modal-footer-bar">
-    <button
-      type="button"
-      class="btn-primary"
-      on:click={() => (compareModalOpen = false)}
-    >
-      Đóng
-    </button>
-  </div>
-</Modal>
+  on:setCurrent={(e) => void setAsCurrentVersion(e.detail.kind, e.detail.version)}
+/>
 
 <!-- (D) Cửa sổ xem ảnh phóng lớn Zoom 25%–400% & Drag-to-Pan (mục 6.11, TC-17) -->
-<Modal
+<ImageLightboxModal
   open={lightboxOpen}
   title={lightboxTitle}
-  width="880px"
+  absPath={lightboxAbsPath}
+  url={lightboxUrl}
   on:close={() => (lightboxOpen = false)}
->
-  <div class="lightbox-toolbar">
-    <div class="zoom-controls">
-      <button
-        type="button"
-        class="btn-secondary zoom-btn"
-        disabled={zoomScale <= 0.25}
-        aria-label="Thu nhỏ ảnh"
-        on:click={() => adjustZoom(-0.25)}
-      >
-        <Icons name="zoom-out" size={15} />
-      </button>
-      <span class="zoom-readout">{Math.round(zoomScale * 100)}%</span>
-      <button
-        type="button"
-        class="btn-secondary zoom-btn"
-        disabled={zoomScale >= 4}
-        aria-label="Phóng to ảnh"
-        on:click={() => adjustZoom(0.25)}
-      >
-        <Icons name="zoom-in" size={15} />
-      </button>
-      <button
-        type="button"
-        class="btn-ghost tiny-btn"
-        on:click={resetLightboxZoom}
-      >
-        100% / Vừa khung
-      </button>
-    </div>
-    <span class="zoom-hint">Lăn chuột để zoom (25%–400%) · Kéo chuột để di chuyển · Nhấp đúp đổi 100%/200%</span>
-  </div>
-
-  <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
-  <div
-    class="lightbox-viewport"
-    class:grabbing={isPanning}
-    role="application"
-    aria-label="Khung phóng to và kéo xem ảnh"
-    on:wheel={onLightboxWheel}
-    on:dblclick={toggleDoubleClickZoom}
-    on:pointerdown={onLightboxPointerDown}
-    on:pointermove={onLightboxPointerMove}
-    on:pointerup={onLightboxPointerUp}
-    on:pointercancel={onLightboxPointerUp}
-  >
-    {#if lightboxUrl}
-      <img
-        class="lightbox-img"
-        src={lightboxUrl}
-        alt={lightboxTitle}
-        draggable="false"
-        style="transform: translate({panX}px, {panY}px) scale({zoomScale});"
-      />
-    {/if}
-  </div>
-
-  <div slot="footer" class="modal-footer-bar">
-    {#if lightboxAbsPath}
-      <button
-        type="button"
-        class="btn-secondary"
-        on:click={() => revealInExplorer(lightboxAbsPath)}
-      >
-        <Icons name="folder-open" size={15} />
-        Hiện trong thư mục
-      </button>
-    {/if}
-    <button
-      type="button"
-      class="btn-primary"
-      on:click={() => (lightboxOpen = false)}
-    >
-      Đóng
-    </button>
-  </div>
-</Modal>
+  on:reveal={(e) => void revealInExplorer(e.detail)}
+/>
 
 <!-- (E) Modal xem video lớn trong màn Dòng việc kèm prompt và metadata (UI-3) -->
-<Modal
+<RowVideoModal
   open={videoModalOpen}
-  title={`Chi tiết video — ${videoModalTitle}`}
-  width="880px"
+  title={videoModalTitle}
+  absPath={videoModalAbsPath}
+  url={videoModalUrl}
+  fileName={videoModalFileName}
+  promptImage={videoModalPromptImage}
+  promptVideo={videoModalPromptVideo}
+  initialDurationSec={videoModalDurationSec}
+  initialResolution={videoModalResolution}
+  accountUsed={videoModalAccount}
   on:close={closeVideoModal}
->
-  <div class="video-modal-layout">
-    <div class="video-player-pane">
-      {#if videoModalUrl}
-        <div class="video-frame-9-16">
-          <video
-            bind:this={videoPlayerEl}
-            class="large-video-player"
-            controls
-            autoplay
-            playsinline
-            src={videoModalUrl}
-            on:loadedmetadata={handleModalVideoMetadata}
-          >
-            <track kind="captions" />
-          </video>
-        </div>
-      {:else}
-        <div class="video-missing-box">
-          <Icons name="alert" size={32} />
-          <span>Không tìm thấy file video trên ổ đĩa</span>
-        </div>
-      {/if}
-    </div>
-
-    <div class="video-meta-pane">
-      <!-- Thẻ thông số video (Metadata) -->
-      <div class="video-meta-card">
-        <h3 class="meta-card-title">Thông số video</h3>
-        <dl class="meta-grid">
-          <div class="meta-grid-row">
-            <dt class="meta-key">Tên file</dt>
-            <dd class="meta-val file-val selectable" title={videoModalAbsPath ?? videoModalFileName}>
-              {videoModalFileName || "—"}
-            </dd>
-          </div>
-          <div class="meta-grid-row">
-            <dt class="meta-key">Thời lượng</dt>
-            <dd class="meta-val">
-              {videoModalDurationSec ? formatSecs(videoModalDurationSec) : "—"}
-            </dd>
-          </div>
-          <div class="meta-grid-row">
-            <dt class="meta-key">Độ phân giải</dt>
-            <dd class="meta-val">
-              {#if videoModalWidth && videoModalHeight}
-                {videoModalWidth}×{videoModalHeight} ({formatAspectRatio(videoModalWidth, videoModalHeight)})
-              {:else}
-                —
-              {/if}
-            </dd>
-          </div>
-          <div class="meta-grid-row">
-            <dt class="meta-key">Tài khoản tạo</dt>
-            <dd class="meta-val">
-              {videoModalAccount || "Tài khoản Muse mặc định"}
-            </dd>
-          </div>
-        </dl>
-      </div>
-
-      <!-- Ô hiển thị nguyên văn "Prompt tạo ảnh" kèm nút copy -->
-      <div class="prompt-box-card">
-        <div class="prompt-box-head">
-          <span class="prompt-box-label">Prompt tạo ảnh</span>
-          <button
-            type="button"
-            class="btn-ghost copy-prompt-btn"
-            title="Sao chép prompt tạo ảnh"
-            on:click={() => copyModalPrompt("image")}
-          >
-            {#if copiedImagePrompt}
-              <Icons name="check" size={13} />
-              <span class="copy-status-text">Đã sao chép</span>
-            {:else}
-              <Icons name="copy" size={13} />
-              <span>Sao chép</span>
-            {/if}
-          </button>
-        </div>
-        <div class="prompt-box-body selectable">
-          {videoModalPromptImage || "(trống)"}
-        </div>
-      </div>
-
-      <!-- Ô hiển thị nguyên văn "Prompt tạo video" kèm nút copy -->
-      <div class="prompt-box-card">
-        <div class="prompt-box-head">
-          <span class="prompt-box-label">Prompt tạo video</span>
-          <button
-            type="button"
-            class="btn-ghost copy-prompt-btn"
-            title="Sao chép prompt tạo video"
-            on:click={() => copyModalPrompt("video")}
-          >
-            {#if copiedVideoPrompt}
-              <Icons name="check" size={13} />
-              <span class="copy-status-text">Đã sao chép</span>
-            {:else}
-              <Icons name="copy" size={13} />
-              <span>Sao chép</span>
-            {/if}
-          </button>
-        </div>
-        <div class="prompt-box-body selectable">
-          {videoModalPromptVideo || "(trống)"}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div slot="footer" class="modal-footer-bar">
-    {#if videoModalAbsPath}
-      <button
-        type="button"
-        class="btn-secondary"
-        on:click={() => revealInExplorer(videoModalAbsPath)}
-      >
-        <Icons name="folder-open" size={15} />
-        Hiện trong thư mục
-      </button>
-    {/if}
-    <button
-      type="button"
-      class="btn-primary"
-      on:click={closeVideoModal}
-    >
-      Đóng
-    </button>
-  </div>
-</Modal>
+  on:reveal={(e) => void revealInExplorer(e.detail)}
+/>
 
 <style>
   .rows-screen {
@@ -4482,375 +3812,9 @@
     width: 100%;
   }
 
-  .scan-empty {
-    padding: 28px 16px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    gap: 8px;
-    color: var(--c-green);
-  }
-  .scan-empty-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--c-text);
-  }
-  .scan-empty p {
-    font-size: var(--fs-label);
-    color: var(--c-muted);
-  }
-  .scan-head-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    font-size: var(--fs-label);
-  }
-  .scan-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
-    gap: 8px;
-    max-height: 240px;
-    overflow-y: auto;
-    padding: 2px;
-  }
-  .scan-item {
-    border: 1px solid var(--c-border);
-    border-radius: 8px;
-    padding: 7px 9px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    cursor: pointer;
-    background: #fff;
-  }
-  .scan-item.picked {
-    border-color: var(--c-teal);
-    background: var(--c-teal-subtle);
-  }
-  .scan-thumb {
-    width: 38px;
-    height: 38px;
-    border-radius: 6px;
-    overflow: hidden;
-    background: var(--c-surface-subtle);
-    flex-shrink: 0;
-  }
-  .scan-thumb img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-  .scan-meta {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-  .scan-name {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--c-text);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .scan-size {
-    font-size: 11px;
-    color: var(--c-muted);
-  }
-  .scan-prompts {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-
-  .compare-kind-tabs {
-    display: flex;
-    gap: 8px;
-  }
-  .compare-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 14px;
-  }
-  .compare-pane {
-    border: 1px solid var(--c-border);
-    border-radius: 10px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    background: var(--c-surface-subtle);
-  }
-  .compare-pane-head {
-    padding: 8px 10px;
-    background: var(--c-card);
-    border-bottom: 1px solid var(--c-border);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .compare-lbl {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--c-muted);
-    white-space: nowrap;
-  }
-  .compare-pane-head select {
-    flex: 1;
-    height: 32px;
-    font-size: 12.5px;
-    min-width: 0;
-  }
-  .compare-stage {
-    height: 320px;
-    background: #0d1520;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 8px;
-    overflow: hidden;
-  }
-  .compare-stage img,
-  .compare-stage video {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-    display: block;
-  }
-  .compare-pane-foot {
-    padding: 8px 10px;
-    background: var(--c-card);
-    border-top: 1px solid var(--c-border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .compare-meta {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--c-muted);
-  }
-
-  .lightbox-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 8px;
-    flex-wrap: wrap;
-  }
-  .zoom-controls {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .zoom-btn {
-    width: 32px;
-    height: 32px;
-    padding: 0;
-  }
-  .zoom-readout {
-    min-width: 52px;
-    text-align: center;
-    font-size: 13px;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    color: var(--c-text);
-  }
-  .zoom-hint {
-    font-size: 11.5px;
-    color: var(--c-muted);
-  }
-  .lightbox-viewport {
-    height: 62vh;
-    background: #0d1520;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    cursor: grab;
-    touch-action: none;
-  }
-  .lightbox-viewport.grabbing {
-    cursor: grabbing;
-  }
-  .lightbox-img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-    display: block;
-    transform-origin: center center;
-    transition: transform 0.05s linear;
-    user-select: none;
-  }
-
-  /* (E) Modal xem video lớn (UI-3) */
-  .video-modal-layout {
-    display: grid;
-    grid-template-columns: 310px 1fr;
-    gap: 20px;
-    align-items: start;
-    min-height: 480px;
-  }
-  .video-player-pane {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    background: #090e17;
-    border: 1px solid var(--c-border);
-    border-radius: var(--r-card);
-    padding: 10px;
-  }
-  .video-frame-9-16 {
-    width: 100%;
-    max-width: 280px;
-    aspect-ratio: 9 / 16;
-    background: #000;
-    border-radius: 8px;
-    overflow: hidden;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-  }
-  .large-video-player {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    background: #000;
-  }
-  .video-missing-box {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    min-height: 260px;
-    color: var(--c-muted);
-    font-size: var(--fs-hint);
-    text-align: center;
-    padding: 20px;
-  }
   .grid-err-text {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .video-meta-pane {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    min-width: 0;
-  }
-  .video-meta-card {
-    background: var(--c-surface-subtle);
-    border: 1px solid var(--c-border);
-    border-radius: var(--r-card);
-    padding: 14px 16px;
-  }
-  .meta-card-title {
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--c-text);
-    margin: 0 0 10px 0;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .meta-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 10px 16px;
-    margin: 0;
-  }
-  .meta-grid-row {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-  .meta-key {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--c-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-  }
-  .meta-val {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--c-text);
-    margin: 0;
-    word-break: break-all;
-  }
-  .file-val {
-    font-family: var(--font-mono, monospace);
-    font-size: 12px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .prompt-box-card {
-    background: var(--c-surface-subtle);
-    border: 1px solid var(--c-border);
-    border-radius: var(--r-card);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  .prompt-box-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--c-border);
-    background: var(--c-card);
-  }
-  .prompt-box-label {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--c-text);
-  }
-  .copy-prompt-btn {
-    padding: 3px 8px;
-    height: 24px;
-    font-size: 11px;
-    font-weight: 600;
-    border-radius: 4px;
-    gap: 4px;
-  }
-  .copy-status-text {
-    color: var(--c-green);
-    font-weight: 700;
-  }
-  .prompt-box-body {
-    padding: 10px 12px;
-    font-size: 12px;
-    line-height: 1.5;
-    color: var(--c-text);
-    max-height: 115px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: var(--c-card);
-  }
-
-  @media (max-width: 820px) {
-    .scan-prompts,
-    .compare-grid {
-      grid-template-columns: 1fr;
-    }
-    .video-modal-layout {
-      grid-template-columns: 1fr;
-    }
-    .video-frame-9-16 {
-      max-width: 240px;
-    }
   }
 </style>

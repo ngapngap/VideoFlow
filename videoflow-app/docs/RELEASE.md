@@ -12,8 +12,8 @@
 #    - videoflow-app/sidecar/pyproject.toml               (version = "...")
 git add -A && git commit -m "feat: mô tả thay đổi"
 git push origin main
-git tag -a v1.5.1 -m "VideoFlow Desktop v1.5.1"
-git push origin v1.5.1        # ← trigger Release workflow (hoặc chạy tay qua workflow_dispatch với input version)
+git tag -a v1.5.4 -m "VideoFlow Desktop v1.5.4"
+git push origin v1.5.4        # ← trigger Release workflow (hoặc chạy tay qua workflow_dispatch với input version)
 ```
 
 `release.yml` chạy qua 2 giai đoạn trên runner `windows-latest` (khóa `concurrency` nhóm `release-windows`, không chạy song song hai bản phát hành):
@@ -31,7 +31,7 @@ git push origin v1.5.1        # ← trigger Release workflow (hoặc chạy tay 
   4. `npm ci`, kiểm tra secret `TAURI_SIGNING_PRIVATE_KEY` (`Verify updater signing key secret`), rồi chạy `tauri-action` (`--target x86_64-pc-windows-msvc`):
      - Build bộ cài NSIS (`VideoFlow Desktop_<ver>_x64-setup.exe`; trên GitHub Releases được chuẩn hóa tên thành `VideoFlow.Desktop_<ver>_x64-setup.exe`).
      - **Ký updater** bằng `TAURI_SIGNING_PRIVATE_KEY` → `*.exe.sig`.
-     - Tạo **Draft Release** (`releaseDraft: true`) kèm `latest.json` để kiểm tra lần cuối trước khi bấm Publish trên GitHub.
+     - **Tự động phát hành Release** (`releaseDraft: false`) kèm `latest.json` ngay khi `verify` và `build` xanh (có thể đổi sang `true` trong `.github/workflows/release.yml` nếu muốn giữ Draft để kiểm tra thủ công trước).
 
 ## Secrets bắt buộc
 

@@ -15,5 +15,20 @@ export default defineConfig({
     target: "chrome105",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules")) {
+            return "vendor";
+          }
+          if (id.includes("/src/screens/Settings.svelte")) {
+            return "screen-settings";
+          }
+          if (id.includes("/src/screens/Rows.svelte")) {
+            return "screen-rows";
+          }
+        },
+      },
+    },
   },
 });

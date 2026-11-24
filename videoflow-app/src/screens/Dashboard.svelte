@@ -638,7 +638,7 @@
       </div>
     </div>
 
-    <!-- Khối tiến độ trực tiếp (mục 6.14 + hiển thị luồng song song 1..3) -->
+    <!-- Khối tiến độ trực tiếp (mục 6.14 + hiển thị luồng song song) -->
     <div class="card progress-block" class:active-run={$running}>
       {#if $running}
         <div class="progress-head">
@@ -648,7 +648,11 @@
               Lượt chạy hiện tại{$currentRun?.run_id || $currentRun?.id ? ` #${$currentRun?.run_id ?? $currentRun?.id}` : ""}
             </span>
             {#if activeEntries.length <= 1 && $progressStep?.step}
-              <span class="badge badge-image">{formatStepBadge($progressStep.step)}</span>
+              <span
+                class="badge"
+                class:badge-video={$progressStep.step === "B3" || $progressStep.step === "download"}
+                class:badge-image={$progressStep.step !== "B3" && $progressStep.step !== "download"}
+              >{formatStepBadge($progressStep.step)}</span>
             {/if}
             {#if activeEntries.length <= 1 && $progressStep?.rowKey}
               <span class="row-pill selectable" title="Dòng đang xử lý">

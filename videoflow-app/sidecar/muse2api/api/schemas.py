@@ -135,7 +135,7 @@ class VideoCreateRequest(_Lenient):
 
 class AccountCreate(BaseModel):
     label: str = ""
-    # Three accepted formats (TODO D1):
+    # Three accepted formats:
     #   1. dict {"name": "value"}
     #   2. raw "Cookie" request header string "a=1; b=2"
     #   3. list of cookie-export entries (e.g. EditThisCookie):

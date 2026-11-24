@@ -16,7 +16,7 @@ pub fn open(project_path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
     // Luôn bật foreign_keys, WAL và busy_timeout trên MỌI kết nối mở ra (kể cả khi user_version >= SCHEMA_VERSION)
-    // để 1–3 luồng worker song song + luồng đọc UI không bao giờ đụng SQLITE_BUSY hay sót WAL.
+    // để nhiều luồng worker song song + luồng đọc UI không bao giờ đụng SQLITE_BUSY hay sót WAL.
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
