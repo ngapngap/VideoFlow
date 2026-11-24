@@ -425,7 +425,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.5.4";
+  let appVersion = "1.5.5";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;

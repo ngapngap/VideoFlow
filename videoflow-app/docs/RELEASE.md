@@ -12,8 +12,8 @@
 #    - videoflow-app/sidecar/pyproject.toml               (version = "...")
 git add -A && git commit -m "feat: mô tả thay đổi"
 git push origin main
-git tag -a v1.5.4 -m "VideoFlow Desktop v1.5.4"
-git push origin v1.5.4        # ← trigger Release workflow (hoặc chạy tay qua workflow_dispatch với input version)
+git tag -a v1.5.5 -m "VideoFlow Desktop v1.5.5"
+git push origin v1.5.5        # ← trigger Release workflow (hoặc chạy tay qua workflow_dispatch với input version)
 ```
 
 `release.yml` chạy qua 2 giai đoạn trên runner `windows-latest` (khóa `concurrency` nhóm `release-windows`, không chạy song song hai bản phát hành):

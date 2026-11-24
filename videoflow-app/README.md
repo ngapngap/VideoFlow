@@ -1,8 +1,8 @@
-# VideoFlow Desktop (v1.5.4 — Full Option)
+# VideoFlow Desktop (v1.5.5 — Full Option)
 
 Ứng dụng Desktop tự động hóa quy trình **Tạo Ảnh → Tạo Video (Local-Only)** triển khai đầy đủ theo **Bản thiết kế v1.3**, **Phụ lục chốt v1.3.1** và **Kế hoạch nâng cấp v1.5.x**, xây dựng trên nền tảng **Tauri v2 (Rust)** + **Svelte 4 / TypeScript**.
 
-**Từ v1.4.0 – v1.5.4:** tích hợp engine nội bộ **VideoFlow Muse** (đóng gói kèm app) — quản lý pool tài khoản/cookie muse.ai với **hồ sơ trình duyệt (profile) và proxy riêng từng tài khoản**, đăng nhập trực tiếp trên trình duyệt có giao diện để tự bắt token, tạo **video** và **ảnh (`muse-image`)**, **pipeline 2 tầng tạo ảnh/video song song độc lập** (đa luồng giới hạn tối đa 1 video / tài khoản Muse), nối cảnh liên tục (`noi_canh`), tự động ghép video sau batch (`auto_merge` qua FFmpeg), theo dõi hạn mức và **tự cập nhật** qua GitHub Releases.
+**Từ v1.4.0 – v1.5.5:** tích hợp engine nội bộ **VideoFlow Muse** (đóng gói kèm app) — quản lý pool tài khoản/cookie muse.ai với **hồ sơ trình duyệt (profile) và proxy riêng từng tài khoản**, đăng nhập trực tiếp trên trình duyệt có giao diện để tự bắt token, tạo **video** và **ảnh (`muse-image`)**, **pipeline 2 tầng tạo ảnh/video song song độc lập** (đa luồng giới hạn tối đa 1 video / tài khoản Muse), nối cảnh liên tục (`noi_canh`), tự động ghép video sau batch (`auto_merge` qua FFmpeg), theo dõi hạn mức và **tự cập nhật** qua GitHub Releases.
 
 Phát hành: xem [`docs/RELEASE.md`](docs/RELEASE.md) · Tải bản mới: https://github.com/ngapngap/VideoFlow/releases/latest
 
@@ -53,9 +53,9 @@ Các tính năng **Nối cảnh (`noi_canh`)** và **Tự động ghép video sa
 
 ---
 
-## Kiến trúc & Toàn bộ Tính năng (v1.5.4 — Full Option)
+## Kiến trúc & Toàn bộ Tính năng (v1.5.5 — Full Option)
 
-| Thành phần | File nguồn | Mô tả theo thiết kế (v1.3 + Phụ lục v1.3.1 + v1.5.4) |
+| Thành phần | File nguồn | Mô tả theo thiết kế (v1.3 + Phụ lục v1.3.1 + v1.5.5) |
 |---|---|---|
 | **Tauri v2 ACL, Asset Protocol & CSP** | `src-tauri/capabilities/default.json`, `tauri.conf.json`, `Cargo.toml` | Khai báo quyền tối giản (`core:default`, `core:event:default`) — toàn bộ thao tác hệ thống đi qua Rust IPC commands; giao thức `asset:` kèm cache-busting theo từng dòng (`rowAssetRevs`) và chính sách CSP bảo mật trên WebView2. |
 | **SQLite State DB (Schema v4 + Auto-Cleanup)** | `src-tauri/src/state_db.rs` | 6 bảng nghiệp vụ + `meta`, bật `WAL`, `foreign_keys`, `busy_timeout = 5000ms` trên mọi kết nối; mở nhanh qua `PRAGMA user_version`, tự động migrate `v1 → v4` (`video_task_id`, `video_download_url`, trạng thái `loi_tam_thoi`, bước `auto_merge`), phục hồi lượt gián đoạn (`recover_interrupted_runs`) và tự dọn lịch sử quá hạn (`cleanup_old_history`) bảo toàn 100% `file_refs` & job mới nhất của từng dòng. |
