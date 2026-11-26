@@ -131,6 +131,10 @@ export interface RowDetail {
   video_duration?: number | null;
   video_resolution?: string | null;
   account_used?: string | null;
+  plugin_operation_id?: string | null;
+  plugin_owner?: string | null;
+  plugin_operation_status?: string | null;
+  recoverable_media_id?: string | null;
 }
 
 export interface DryRunResult {
@@ -247,6 +251,29 @@ export interface SettingsView {
   ffmpeg_resolved_path?: string | null;
 }
 
+// Plugin Host Contract v1. Manifest JSON is kept extensible so newer manifest
+// fields can be shown without coupling the UI to a particular provider.
+export interface PluginAction { id: string; label: string; scope?: "instance" | "job"; confirm?: string | boolean }
+export interface PluginManifest {
+  id: string; name: string; version: string; plugin_api_version: string;
+  min_core_version?: string | null; bundled?: boolean; config_schema?: Record<string, unknown>;
+  actions?: PluginAction[]; permissions?: string[]; [key: string]: unknown;
+}
+export interface PluginInstance {
+  plugin_id: string; instance_id: string; enabled: boolean; trusted: boolean; bundled?: boolean;
+  health?: string; origin?: string | null; reason?: string | null;
+  config?: Record<string, unknown>; configured_secrets?: string[];
+  restart_required?: boolean; [key: string]: unknown;
+}
+export interface PluginStatus {
+  plugin_id: string; instance_id: string; running: boolean; health: string;
+  origin?: string | null; reason?: string | null; pid?: number | null;
+  checks?: Record<string, { status: string; message?: string }> | null; [key: string]: unknown;
+}
+export interface PluginSummary {
+  manifest: PluginManifest; bundled?: boolean; instances: PluginInstance[]; error?: string | null;
+}
+
 // ━━ VideoFlow Muse nội bộ (engine + pool cookie + hạn mức) ━━
 
 export interface SidecarStatus {
@@ -358,6 +385,29 @@ export interface MuseQuotaSnapshot {
 }
 
 export const api = {
+  plugin_list: () => invoke<PluginSummary[]>("plugin_list"),
+  plugin_add_instance: (pluginId: string, instanceId: string) =>
+    invoke<PluginInstance>("plugin_add_instance", { pluginId, instanceId }),
+  plugin_remove_instance: (pluginId: string, instanceId: string) =>
+    invoke<boolean>("plugin_remove_instance", { pluginId, instanceId }),
+  plugin_set_trust: (pluginId: string, instanceId: string, trusted: boolean) =>
+    invoke<PluginInstance>("plugin_set_trust", { pluginId, instanceId, trusted }),
+  plugin_set_enabled: (pluginId: string, instanceId: string, enabled: boolean) =>
+    invoke<PluginInstance>("plugin_set_enabled", { pluginId, instanceId, enabled }),
+  plugin_start: (pluginId: string, instanceId: string) =>
+    invoke<PluginStatus>("plugin_start", { pluginId, instanceId }),
+  plugin_stop: (pluginId: string, instanceId: string) =>
+    invoke<PluginStatus>("plugin_stop", { pluginId, instanceId }),
+  plugin_status: (pluginId: string, instanceId: string) =>
+    invoke<PluginStatus>("plugin_status", { pluginId, instanceId }),
+  plugin_capabilities: (pluginId: string, instanceId: string) =>
+    invoke<Record<string, any>>("plugin_capabilities", { pluginId, instanceId }),
+  plugin_quota: (pluginId: string, instanceId: string) =>
+    invoke<Record<string, any>>("plugin_quota", { pluginId, instanceId }),
+  plugin_save_config: (pluginId: string, instanceId: string, config: Record<string, unknown>, secrets: Record<string, string>) =>
+    invoke<PluginInstance>("plugin_save_config", { pluginId, instanceId, config, secrets }),
+  plugin_action: (pluginId: string, instanceId: string, actionId: string, payload: Record<string, unknown> = {}) =>
+    invoke<Record<string, any>>("plugin_action", { pluginId, instanceId, actionId, payload }),
   list_recent_projects: () => invoke<RecentProject[]>("list_recent_projects"),
   remove_recent_project: (path: string) => invoke<boolean>("remove_recent_project", { path }),
   load_project: (path?: string) => invoke<ProjectInfo>("load_project", { path }),
@@ -389,6 +439,8 @@ export const api = {
   run_row: (rowKey: string) => invoke<number>("run_row", { rowKey }),
   rerun_row_step: (rowKey: string, step: "anh" | "video") =>
     invoke<number>("rerun_row_step", { rowKey, step }),
+  recover_row_media: (rowKey: string) =>
+    invoke<{ operation_id?: string; owner?: string; status?: string; task_id?: string }>("recover_row_media", { rowKey }),
   stop_run: () => invoke<boolean>("stop_run"),
   is_running: () => invoke<boolean>("is_running"),
   engine_done: () => invoke<void>("engine_done"),

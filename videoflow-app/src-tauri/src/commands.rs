@@ -213,6 +213,10 @@ pub struct RowDetail {
     pub video_duration: Option<f64>,
     pub video_resolution: Option<String>,
     pub account_used: Option<String>,
+    pub plugin_operation_id: Option<String>,
+    pub plugin_owner: Option<String>,
+    pub plugin_operation_status: Option<String>,
+    pub recoverable_media_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -964,6 +968,25 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
     {
         related_keys.push(legacy_low);
     }
+    let plugin_op = related_keys.iter().find_map(|key| {
+        crate::state_db::load_plugin_operation(&conn, key, "B3")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                crate::state_db::load_plugin_operation(&conn, key, "B2")
+                    .ok()
+                    .flatten()
+            })
+    });
+    let recoverable_media_id = plugin_op
+        .as_ref()
+        .and_then(|op| op.error_json.as_deref())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|v| {
+            v.get("recoverable_media_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned)
+        });
 
     let mut timeline = Vec::new();
     let mut seen_attempt_ids = std::collections::HashSet::<i64>::new();
@@ -1105,6 +1128,10 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
         video_duration,
         video_resolution,
         account_used,
+        plugin_operation_id: plugin_op.as_ref().map(|op| op.operation_id.clone()),
+        plugin_owner: plugin_op.as_ref().map(|op| op.owner.clone()),
+        plugin_operation_status: plugin_op.as_ref().map(|op| op.status.clone()),
+        recoverable_media_id,
     })
 }
 
@@ -1112,6 +1139,16 @@ pub fn build_row_detail_at(p: &Path, row_key: &str) -> AppResult<RowDetail> {
 pub fn get_row_detail(row_key: String, state: State<'_, AppState>) -> AppResult<RowDetail> {
     let p = project_path(&state)?;
     build_row_detail_at(&p, &row_key)
+}
+
+#[tauri::command]
+pub fn recover_row_media(
+    row_key: String,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    let p = project_path(&state)?;
+    let cfg = state.settings_cache.read().clone();
+    engine::recover_row_media(&cfg, &p, &row_key)
 }
 
 pub fn set_current_file_version_at(
@@ -1604,6 +1641,45 @@ pub fn rerun_row_step(
 pub fn stop_run(state: State<'_, AppState>) -> AppResult<bool> {
     if let Some(flag) = state.stop_flag.read().clone() {
         flag.store(true, Ordering::SeqCst);
+        let run_id = state.active_run_id.load(Ordering::SeqCst);
+        if run_id > 0 {
+            if let Some(project) = state.project.read().clone() {
+                let conn = crate::state_db::open(&project).map_err(|e| {
+                    AppError::new(
+                        "DB_FAIL",
+                        format!("Không mở được state.db để lưu yêu cầu STOP: {e}"),
+                    )
+                })?;
+                let operations = crate::state_db::request_run_plugin_operation_stops(&conn, run_id)
+                    .map_err(|e| {
+                        AppError::new(
+                            "DB_FAIL",
+                            format!("Không lưu được yêu cầu STOP cho plugin: {e}"),
+                        )
+                    })?;
+                drop(conn);
+                for op in operations {
+                    let project = project.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(result) =
+                            crate::plugins::client::cancel(&op.owner, &op.operation_id)
+                        {
+                            let status = result["status"]
+                                .as_str()
+                                .unwrap_or("reconcile_needed")
+                                .to_owned();
+                            if let Ok(db) = crate::state_db::open(&project) {
+                                let _ = crate::state_db::confirm_plugin_operation_stop(
+                                    &db,
+                                    &op.operation_id,
+                                    &status,
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
         Ok(true)
     } else {
         Ok(false)

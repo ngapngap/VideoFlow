@@ -92,6 +92,7 @@
   let draftPromptVideo = "";
   let savingPrompts = false;
   let actionBusy = false;
+  let recoveringPluginMedia = false;
 
   // Hộp xác nhận đóng/chuyển Drawer khi prompt đang sửa dở
   let unsavedPromptModalOpen = false;
@@ -751,6 +752,17 @@
     } finally {
       actionBusy = false;
     }
+  }
+
+  async function recoverPluginMedia(): Promise<void> {
+    if (!detail || !detail.recoverable_media_id || $running || recoveringPluginMedia) return;
+    recoveringPluginMedia = true;
+    try {
+      await api.recover_row_media(detail.row.row_key);
+      detail = await api.get_row_detail(detail.row.row_key);
+      showToast("info", "Đã yêu cầu plugin khôi phục media; trạng thái sẽ được cập nhật khi hoàn tất.");
+    } catch (e) { showToast("error", formatApiError(e)); }
+    finally { recoveringPluginMedia = false; }
   }
 
   async function confirmResetStatus(): Promise<void> {
@@ -1864,6 +1876,23 @@
               <span>Thông điệp lỗi gần nhất</span>
             </div>
             <div>{detail.row.last_error}</div>
+          </div>
+        {/if}
+
+        {#if detail.plugin_operation_status}
+          <div class="error-box selectable">
+            <div class="error-box-head"><Icons name="alert" size={14} /><span>Thao tác plugin · {detail.plugin_operation_status}</span></div>
+            {#if detail.plugin_owner}<div>Instance: <code>{detail.plugin_owner}</code></div>{/if}
+            {#if detail.plugin_operation_id}<div>ID thao tác: <code>{detail.plugin_operation_id}</code></div>{/if}
+            {#if detail.plugin_operation_status === "reconcile_needed" || detail.plugin_operation_status === "abandoned"}
+              <div>Đối soát thao tác này trên đúng instance trước khi tạo lại để tránh gửi lệnh sinh trùng.</div>
+            {/if}
+            {#if detail.recoverable_media_id}
+              <button type="button" class="btn-secondary small-btn" disabled={$running || recoveringPluginMedia} on:click={recoverPluginMedia}>
+                <Icons name="refresh" size={14} />
+                {recoveringPluginMedia ? "Đang khôi phục…" : "Lấy lại clip đã tạo"}
+              </button>
+            {/if}
           </div>
         {/if}
 

@@ -1,0 +1,33 @@
+{
+  "id": "demo",
+  "min_core_version": null,
+  "name": "Demo",
+  "version": "0.1.0",
+  "plugin_api_version": "1",
+  "entry": {
+    "exe": "demo.exe",
+    "args": [
+      "--port",
+      "{port}",
+      "--data-dir",
+      "{data_dir}",
+      "--config-file",
+      "{config_file}"
+    ]
+  },
+  "preferred_port": 18611,
+  "health_path": "/healthz",
+  "capabilities_path": "/vf-plugin/v1/capabilities",
+  "quota_path": "/vf-plugin/v1/quota",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "video_model": {
+        "type": "string",
+        "default": "m1",
+        "x-dynamic-enum": "capabilities.video.models[].id"
+      }
+    }
+  },
+  "actions": []
+}

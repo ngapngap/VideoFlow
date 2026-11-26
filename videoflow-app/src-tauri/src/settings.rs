@@ -147,10 +147,14 @@ impl Settings {
         clean.endpoint_video_model =
             trim_or_default(&clean.endpoint_video_model, &def.endpoint_video_model);
         // Nguồn ảnh/video chỉ nhận 2 giá trị hợp lệ; sai định dạng về gateway ngoài.
-        if clean.image_source != "internal" {
+        if clean.image_source != "internal"
+            && !crate::plugins::routing::is_plugin(&clean.image_source)
+        {
             clean.image_source = "gateway".into();
         }
-        if clean.video_source != "internal" {
+        if clean.video_source != "internal"
+            && !crate::plugins::routing::is_plugin(&clean.video_source)
+        {
             clean.video_source = "gateway".into();
         }
         clean.muse_chromium_path = clean.muse_chromium_path.trim().to_string();
@@ -171,7 +175,9 @@ impl Settings {
         } else {
             120
         };
-        clean.video_seconds = clean.video_seconds.clamp(1, max_video_seconds);
+        if !crate::plugins::routing::is_plugin(&clean.video_source) {
+            clean.video_seconds = clean.video_seconds.clamp(1, max_video_seconds);
+        }
         clean.image_timeout_s = clean.image_timeout_s.max(1);
         clean.video_create_timeout_s = clean.video_create_timeout_s.max(1);
         clean.poll_interval_s = clean.poll_interval_s.max(1);
