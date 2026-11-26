@@ -379,9 +379,9 @@
       const view = await api.get_settings();
       endpointStatus.set({
         imageConfigured:
-          view.settings?.image_source === "internal" || Boolean(view.has_image_key),
+          view.settings?.image_source !== "gateway" || Boolean(view.has_image_key),
         videoConfigured:
-          view.settings?.video_source === "internal" || Boolean(view.has_video_key),
+          view.settings?.video_source !== "gateway" || Boolean(view.has_video_key),
       });
       confirmStartEnabled.set(view.settings?.confirm_start ?? true);
       maxAttemptsStore.set(Math.max(1, Number(view.settings?.max_attempts) || 3));
@@ -789,7 +789,7 @@
       class:ok={$endpointStatus.imageConfigured}
       class:warn={!$endpointStatus.imageConfigured}
     ></span>
-    <span>{$endpointStatus.imageConfigured ? "có key" : "chưa có key"}</span>
+    <span>{$endpointStatus.imageConfigured ? "đã cấu hình" : "chưa cấu hình"}</span>
     <span class="sep">·</span>
     <span>Video:</span>
     <span
@@ -797,7 +797,7 @@
       class:ok={$endpointStatus.videoConfigured}
       class:warn={!$endpointStatus.videoConfigured}
     ></span>
-    <span>{$endpointStatus.videoConfigured ? "có key" : "chưa có key"}</span>
+    <span>{$endpointStatus.videoConfigured ? "đã cấu hình" : "chưa cấu hình"}</span>
   </span>
 
   <span class="status-divider"></span>

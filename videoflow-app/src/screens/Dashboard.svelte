@@ -21,7 +21,7 @@
     showToast,
     formatApiError,
   } from "../lib/store";
-  import { api, type DryRunResult, type ProbeResult } from "../lib/api";
+  import { api, type DryRunResult, type ProbeResult, type PluginStatus, type PluginSummary } from "../lib/api";
   import { countUsableMuseVideoAccounts, getConcurrencyMax } from "../lib/settingsSave";
   import { createCoalescedScheduler } from "../lib/asyncGuard";
   import Icons from "../lib/Icons.svelte";
@@ -57,9 +57,12 @@
 
   // Điều chỉnh nhanh số luồng chạy song song (tối đa theo số tài khoản Muse khả dụng)
   let concurrency = 1;
+  let imageSource = "gateway";
   let videoSource = "gateway";
   let settingsMuseVideoAccounts = 0;
   let savingConcurrency = false;
+  let providerChecks: { kind: "image" | "video"; source: string; name: string; instance: string; status: PluginStatus | null; quota: any; error: string }[] = [];
+  let checkingProviders = false;
 
   $: usableMuseAccounts = countUsableMuseVideoAccounts(
     $museAccounts,
@@ -80,13 +83,71 @@
     try {
       const view = await api.get_settings();
       concurrency = Math.max(1, Math.round(Number(view.settings.concurrency) || 1));
+      imageSource = view.settings.image_source || "gateway";
       videoSource = view.settings.video_source || "gateway";
+      endpointStatus.set({
+        imageConfigured: imageSource !== "gateway" || Boolean(view.has_image_key),
+        videoConfigured: videoSource !== "gateway" || Boolean(view.has_video_key),
+      });
+      await refreshProviderChecks();
       if (typeof view.muse_video_accounts === "number") {
         settingsMuseVideoAccounts = view.muse_video_accounts;
       }
     } catch {
       // Giữ giá trị hiện tại nếu chưa nạp được settings
     }
+  }
+
+  async function refreshProviderChecks(): Promise<void> {
+    const pluginSources = (["image", "video"] as const).map((kind) => ({ kind, source: kind === "image" ? imageSource : videoSource }))
+      .filter((x) => x.source.startsWith("plugin:") || x.source.startsWith("plugin-pool:"));
+    if (!pluginSources.length) { providerChecks = []; return; }
+    checkingProviders = true;
+    try {
+      const registry = await api.plugin_list();
+      const checks: typeof providerChecks = [];
+      for (const { kind, source } of pluginSources) {
+        const pool = source.startsWith("plugin-pool:");
+        const parts = source.split(":");
+        const pluginId = parts[1];
+        const summary = registry.find((p: PluginSummary) => p.manifest.id === pluginId);
+        let instances = summary?.instances ?? [];
+        if (pool) instances = instances.filter((i) => i.enabled && (i.trusted || i.bundled || summary?.bundled));
+        else {
+          const requested = parts[2] ?? "default";
+          instances = instances.filter((i) => i.instance_id === requested);
+        }
+        if (!summary || instances.length === 0) {
+          checks.push({ kind, source, name: summary?.manifest.name ?? pluginId, instance: pool ? "pool" : parts[2] ?? "default", status: null, quota: null, error: "Không tìm thấy instance đã bật cho nguồn này." });
+          continue;
+        }
+        for (const instance of instances) {
+          const status = await api.plugin_status(pluginId, instance.instance_id).catch((e) => null);
+          const quota = status?.running ? await api.plugin_quota(pluginId, instance.instance_id).catch(() => null) : null;
+          checks.push({ kind, source, name: summary.manifest.name, instance: instance.instance_id, status, quota, error: status ? "" : "Không đọc được trạng thái instance." });
+        }
+      }
+      providerChecks = checks;
+    } catch (e) {
+      providerChecks = pluginSources.map(({ kind, source }) => ({ kind, source, name: source.split(":")[1] ?? source, instance: "", status: null, quota: null, error: formatApiError(e) }));
+    } finally { checkingProviders = false; }
+  }
+
+  function providerReady(item: (typeof providerChecks)[number]) {
+    return Boolean(item.status?.running && item.status.health === "ok");
+  }
+  function providerPort(item: (typeof providerChecks)[number]) {
+    try { return item.status?.origin ? new URL(item.status.origin).port || "80" : "—"; } catch { return "—"; }
+  }
+  function quotaSummary(quota: any, kind: "image" | "video") {
+    if (!quota) return "Chưa có dữ liệu quota";
+    const groups = (quota.limits ?? []).filter((x: any) => x.media_kind === kind);
+    if (!groups.length) return "Quota chưa được công bố";
+    return groups.map((g: any) => {
+      const accounts = g.accounts ?? [];
+      if (!accounts.length) return `${g.unit ?? "quota"}: chưa biết`;
+      return accounts.map((a: any) => `${a.label ?? a.id ?? "Tài khoản"}: ${a.balance == null ? (a.status ?? "chưa biết") : `${a.balance}${a.total == null ? "" : `/${a.total}`}`} ${g.unit ?? ""}`.trim()).join(" · ");
+    }).join("; ");
   }
 
   onMount(() => {
@@ -100,6 +161,7 @@
     savingConcurrency = true;
     try {
       const view = await api.get_settings();
+      imageSource = view.settings.image_source || "gateway";
       videoSource = view.settings.video_source || "gateway";
       if (typeof view.muse_video_accounts === "number") {
         settingsMuseVideoAccounts = view.muse_video_accounts;
@@ -641,6 +703,28 @@
       </div>
     </div>
 
+    {#if providerChecks.length > 0}
+      <div class="provider-row">
+        <div class="provider-head"><strong>Trạng thái plugin đang chọn</strong>
+          <button type="button" class="btn-ghost" disabled={checkingProviders} on:click={refreshProviderChecks}>
+            <Icons name="refresh" size={13} /> {checkingProviders ? "Đang kiểm tra…" : "Làm mới"}
+          </button>
+        </div>
+        <div class="provider-grid">
+          {#each providerChecks as item, idx (`${item.kind}:${item.instance}:${idx}`)}
+            <div class="provider-card" class:provider-ready={providerReady(item)} class:provider-down={!providerReady(item)}>
+              <div class="provider-card-head"><span>{item.kind === "image" ? "Ảnh" : "Video"} · {item.name}</span>
+                <span class="provider-state">{providerReady(item) ? "Sẵn sàng" : item.status?.running ? `Không sẵn sàng · ${item.status.health}` : "Không hoạt động"}</span>
+              </div>
+              <div class="provider-meta">Instance: <code>{item.instance || "—"}</code> · Port: <code>{providerPort(item)}</code></div>
+              {#if item.error || item.status?.reason}<div class="provider-reason">{item.error || item.status?.reason}</div>{/if}
+              <div class="provider-meta">{quotaSummary(item.quota, item.kind)}</div>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
     <!-- Hàng 4 thẻ số liệu -->
     <div class="metric-row">
       <div class="card metric">
@@ -1015,16 +1099,16 @@
       <div class="ep-pills">
         <span class="ep-pill" class:ok={$endpointStatus.imageConfigured} class:missing={!$endpointStatus.imageConfigured}>
           <Icons name={$endpointStatus.imageConfigured ? "check" : "alert"} size={13} />
-          Endpoint ảnh: {$endpointStatus.imageConfigured ? "Đã cấu hình key" : "Chưa có API key"}
+          Endpoint ảnh: {$endpointStatus.imageConfigured ? (imageSource === "gateway" ? "Đã cấu hình key" : imageSource === "internal" ? "VideoFlow Muse" : "Plugin đã chọn") : "Chưa có API key"}
         </span>
         <span class="ep-pill" class:ok={$endpointStatus.videoConfigured} class:missing={!$endpointStatus.videoConfigured}>
           <Icons name={$endpointStatus.videoConfigured ? "check" : "alert"} size={13} />
-          Endpoint video: {$endpointStatus.videoConfigured ? "Đã cấu hình key" : "Chưa có API key"}
+          Endpoint video: {$endpointStatus.videoConfigured ? (videoSource === "gateway" ? "Đã cấu hình key" : videoSource === "internal" ? "VideoFlow Muse" : "Plugin đã chọn") : "Chưa có API key"}
         </span>
       </div>
       {#if !$endpointStatus.imageConfigured || !$endpointStatus.videoConfigured}
         <div class="ep-warn-note">
-          Chưa lưu đủ API key — lượt chạy có thể dừng với lỗi xác thực.
+          Chưa cấu hình đủ nguồn tạo media — lượt chạy có thể dừng trước khi bắt đầu.
           <button
             type="button"
             class="inline-link"
@@ -1343,6 +1427,16 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 14px;
   }
+  .provider-row { margin-top: 12px; padding: 14px; border: 1px solid var(--c-border); border-radius: 10px; background: var(--c-card); }
+  .provider-head,.provider-card-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .provider-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:10px; margin-top:10px; }
+  .provider-card { border:1px solid var(--c-border); border-left:3px solid var(--c-danger); border-radius:8px; padding:10px 12px; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  .provider-ready { border-left-color:var(--c-teal); }
+  .provider-card-head { font-weight:600; flex-wrap:wrap; }
+  .provider-state { font-size:12px; color:var(--c-danger); }
+  .provider-ready .provider-state { color:var(--c-teal); }
+  .provider-meta,.provider-reason { color:var(--c-muted); font-size:var(--fs-hint); overflow-wrap:anywhere; }
+  .provider-reason { color:var(--c-danger); }
   .src-card {
     min-height: 64px;
     padding: 10px 112px 10px 16px;

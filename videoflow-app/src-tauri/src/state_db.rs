@@ -5,7 +5,28 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
+
+/// Durable identity and last known state for one plugin generation operation.
+/// The UUID is intentionally independent of a run/job ID so an interrupted
+/// operation can be continued by a later run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginOperation {
+    pub operation_id: String,
+    pub job_id: Option<i64>,
+    pub row_key: String,
+    pub step: String,
+    pub owner: String,
+    pub media_kind: String,
+    pub request_json: String,
+    pub fingerprint: String,
+    pub task_id: Option<String>,
+    pub locator: Option<String>,
+    pub status: String,
+    pub stop_requested: bool,
+    pub cancel_confirmed: bool,
+    pub error_json: Option<String>,
+}
 
 /// Kiểu trả về chuẩn của `latest_job_status`:
 /// `(status, image_status, video_status, last_error, attempts_count)`
@@ -123,6 +144,27 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
         CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+
+        CREATE TABLE IF NOT EXISTS plugin_operations (
+            operation_id TEXT PRIMARY KEY,
+            job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+            row_key TEXT NOT NULL,
+            step TEXT NOT NULL CHECK(step IN ('B2','B3')),
+            owner TEXT NOT NULL,
+            media_kind TEXT NOT NULL CHECK(media_kind IN ('image','video')),
+            request_json TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            task_id TEXT,
+            locator TEXT,
+            status TEXT NOT NULL DEFAULT 'prepared',
+            stop_requested INTEGER NOT NULL DEFAULT 0,
+            cancel_confirmed INTEGER NOT NULL DEFAULT 0,
+            error_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_plugin_ops_row_step ON plugin_operations(row_key, step, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_plugin_ops_pending_cancel ON plugin_operations(stop_requested, cancel_confirmed);
         "#,
     )?;
 
@@ -135,6 +177,19 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     // Migration idempotent v3 -> v4: cập nhật CHECK constraint bảng logs cho phép 'auto_merge'
     migrate_logs_v4_check_constraint(conn)?;
+
+    // v5: durable plugin operation identities and STOP intent.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_operations (\
+            operation_id TEXT PRIMARY KEY, job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,\
+            row_key TEXT NOT NULL, step TEXT NOT NULL CHECK(step IN ('B2','B3')), owner TEXT NOT NULL,\
+            media_kind TEXT NOT NULL CHECK(media_kind IN ('image','video')), request_json TEXT NOT NULL,\
+            fingerprint TEXT NOT NULL, task_id TEXT, locator TEXT, status TEXT NOT NULL DEFAULT 'prepared',\
+            stop_requested INTEGER NOT NULL DEFAULT 0, cancel_confirmed INTEGER NOT NULL DEFAULT 0,\
+            error_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\
+         CREATE INDEX IF NOT EXISTS idx_plugin_ops_row_step ON plugin_operations(row_key, step, updated_at);\
+         CREATE INDEX IF NOT EXISTS idx_plugin_ops_pending_cancel ON plugin_operations(stop_requested, cancel_confirmed);"
+    )?;
 
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -317,8 +372,226 @@ fn ensure_column(
     }
     drop(rows);
     drop(stmt);
-    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};"))?;
+    conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {col_type};"
+    ))?;
     Ok(())
+}
+
+/// Persist the operation identity before a generation request is sent. When
+/// the same logical input is resumed in a later run, reuse its UUID. Explicit
+/// reruns pass `force_new=true` and receive a fresh UUID.
+// Keep the caller’s snapshot and fingerprint together at the transaction boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_plugin_operation(
+    conn: &Connection,
+    job_id: i64,
+    row_key: &str,
+    step: &str,
+    owner: &str,
+    media_kind: &str,
+    request_json: &str,
+    fingerprint: &str,
+    force_new: bool,
+) -> Result<PluginOperation, rusqlite::Error> {
+    let now = chrono::Local::now().to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
+    if !force_new {
+        if let Some(mut op) = tx
+            .query_row(
+                "SELECT operation_id, job_id, row_key, step, owner, media_kind, request_json, fingerprint,
+                        task_id, locator, status, stop_requested, cancel_confirmed, error_json
+                 FROM plugin_operations
+                 WHERE LOWER(row_key)=LOWER(?1) AND step=?2 AND owner=?3 AND fingerprint=?4
+                 ORDER BY updated_at DESC LIMIT 1",
+                rusqlite::params![row_key, step, owner, fingerprint],
+                operation_from_row,
+            )
+            .optional()?
+        {
+            tx.execute(
+                "UPDATE plugin_operations SET job_id=?1, updated_at=?2 WHERE operation_id=?3",
+                rusqlite::params![job_id, now, op.operation_id],
+            )?;
+            op.job_id = Some(job_id);
+            tx.commit()?;
+            return Ok(op);
+        }
+    }
+
+    let operation_id = new_operation_uuid()?;
+    tx.execute(
+        "INSERT INTO plugin_operations(operation_id,job_id,row_key,step,owner,media_kind,
+            request_json,fingerprint,status,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'prepared',?9,?9)",
+        rusqlite::params![
+            operation_id,
+            job_id,
+            row_key,
+            step,
+            owner,
+            media_kind,
+            request_json,
+            fingerprint,
+            now
+        ],
+    )?;
+    tx.commit()?;
+    Ok(PluginOperation {
+        operation_id,
+        job_id: Some(job_id),
+        row_key: row_key.to_string(),
+        step: step.to_string(),
+        owner: owner.to_string(),
+        media_kind: media_kind.to_string(),
+        request_json: request_json.to_string(),
+        fingerprint: fingerprint.to_string(),
+        task_id: None,
+        locator: None,
+        status: "prepared".into(),
+        stop_requested: false,
+        cancel_confirmed: false,
+        error_json: None,
+    })
+}
+
+pub fn load_plugin_operation(
+    conn: &Connection,
+    row_key: &str,
+    step: &str,
+) -> Result<Option<PluginOperation>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT operation_id, job_id, row_key, step, owner, media_kind, request_json, fingerprint,
+                task_id, locator, status, stop_requested, cancel_confirmed, error_json
+         FROM plugin_operations WHERE LOWER(row_key)=LOWER(?1) AND step=?2
+         ORDER BY updated_at DESC LIMIT 1",
+        rusqlite::params![row_key, step],
+        operation_from_row,
+    )
+    .optional()
+}
+
+pub fn update_plugin_operation(
+    conn: &Connection,
+    operation_id: &str,
+    status: &str,
+    task_id: Option<&str>,
+    locator: Option<&str>,
+    error_json: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE plugin_operations SET status=CASE WHEN stop_requested=1 OR cancel_confirmed=1 THEN status ELSE ?1 END,
+            task_id=COALESCE(?2,task_id), locator=COALESCE(?3,locator),
+            error_json=CASE WHEN cancel_confirmed=1 THEN error_json ELSE ?4 END,
+            updated_at=?5 WHERE operation_id=?6",
+        rusqlite::params![
+            status,
+            task_id,
+            locator,
+            error_json,
+            chrono::Local::now().to_rfc3339(),
+            operation_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// Atomically persist STOP intent for every plugin operation associated with a
+/// run, before the caller starts asynchronous DELETE requests.
+pub fn request_run_plugin_operation_stops(
+    conn: &Connection,
+    run_id: i64,
+) -> Result<Vec<PluginOperation>, rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    let now = chrono::Local::now().to_rfc3339();
+    tx.execute(
+        "UPDATE plugin_operations SET stop_requested=1,updated_at=?1
+        WHERE job_id IN (SELECT id FROM jobs WHERE run_id=?2) AND cancel_confirmed=0",
+        rusqlite::params![now, run_id],
+    )?;
+    let mut stmt=tx.prepare("SELECT operation_id,job_id,row_key,step,owner,media_kind,request_json,fingerprint,
+        task_id,locator,status,stop_requested,cancel_confirmed,error_json FROM plugin_operations
+        WHERE job_id IN (SELECT id FROM jobs WHERE run_id=?1) AND stop_requested=1 AND cancel_confirmed=0")?;
+    let result: Result<Vec<PluginOperation>, rusqlite::Error> = stmt
+        .query_map(rusqlite::params![run_id], operation_from_row)?
+        .collect();
+    drop(stmt);
+    let ops = result?;
+    tx.commit()?;
+    Ok(ops)
+}
+
+/// Mark cancellation locally before network I/O; return all operations that
+/// still need DELETE confirmation after a STOP or process restart.
+pub fn request_plugin_operation_stop(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE plugin_operations SET stop_requested=1,updated_at=?1 WHERE operation_id=?2",
+        rusqlite::params![chrono::Local::now().to_rfc3339(), operation_id],
+    )?;
+    Ok(())
+}
+
+pub fn pending_plugin_cancellations(
+    conn: &Connection,
+) -> Result<Vec<PluginOperation>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT operation_id,job_id,row_key,step,owner,media_kind,request_json,fingerprint,
+                task_id,locator,status,stop_requested,cancel_confirmed,error_json
+         FROM plugin_operations WHERE stop_requested=1 AND cancel_confirmed=0 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map([], operation_from_row)?;
+    rows.collect()
+}
+
+pub fn confirm_plugin_operation_stop(
+    conn: &Connection,
+    operation_id: &str,
+    status: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE plugin_operations SET status=?1,cancel_confirmed=1,updated_at=?2 WHERE operation_id=?3",
+        rusqlite::params![status, chrono::Local::now().to_rfc3339(), operation_id],
+    )?;
+    Ok(())
+}
+
+fn operation_from_row(row: &rusqlite::Row<'_>) -> Result<PluginOperation, rusqlite::Error> {
+    Ok(PluginOperation {
+        operation_id: row.get(0)?,
+        job_id: row.get(1)?,
+        row_key: row.get(2)?,
+        step: row.get(3)?,
+        owner: row.get(4)?,
+        media_kind: row.get(5)?,
+        request_json: row.get(6)?,
+        fingerprint: row.get(7)?,
+        task_id: row.get(8)?,
+        locator: row.get(9)?,
+        status: row.get(10)?,
+        stop_requested: row.get::<_, i64>(11)? != 0,
+        cancel_confirmed: row.get::<_, i64>(12)? != 0,
+        error_json: row.get(13)?,
+    })
+}
+
+fn new_operation_uuid() -> Result<String, rusqlite::Error> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.to_string().into()))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 /// Phục hồi các lượt đang dở (`status = 'dang_chay'`) sang `'gian_doan'` khi mở lại dự án/app.
@@ -642,6 +915,102 @@ pub fn migrate_jobs_row_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_operation_uuid_is_reused_until_explicit_rerun_and_stop_is_durable() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind,status,started_at) VALUES('chung','dang_chay','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(run_id,row_key,status) VALUES(1,'row#input','dang_cho')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind,status,started_at) VALUES('chung','dang_chay','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(run_id,row_key,status) VALUES(2,'row#input','dang_cho')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs(kind,status,started_at) VALUES('chung','dang_chay','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(run_id,row_key,status) VALUES(3,'row#input','dang_cho')",
+            [],
+        )
+        .unwrap();
+        let first = prepare_plugin_operation(
+            &conn,
+            1,
+            "row#input",
+            "B3",
+            "plugin:demo:one",
+            "video",
+            "{\"prompt\":\"x\"}",
+            "fp1",
+            false,
+        )
+        .unwrap();
+        let resumed = prepare_plugin_operation(
+            &conn,
+            2,
+            "row#input",
+            "B3",
+            "plugin:demo:one",
+            "video",
+            "{\"prompt\":\"x\"}",
+            "fp1",
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.operation_id, resumed.operation_id);
+        assert_eq!(resumed.job_id, Some(2));
+        let deliberate = prepare_plugin_operation(
+            &conn,
+            3,
+            "row#input",
+            "B3",
+            "plugin:demo:one",
+            "video",
+            "{\"prompt\":\"x\"}",
+            "fp1",
+            true,
+        )
+        .unwrap();
+        assert_ne!(first.operation_id, deliberate.operation_id);
+        request_plugin_operation_stop(&conn, &first.operation_id).unwrap();
+        update_plugin_operation(
+            &conn,
+            &first.operation_id,
+            "succeeded",
+            Some("late-task"),
+            Some("late.mp4"),
+            None,
+        )
+        .unwrap();
+        let after_late_response = load_plugin_operation(&conn, "row#input", "B3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_late_response.status, "prepared",
+            "a late submit response must not overwrite STOP intent"
+        );
+        assert_eq!(pending_plugin_cancellations(&conn).unwrap().len(), 1);
+        confirm_plugin_operation_stop(&conn, &first.operation_id, "cancelled").unwrap();
+        assert!(pending_plugin_cancellations(&conn).unwrap().is_empty());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);

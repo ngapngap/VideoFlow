@@ -44,14 +44,20 @@
   } from "../lib/settingsSave";
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
+  import PluginManager from "../lib/PluginManager.svelte";
 
-  type Tab = "project" | "image" | "video" | "run" | "general";
+  type Tab = "project" | "image" | "video" | "plugins" | "run" | "general";
   let tab: Tab = "project";
   let loading = true;
   let saving = false;
   let recheckingProject = false;
 
   let s: Settings | null = null;
+  let pluginRegistry: import("../lib/api").PluginSummary[] = [];
+  let sourceCapabilities: Record<string, Record<string, any>> = {};
+  let sourceCapabilitiesFor: Record<string, string> = {};
+  let sourceCapabilitiesBusy: Record<string, boolean> = {};
+  let sourceCapabilitiesError: Record<string, string> = {};
   let settingsMuseVideoAccounts = 0;
   let imageKeyPreview = "";
   let videoKeyPreview = "";
@@ -243,6 +249,7 @@
     { key: "project", label: "Dự án Local", icon: "folder" },
     { key: "image", label: "Endpoint ảnh", icon: "image" },
     { key: "video", label: "Endpoint video", icon: "video" },
+    { key: "plugins", label: "Plugins", icon: "settings" },
     { key: "run", label: "Chạy và thử lại", icon: "redo" },
     { key: "general", label: "Chung", icon: "settings" },
   ];
@@ -297,6 +304,181 @@
     }
   }
 
+  function pluginSources(kind: "image" | "video") {
+    const out: { value: string; label: string }[] = [];
+    for (const p of pluginRegistry) {
+      const instances = (p.instances ?? []).filter((i) => i.enabled && (i.trusted || i.bundled || p.bundled));
+      if (!instances.length) continue;
+      if (instances.some((i) => (i.instance_id || "default") === "default")) {
+        out.push({ value: `plugin:${p.manifest.id}`, label: `${p.manifest.name} · instance mặc định` });
+      }
+      for (const i of instances) {
+        const iid = i.instance_id || i.id || "default";
+        out.push({ value: `plugin:${p.manifest.id}:${iid}`, label: `${p.manifest.name} · ${iid}` });
+      }
+      if (instances.length > 1) out.push({ value: `plugin-pool:${p.manifest.id}`, label: `${p.manifest.name} · tự phân bổ trong pool` });
+    }
+    return out;
+  }
+
+  function setPluginSource(kind: "image" | "video", value: string) {
+    if (!s) return;
+    if (kind === "image") s.image_source = value;
+    else s.video_source = value;
+    mark();
+  }
+
+  function pluginTargets(kind: "image" | "video") {
+    if (!s) return [];
+    const source = kind === "image" ? s.image_source : s.video_source;
+    const parts = source.split(":");
+    if (parts[0] !== "plugin" && parts[0] !== "plugin-pool") return [];
+    const p = pluginRegistry.find((item) => item.manifest.id === parts[1]);
+    if (!p) return [];
+    let instances = p.instances ?? [];
+    if (parts[0] === "plugin-pool") instances = instances.filter((i) => i.enabled && (i.trusted || i.bundled || p.bundled));
+    else instances = instances.filter((i) => i.instance_id === (parts[2] ?? "default"));
+    return instances.map((instance) => ({ plugin: p, instance }));
+  }
+
+  async function loadSourceCapabilities(kind: "image" | "video") {
+    const source = kind === "image" ? s?.image_source : s?.video_source;
+    if (!source || !source.startsWith("plugin")) return;
+    const targets = pluginTargets(kind);
+    if (!targets.length) { sourceCapabilitiesError[kind] = "Không tìm thấy instance plugin phù hợp với nguồn đã chọn."; return; }
+    sourceCapabilitiesBusy[kind] = true;
+    sourceCapabilitiesError[kind] = "";
+    try {
+      const entries = await Promise.all(targets.map(async ({ plugin, instance }) => ({
+        owner: `${plugin.manifest.id}:${instance.instance_id}`,
+        value: await api.plugin_capabilities(plugin.manifest.id, instance.instance_id),
+      })));
+      sourceCapabilities[kind] = Object.fromEntries(entries.map((x) => [x.owner, x.value]));
+      sourceCapabilitiesFor[kind] = source;
+    } catch (e) { sourceCapabilitiesError[kind] = formatApiError(e); }
+    finally { sourceCapabilitiesBusy[kind] = false; }
+  }
+
+  function pluginModelOptions(kind: "image" | "video") {
+    const source = kind === "image" ? s?.image_source : s?.video_source;
+    if (!source || sourceCapabilitiesFor[kind] !== source) return [];
+    const targets = pluginTargets(kind);
+    const lists = targets.map(({ plugin, instance }) => {
+      const value = sourceCapabilities[kind]?.[`${plugin.manifest.id}:${instance.instance_id}`];
+      return (value?.[kind]?.models ?? []) as any[];
+    });
+    if (!lists.length || lists.some((x) => !x.length)) return [];
+    const commonIds = lists.slice(1).reduce((ids: string[], models) => ids.filter((id) => models.some((m) => m.id === id)), lists[0].map((m) => String(m.id)));
+    return commonIds.map((id) => lists[0].find((m) => m.id === id)).filter(Boolean);
+  }
+
+  function pluginModelConfigured(kind: "image" | "video") {
+    return pluginTargets(kind).every(({ plugin }) => {
+      const name = `${kind}_model`;
+      return Boolean((plugin.manifest.config_schema as any)?.properties?.[name]);
+    });
+  }
+
+  function selectedPluginModel(kind: "image" | "video") {
+    const targets = pluginTargets(kind);
+    const values = targets.map(({ instance }) => String(instance.config?.[`${kind}_model`] ?? ""));
+    return values.length && values.every((v) => v === values[0]) ? values[0] : "";
+  }
+
+  async function choosePluginModel(kind: "image" | "video", model: string) {
+    if (!model) return;
+    const targets = pluginTargets(kind);
+    const field = `${kind}_model`;
+    try {
+      await Promise.all(targets.map(({ plugin, instance }) => api.plugin_save_config(
+        plugin.manifest.id, instance.instance_id, { ...(instance.config ?? {}), [field]: model }, {}
+      )));
+      for (const target of targets) {
+        target.instance.config = { ...(target.instance.config ?? {}), [field]: model };
+        target.instance.restart_required = true;
+      }
+      showToast("success", `Đã lưu model ${kind === "image" ? "ảnh" : "video"}; instance đang chạy sẽ yêu cầu restart.`);
+      pluginRegistry = [...pluginRegistry];
+    } catch (e) { showToast("error", formatApiError(e)); }
+  }
+  function pluginModelChange(e: Event, kind: "image" | "video") {
+    void choosePluginModel(kind, (e.target as HTMLSelectElement).value);
+  }
+
+  function selectedPluginVideoModels() {
+    const selected = selectedPluginModel("video");
+    const options = pluginModelOptions("video");
+    const model = options.find((m: any) => m.id === selected) ?? (options.length === 1 ? options[0] : null);
+    return model ?? null;
+  }
+
+  function videoAspectOptions() {
+    const source = s?.video_source;
+    if (!source || sourceCapabilitiesFor.video !== source) return [];
+    const targets = pluginTargets("video");
+    const model = selectedPluginVideoModels();
+    if (!model) return [];
+    const byTarget = targets.map(({ plugin, instance }) => {
+      const caps = sourceCapabilities.video?.[`${plugin.manifest.id}:${instance.instance_id}`];
+      const selectedId = String(instance.config?.video_model ?? model.id);
+      const selected = (caps?.video?.models ?? []).find((m: any) => m.id === selectedId);
+      return (selected?.aspects ?? []) as string[];
+    });
+    return byTarget.length ? byTarget[0].filter((aspect) => byTarget.slice(1).every((list) => list.includes(aspect))) : [];
+  }
+
+  function videoDurationOptions() {
+    const source = s?.video_source;
+    if (!source || sourceCapabilitiesFor.video !== source) return [];
+    const targets = pluginTargets("video");
+    const model = selectedPluginVideoModels();
+    if (!model) return [];
+    const byTarget = targets.map(({ plugin, instance }) => {
+      const caps = sourceCapabilities.video?.[`${plugin.manifest.id}:${instance.instance_id}`];
+      const selectedId = String(instance.config?.video_model ?? model.id);
+      const selected = (caps?.video?.models ?? []).find((m: any) => m.id === selectedId);
+      return (selected?.durations ?? []) as number[];
+    });
+    return byTarget.length ? byTarget[0].filter((duration) => byTarget.slice(1).every((list) => list.includes(duration))) : [];
+  }
+
+  function setVideoAspect(aspect: string) {
+    if (!s || !aspect) return;
+    const [w, h] = aspect.split(":").map(Number);
+    if (!w || !h) return;
+    const edge = 1280;
+    s.video_size = w >= h ? `${edge}x${Math.round(edge * h / w)}` : `${Math.round(edge * w / h)}x${edge}`;
+    mark();
+  }
+  function videoAspectChange(e: Event) { setVideoAspect((e.target as HTMLSelectElement).value); }
+  function videoDurationChange(e: Event) {
+    if (!s) return;
+    s.video_seconds = Number((e.target as HTMLSelectElement).value);
+    mark();
+  }
+
+  function currentVideoAspect() {
+    const match = /^(\d+)x(\d+)$/.exec(s?.video_size?.trim() ?? "");
+    if (!match) return "";
+    let a = Number(match[1]), b = Number(match[2]);
+    const gcd = (x: number, y: number): number => y ? gcd(y, x % y) : x;
+    const d = gcd(a, b) || 1;
+    a /= d; b /= d;
+    return `${a}:${b}`;
+  }
+
+  function selectedModelRetiresSoon(kind: "image" | "video") {
+    const id = selectedPluginModel(kind);
+    const model = pluginModelOptions(kind).find((m: any) => m.id === id);
+    if (!model?.retires_on) return false;
+    const t = Date.parse(model.retires_on);
+    return Number.isFinite(t) && t >= Date.now() && t - Date.now() <= 7 * 86400000;
+  }
+
+  function staleCapabilities(kind: "image" | "video") {
+    return Object.values(sourceCapabilities[kind] ?? {}).some((value) => Boolean((value as any)?.stale));
+  }
+
   onDestroy(() => {
     destroyed = true;
     ++museRefreshSeq;
@@ -322,7 +504,7 @@
   function computeValidationErrors(cfg: Settings | null, museVideoAccs: number): string[] {
     if (!cfg) return [];
     const errs: string[] = [];
-    if (cfg.image_source !== "internal") {
+    if (cfg.image_source === "gateway") {
       if (!isValidHttpUrl(cfg.endpoint_image_base_url)) {
         errs.push("Base URL endpoint ảnh phải bắt đầu bằng http:// hoặc https://.");
       }
@@ -333,7 +515,7 @@
     if (!isValidIntInRange(cfg.image_timeout_s, 5, 3600)) {
       errs.push("Timeout gọi ảnh phải là số nguyên từ 5 đến 3600 giây.");
     }
-    if (cfg.video_source !== "internal") {
+    if (cfg.video_source === "gateway") {
       if (!isValidHttpUrl(cfg.endpoint_video_base_url)) {
         errs.push("Base URL endpoint video phải bắt đầu bằng http:// hoặc https://.");
       }
@@ -418,8 +600,8 @@
     pendingClearVideoKey = false;
 
     endpointStatus.set({
-      imageConfigured: cloned.image_source === "internal" || hasImageKey,
-      videoConfigured: cloned.video_source === "internal" || hasVideoKey,
+      imageConfigured: cloned.image_source !== "gateway" || hasImageKey,
+      videoConfigured: cloned.video_source !== "gateway" || hasVideoKey,
     });
     confirmStartEnabled.set(Boolean(cloned.confirm_start));
     maxAttemptsStore.set(Math.max(1, Number(cloned.max_attempts) || 3));
@@ -430,6 +612,7 @@
     try {
       const view = await api.get_settings();
       applySettingsView(view);
+      try { pluginRegistry = await api.plugin_list(); } catch { pluginRegistry = []; }
       imageKeyInput = "";
       videoKeyInput = "";
       hideAllKeyVisibility();
@@ -976,12 +1159,12 @@
       {:else if tab === "image"}
         <div class="label" id="image-source-label">Nguồn sinh ảnh</div>
         <div class="source-radios" role="radiogroup" aria-labelledby="image-source-label">
-          <label class="radio-card" class:active={s.image_source !== "internal"}>
+          <label class="radio-card" class:active={s.image_source === "gateway"}>
             <input
               type="radio"
               name="image-source"
               value="gateway"
-              checked={s.image_source !== "internal"}
+              checked={s.image_source === "gateway"}
               disabled={$running}
               on:change={() => {
                 if (s) {
@@ -1015,7 +1198,40 @@
               <span>Tạo ảnh bằng model ảnh của muse.ai (muse-image), dùng chung engine/cookie với video</span>
             </div>
           </label>
+          {#each pluginSources("image") as source (source.value)}
+            <label class="radio-card" class:active={s.image_source === source.value}>
+              <input type="radio" name="image-source" value={source.value} checked={s.image_source === source.value} disabled={$running} on:change={() => setPluginSource("image", source.value)} />
+              <div><strong>{source.label}</strong><span>Dùng plugin tạo ảnh. Chỉnh model và cấu hình instance trong tab Plugins.</span></div>
+            </label>
+          {/each}
         </div>
+
+        {#if s.image_source.startsWith("plugin")}
+          <div class="plugin-cap-panel">
+            <div class="inline">
+              <button type="button" class="btn-secondary" disabled={sourceCapabilitiesBusy.image} on:click={() => loadSourceCapabilities("image")}>
+                <Icons name="refresh" size={14} /> {sourceCapabilitiesBusy.image ? "Đang tải capabilities…" : "Tải capabilities ảnh"}
+              </button>
+              {#if sourceCapabilitiesError.image}<span class="feedback-line bad">{sourceCapabilitiesError.image}</span>{/if}
+            </div>
+            {#if sourceCapabilitiesFor.image === s.image_source}
+              {#if staleCapabilities("image")}<div class="warn-hint">Capabilities đang cũ; plugin sẽ xác nhận model cuối cùng khi gửi yêu cầu.</div>{/if}
+              {#if pluginModelOptions("image").length}
+                <label class="label" for="plugin-image-model">Model ảnh từ capabilities</label>
+                {#if pluginModelConfigured("image")}
+                  <select id="plugin-image-model" class="input full" value={selectedPluginModel("image")} on:change={(e) => pluginModelChange(e, "image")}>
+                    <option value="">— Dùng model mặc định của plugin —</option>
+                    {#each pluginModelOptions("image") as model (model.id)}<option value={model.id}>{model.label ?? model.id}</option>{/each}
+                  </select>
+                {:else}<div class="hint">Model được quản lý trong tab Plugins theo schema của provider.</div>{/if}
+                {#if selectedModelRetiresSoon("image")}<div class="warn-hint">Model ảnh đã chọn sẽ nghỉ trong 7 ngày tới.</div>{/if}
+                {#each pluginModelOptions("image") as model (model.id)}
+                  <div class="hint">{model.label ?? model.id}: aspect {(model.aspects ?? []).join(", ") || "chưa công bố"}{#if model.retires_on} · nghỉ ngày {model.retires_on}{/if}</div>
+                {/each}
+              {:else}<div class="hint">Plugin chưa công bố model ảnh cho instance đã chọn.</div>{/if}
+            {/if}
+          </div>
+        {/if}
 
         {#if s.image_source === "internal"}
           <div class="hint" style="margin-bottom:8px">
@@ -1023,7 +1239,7 @@
             VideoFlow Muse (chung engine với video). Tài khoản &amp; cookie quản lý ở mục
             <b>Tài khoản</b> trên thanh điều hướng; engine tự khởi động khi chạy.
           </div>
-        {:else}
+        {:else if s.image_source === "gateway"}
         <label class="label" for="cfg-img-base-url">Địa chỉ gốc (Base URL)</label>
         <input
           id="cfg-img-base-url"
@@ -1139,7 +1355,7 @@
           disabled={$running}
         />
 
-        {#if s.image_source !== "internal"}
+        {#if s.image_source === "gateway"}
         <div class="inline test-row">
           <button
             type="button"
@@ -1166,12 +1382,12 @@
       {:else if tab === "video"}
         <div class="label" id="video-source-label">Nguồn sinh video</div>
         <div class="source-radios" role="radiogroup" aria-labelledby="video-source-label">
-          <label class="radio-card" class:active={s.video_source !== "internal"}>
+          <label class="radio-card" class:active={s.video_source === "gateway"}>
             <input
               type="radio"
               name="video-source"
               value="gateway"
-              checked={s.video_source !== "internal"}
+              checked={s.video_source === "gateway"}
               disabled={$running}
               on:change={() => {
                 if (s) {
@@ -1205,9 +1421,39 @@
               <span>Gateway chạy ngầm trên máy, sinh video trực tiếp từ muse.ai bằng cookie</span>
             </div>
           </label>
+          {#each pluginSources("video") as source (source.value)}
+            <label class="radio-card" class:active={s.video_source === source.value}>
+              <input type="radio" name="video-source" value={source.value} checked={s.video_source === source.value} disabled={$running} on:change={() => setPluginSource("video", source.value)} />
+              <div><strong>{source.label}</strong><span>Dùng plugin tạo video. Chỉnh model và cấu hình instance trong tab Plugins.</span></div>
+            </label>
+          {/each}
         </div>
 
-        {#if s.video_source !== "internal"}
+        {#if s.video_source.startsWith("plugin")}
+          <div class="plugin-cap-panel">
+            <div class="inline">
+              <button type="button" class="btn-secondary" disabled={sourceCapabilitiesBusy.video} on:click={() => loadSourceCapabilities("video")}>
+                <Icons name="refresh" size={14} /> {sourceCapabilitiesBusy.video ? "Đang tải capabilities…" : "Tải capabilities video"}
+              </button>
+              {#if sourceCapabilitiesError.video}<span class="feedback-line bad">{sourceCapabilitiesError.video}</span>{/if}
+            </div>
+            {#if sourceCapabilitiesFor.video === s.video_source}
+              {#if staleCapabilities("video")}<div class="warn-hint">Capabilities đang cũ; plugin sẽ kiểm tra lại model, aspect và thời lượng khi gửi.</div>{/if}
+              {#if pluginModelOptions("video").length}
+                <label class="label" for="plugin-video-model">Model video từ capabilities</label>
+                {#if pluginModelConfigured("video")}
+                  <select id="plugin-video-model" class="input full" value={selectedPluginModel("video")} on:change={(e) => pluginModelChange(e, "video")}>
+                    <option value="">— Dùng model mặc định của plugin —</option>
+                    {#each pluginModelOptions("video") as model (model.id)}<option value={model.id}>{model.label ?? model.id}</option>{/each}
+                  </select>
+                {:else}<div class="hint">Model được quản lý trong tab Plugins theo schema của provider.</div>{/if}
+                {#if selectedModelRetiresSoon("video")}<div class="warn-hint">Model video đã chọn sẽ nghỉ trong 7 ngày tới.</div>{/if}
+              {:else}<div class="hint">Plugin chưa công bố model video cho instance đã chọn.</div>{/if}
+            {/if}
+          </div>
+        {/if}
+
+        {#if s.video_source === "gateway"}
         <label class="label" for="cfg-vid-base-url">Địa chỉ gốc (Base URL)</label>
         <input
           id="cfg-vid-base-url"
@@ -1470,6 +1716,23 @@
             />
           </div>
         </div>
+        {#if s.video_source.startsWith("plugin") && sourceCapabilitiesFor.video === s.video_source}
+          {#if videoAspectOptions().length}
+            <label class="label" for="plugin-video-aspect">Aspect được hỗ trợ bởi model</label>
+            <select id="plugin-video-aspect" class="input narrow" value={currentVideoAspect()} on:change={videoAspectChange}>
+              <option value="">— Chọn aspect —</option>
+              {#each videoAspectOptions() as aspect (aspect)}<option value={aspect}>{aspect}</option>{/each}
+            </select>
+            {#if currentVideoAspect() && !videoAspectOptions().includes(currentVideoAspect())}<div class="warn-hint">Kích thước hiện tại có aspect {currentVideoAspect()}, model không công bố hỗ trợ aspect này.</div>{/if}
+          {/if}
+          {#if videoDurationOptions().length}
+            <label class="label" for="plugin-video-duration">Thời lượng model hỗ trợ</label>
+            <select id="plugin-video-duration" class="input narrow" value={videoDurationOptions().includes(Number(s.video_seconds)) ? Number(s.video_seconds) : ""} on:change={videoDurationChange}>
+              <option value="">Hiện tại: {s.video_seconds} giây (chưa được model hỗ trợ)</option>
+              {#each videoDurationOptions() as duration (duration)}<option value={duration}>{duration} giây</option>{/each}
+            </select>
+          {/if}
+        {/if}
 
         <div class="two-cols">
           <div>
@@ -1541,6 +1804,9 @@
           {/if}
         </div>
         {/if}
+
+      {:else if tab === "plugins"}
+        <PluginManager />
 
       {:else if tab === "run"}
         <div class="two-cols">

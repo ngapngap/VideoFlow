@@ -7,6 +7,7 @@ use crate::adapters::{self, ApiFail, ApiFailKind, PollOutcome};
 use crate::error::{AppError, AppResult};
 use crate::prompts_csv::{self, RowStatus};
 use crate::settings::Settings;
+use base64::Engine as _;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -853,6 +854,26 @@ pub fn run_with_emitter_and_hook(
     let conn = crate::state_db::open(project_path)
         .map_err(|e| AppError::new("DB_FAIL", format!("Không mở được state.db: {e}")))?;
 
+    // A confirmed STOP is an operation decision, not just a worker flag. Retry
+    // any durable DELETE intents before planning new work after restart.
+    if let Ok(pending) = crate::state_db::pending_plugin_cancellations(&conn) {
+        for op in pending {
+            if let Ok(result) = crate::plugins::client::cancel(&op.owner, &op.operation_id) {
+                let status = result["status"].as_str().unwrap_or("reconcile_needed");
+                let _ =
+                    crate::state_db::confirm_plugin_operation_stop(&conn, &op.operation_id, status);
+                let _ = crate::state_db::update_plugin_operation(
+                    &conn,
+                    &op.operation_id,
+                    status,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
     let image_out = project_path.join("image_out");
     let video_out = project_path.join("video_out");
     let _ = std::fs::create_dir_all(&image_out);
@@ -1480,6 +1501,288 @@ pub fn sha2hex(s: &str) -> String {
 
 // ━━ B2: tạo ảnh (5.1, 5.5) + cập nhật row trong RAM + SQLite transaction ━━
 
+fn plugin_create_image(
+    ctx: &WorkerRowCtx<'_>,
+    lease: &crate::plugins::routing::Lease,
+    op: &crate::state_db::PluginOperation,
+    image: &Path,
+    prompt: &str,
+) -> Result<Vec<u8>, ApiFail> {
+    let model = serde_json::from_str::<serde_json::Value>(&op.request_json)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| lease.model.clone());
+    // A saved operation is resolved by GET first. A transport error from POST
+    // is ambiguous, so this invocation never follows it with another POST.
+    let mut value = if plugin_operation_can_retry(op) {
+        crate::plugins::client::submit_image(
+            ctx.cfg,
+            &lease.owner,
+            &op.operation_id,
+            &model,
+            image,
+            prompt,
+        )
+        .map_err(|e| persist_plugin_operation_error(ctx, op, &e, "reconcile_needed"))?
+    } else if op.status != "prepared" {
+        match crate::plugins::client::lookup(&lease.owner, &op.operation_id) {
+            Ok(v) => v,
+            Err(err) if err.http == Some(404) => {
+                return Err(persist_plugin_operation_error(
+                    ctx,
+                    op,
+                    &err,
+                    "reconcile_needed",
+                ))
+            }
+            Err(err) => {
+                crate::plugins::routing::block(&lease.owner, "image", &err);
+                return Err(err.as_api_fail());
+            }
+        }
+    } else {
+        crate::state_db::update_plugin_operation(
+            ctx.conn,
+            &op.operation_id,
+            "submitting",
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: e.to_string(),
+        })?;
+        match crate::plugins::client::submit_image(
+            ctx.cfg,
+            &lease.owner,
+            &op.operation_id,
+            &model,
+            image,
+            prompt,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                crate::plugins::routing::block(&lease.owner, "image", &err);
+                match crate::plugins::client::lookup(&lease.owner, &op.operation_id) {
+                    Ok(v) => v,
+                    Err(lookup_err) => {
+                        crate::plugins::routing::block(&lease.owner, "image", &lookup_err);
+                        return Err(persist_plugin_operation_error(
+                            ctx,
+                            op,
+                            &err,
+                            "reconcile_needed",
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    if value.get("status").is_none() && value["data"][0]["b64_json"].as_str().is_some() {
+        value["status"] = serde_json::Value::String("succeeded".into());
+    }
+    let poll_started = Instant::now();
+    loop {
+        if ctx.stop_flag.load(Ordering::SeqCst) {
+            stop_plugin_operation(ctx, op)?;
+            return Err(ApiFail::stopped(
+                "Đang chờ plugin xác nhận dừng thao tác ảnh",
+            ));
+        }
+        match value["status"].as_str().unwrap_or("") {
+            "succeeded" => {
+                let data = value["data"][0]["b64_json"]
+                    .as_str()
+                    .ok_or_else(|| ApiFail {
+                        kind: ApiFailKind::NghiepVu,
+                        http_status: None,
+                        code: "PLUGIN_BAD_RESPONSE".into(),
+                        message: "Plugin thiếu ảnh kết quả".into(),
+                    })?;
+                let raw_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| ApiFail {
+                        kind: ApiFailKind::NghiepVu,
+                        http_status: None,
+                        code: "PLUGIN_BAD_RESPONSE".into(),
+                        message: e.to_string(),
+                    })?;
+                let bytes = adapters::ensure_png_bytes(raw_bytes, 200)?;
+                crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    "succeeded",
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: e.to_string(),
+                })?;
+                return Ok(bytes);
+            }
+            "failed" | "reconcile_needed" | "cancelled" | "abandoned" => {
+                let error = value.get("error").cloned().unwrap_or_default();
+                let status = value["status"].as_str().unwrap_or("failed");
+                crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    status,
+                    None,
+                    None,
+                    Some(&error.to_string()),
+                )
+                .map_err(|e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: e.to_string(),
+                })?;
+                let failure = crate::plugins::client::PluginError::from_error(&error, None);
+                crate::plugins::routing::block(&op.owner, &op.media_kind, &failure);
+                return Err(failure.as_api_fail());
+            }
+            "processing" => {
+                crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    "processing",
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: e.to_string(),
+                })?;
+                if poll_started.elapsed().as_secs() >= 1800 {
+                    return Err(ApiFail {
+                        kind: ApiFailKind::TamThoi {
+                            retry_after_s: None,
+                        },
+                        http_status: None,
+                        code: "POLL_TIMEOUT".into(),
+                        message: "Ảnh vẫn đang xử lý; operation được giữ để tiếp tục poll".into(),
+                    });
+                }
+                if adapters::sleep_interruptible(Duration::from_secs(2), ctx.stop_flag) {
+                    continue;
+                }
+                value = match crate::plugins::client::lookup(&lease.owner, &op.operation_id) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        crate::plugins::routing::block(&lease.owner, "image", &err);
+                        return Err(persist_plugin_operation_error(
+                            ctx,
+                            op,
+                            &err,
+                            "reconcile_needed",
+                        ));
+                    }
+                };
+            }
+            _ => {
+                return Err(ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "PLUGIN_BAD_RESPONSE".into(),
+                    message: "Plugin trả trạng thái operation không hợp lệ".into(),
+                })
+            }
+        }
+    }
+}
+
+fn stop_plugin_operation(
+    ctx: &WorkerRowCtx<'_>,
+    op: &crate::state_db::PluginOperation,
+) -> Result<(), ApiFail> {
+    crate::state_db::request_plugin_operation_stop(ctx.conn, &op.operation_id).map_err(|e| {
+        ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: e.to_string(),
+        }
+    })?;
+    match crate::plugins::client::cancel(&op.owner, &op.operation_id) {
+        Ok(v) => {
+            let status = v["status"].as_str().unwrap_or("reconcile_needed");
+            crate::state_db::confirm_plugin_operation_stop(ctx.conn, &op.operation_id, status)
+                .map_err(|e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: e.to_string(),
+                })?;
+            crate::state_db::update_plugin_operation(
+                ctx.conn,
+                &op.operation_id,
+                status,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: e.to_string(),
+            })?;
+        }
+        Err(e) => crate::plugins::routing::block(&op.owner, &op.media_kind, &e),
+    }
+    Ok(())
+}
+
+fn persist_plugin_operation_error(
+    ctx: &WorkerRowCtx<'_>,
+    op: &crate::state_db::PluginOperation,
+    error: &crate::plugins::client::PluginError,
+    status: &str,
+) -> ApiFail {
+    crate::plugins::routing::block(&op.owner, &op.media_kind, error);
+    let snapshot = serde_json::json!({
+        "kind":error.kind,"scope":error.scope,"code":error.code,"message":error.message,
+        "retryable":error.retryable,"retry_after_s":error.retry_after_s,
+        "recoverable_media_id":error.recoverable_media_id,
+    })
+    .to_string();
+    match crate::state_db::update_plugin_operation(
+        ctx.conn,
+        &op.operation_id,
+        status,
+        None,
+        None,
+        Some(&snapshot),
+    ) {
+        Ok(()) => error.as_api_fail(),
+        Err(e) => ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("Không lưu được trạng thái operation: {e}"),
+        },
+    }
+}
+
+fn plugin_operation_can_retry(op: &crate::state_db::PluginOperation) -> bool {
+    op.status == "failed"
+        && op
+            .error_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .is_some_and(|e| e["kind"] == "transient" && e["retryable"] == true)
+}
+
 fn run_b2(
     ctx: &WorkerRowCtx<'_>,
     row: &mut prompts_csv::Row,
@@ -1511,6 +1814,86 @@ fn run_b2(
 
     let cur_img_hash = sha2hex(row.promt_tao_image.trim());
 
+    let input_bytes = std::fs::read(&ref_path).map_err(|e| ApiFail {
+        kind: ApiFailKind::NghiepVu,
+        http_status: None,
+        code: "IMAGE_READ_FAIL".into(),
+        message: e.to_string(),
+    })?;
+    let image_hash = sha2hex(&base64::engine::general_purpose::STANDARD.encode(&input_bytes));
+    let prior_plugin_op = if force_new {
+        None
+    } else {
+        crate::state_db::load_plugin_operation(ctx.conn, &row_key, "B2").map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("Không đọc được operation ảnh: {e}"),
+        })?
+    };
+    let reusable_plugin_op = prior_plugin_op.filter(|op| {
+        op.media_kind == "image"
+            && serde_json::from_str::<serde_json::Value>(&op.request_json)
+                .ok()
+                .is_some_and(|v| {
+                    v["prompt"] == row.promt_tao_image && v["image_sha256"] == image_hash
+                })
+    });
+    let use_plugin =
+        crate::plugins::routing::is_plugin(&ctx.cfg.image_source) || reusable_plugin_op.is_some();
+    let plugin_lease = if use_plugin {
+        Some(
+            if let Some(op) = reusable_plugin_op.as_ref() {
+                crate::plugins::routing::hold_owner(&op.owner, "image", ctx.stop_flag)
+            } else {
+                crate::plugins::routing::acquire(&ctx.cfg.image_source, "image", ctx.stop_flag)
+            }
+            .map_err(|e| e.as_api_fail())?,
+        )
+    } else {
+        None
+    };
+    let mut plugin_op = if let Some(lease) = plugin_lease.as_ref() {
+        let snap_model = reusable_plugin_op
+            .as_ref()
+            .and_then(|op| serde_json::from_str::<serde_json::Value>(&op.request_json).ok())
+            .and_then(|v| v["model"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| lease.model.clone());
+        let request = serde_json::json!({"model":snap_model,"prompt":row.promt_tao_image,"image_sha256":image_hash});
+        let fingerprint = sha2hex(&request.to_string());
+        Some(if let Some(op) = reusable_plugin_op {
+            let _ = ctx.conn.execute(
+                "UPDATE plugin_operations SET job_id=?1,updated_at=?2 WHERE operation_id=?3",
+                rusqlite::params![
+                    ctx.job_id,
+                    chrono::Local::now().to_rfc3339(),
+                    op.operation_id
+                ],
+            );
+            op
+        } else {
+            crate::state_db::prepare_plugin_operation(
+                ctx.conn,
+                ctx.job_id,
+                &row_key,
+                "B2",
+                &lease.owner,
+                "image",
+                &request.to_string(),
+                &fingerprint,
+                force_new,
+            )
+            .map_err(|e| ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("Không lưu được operation trước khi gửi yêu cầu: {e}"),
+            })?
+        })
+    } else {
+        None
+    };
+
     if !force_new
         && matches!(row.status(), RowStatus::DaTaoImage | RowStatus::DaTaoVideo)
         && !row.anh_da_tao.is_empty()
@@ -1532,11 +1915,24 @@ fn run_b2(
     let mut local_try: u32 = 0;
     let bytes = loop {
         if ctx.stop_flag.load(Ordering::SeqCst) {
+            if let Some(op) = plugin_op.as_ref() {
+                stop_plugin_operation(ctx, op)?;
+            }
             return Err(ApiFail::stopped("Đã dừng an toàn trước khi gọi tạo ảnh"));
         }
         local_try += 1;
-        match adapters::create_image(ctx.cfg, &ref_path, &row.promt_tao_image) {
-            Ok(res) => break res.png_bytes,
+        let create_result = if let (Some(lease), Some(op)) =
+            (plugin_lease.as_ref(), plugin_op.as_ref())
+        {
+            plugin_create_image(ctx, lease, op, &ref_path, &row.promt_tao_image)
+        } else {
+            adapters::create_image(ctx.cfg, &ref_path, &row.promt_tao_image).map(|r| r.png_bytes)
+        };
+        if let Some(op) = plugin_op.as_mut() {
+            op.status = "submitting".into();
+        }
+        match create_result {
+            Ok(bytes) => break bytes,
             Err(fail) => {
                 let transient = is_transient_error(&fail);
                 let _ = record_attempt(
@@ -2226,6 +2622,33 @@ fn run_b3(
         }
     };
 
+    let has_resumable_plugin_op = if force_new {
+        false
+    } else {
+        crate::state_db::load_plugin_operation(ctx.conn, &row_key, "B3")
+            .map_err(|e| ApiFail {
+                kind: ApiFailKind::NghiepVu,
+                http_status: None,
+                code: "DB_TX_FAIL".into(),
+                message: format!("Không đọc được operation video: {e}"),
+            })?
+            .is_some_and(|op| {
+                std::fs::read(&img_path).ok().is_some_and(|bytes| {
+                    let hash = sha2hex(&base64::engine::general_purpose::STANDARD.encode(bytes));
+                    serde_json::from_str::<serde_json::Value>(&op.request_json)
+                        .ok()
+                        .is_some_and(|v| {
+                            op.media_kind == "video"
+                                && v["image_sha256"] == hash
+                                && v["prompt"] == row.promt_tao_video
+                        })
+                })
+            })
+    };
+    if crate::plugins::routing::is_plugin(&ctx.cfg.video_source) || has_resumable_plugin_op {
+        return run_plugin_b3(ctx, row, &row_key, &img_path, force_new);
+    }
+
     let _ = ctx.conn.execute(
         "UPDATE jobs SET video_status = 'dang_chay' WHERE id = ?1",
         rusqlite::params![ctx.job_id],
@@ -2585,6 +3008,461 @@ fn run_b3(
     })?;
 
     Ok(RowStatus::DaTaoVideo)
+}
+
+fn run_plugin_b3(
+    ctx: &WorkerRowCtx<'_>,
+    row: &mut prompts_csv::Row,
+    row_key: &str,
+    image: &Path,
+    force_new: bool,
+) -> Result<RowStatus, ApiFail> {
+    let bytes = std::fs::read(image).map_err(|e| ApiFail {
+        kind: ApiFailKind::NghiepVu,
+        http_status: None,
+        code: "IMAGE_READ_FAIL".into(),
+        message: e.to_string(),
+    })?;
+    let image_hash = sha2hex(&base64::engine::general_purpose::STANDARD.encode(&bytes));
+    let prior = if force_new {
+        None
+    } else {
+        crate::state_db::load_plugin_operation(ctx.conn, row_key, "B3").map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("Không đọc được operation video: {e}"),
+        })?
+    };
+    let reusable = prior.filter(|op| {
+        op.media_kind == "video"
+            && serde_json::from_str::<serde_json::Value>(&op.request_json)
+                .ok()
+                .is_some_and(|v| {
+                    v["image_sha256"] == image_hash && v["prompt"] == row.promt_tao_video
+                })
+    });
+    let lease = if let Some(op) = reusable.as_ref() {
+        crate::plugins::routing::hold_owner(&op.owner, "video", ctx.stop_flag)
+            .map_err(|e| e.as_api_fail())?
+    } else {
+        crate::plugins::routing::acquire(&ctx.cfg.video_source, "video", ctx.stop_flag)
+            .map_err(|e| e.as_api_fail())?
+    };
+    let prior_snapshot = reusable
+        .as_ref()
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o.request_json).ok());
+    let request = serde_json::json!({
+        "model":prior_snapshot.as_ref().and_then(|v|v["model"].as_str()).unwrap_or(&lease.model),
+        "prompt":row.promt_tao_video,"image_sha256":image_hash,
+        "size":prior_snapshot.as_ref().and_then(|v|v["size"].as_str()).unwrap_or(&ctx.cfg.video_size),
+        "seconds":prior_snapshot.as_ref().and_then(|v|v["seconds"].as_u64()).unwrap_or(ctx.cfg.video_seconds as u64)
+    });
+    let fingerprint = sha2hex(&request.to_string());
+    let op = if let Some(op) = reusable {
+        op
+    } else {
+        crate::state_db::prepare_plugin_operation(
+            ctx.conn,
+            ctx.job_id,
+            row_key,
+            "B3",
+            &lease.owner,
+            "video",
+            &request.to_string(),
+            &fingerprint,
+            force_new,
+        )
+        .map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: format!("Không lưu được operation trước khi gửi yêu cầu: {e}"),
+        })?
+    };
+    let saved_request =
+        serde_json::from_str::<serde_json::Value>(&op.request_json).unwrap_or_default();
+    let mut submit_cfg = ctx.cfg.clone();
+    if let Some(size) = saved_request["size"].as_str() {
+        submit_cfg.video_size = size.to_owned();
+    }
+    if let Some(seconds) = saved_request["seconds"].as_u64() {
+        submit_cfg.video_seconds = seconds as u32;
+    }
+    let _ = ctx.conn.execute(
+        "UPDATE plugin_operations SET job_id=?1,updated_at=?2 WHERE operation_id=?3",
+        rusqlite::params![
+            ctx.job_id,
+            chrono::Local::now().to_rfc3339(),
+            op.operation_id
+        ],
+    );
+    if ctx.stop_flag.load(Ordering::SeqCst) {
+        stop_plugin_operation(ctx, &op)?;
+        return Err(ApiFail::stopped("Đang chờ plugin xác nhận dừng video"));
+    }
+    let mut value = if plugin_operation_can_retry(&op) {
+        crate::plugins::client::submit_video(
+            &submit_cfg,
+            &op.owner,
+            &op.operation_id,
+            request["model"].as_str().unwrap_or(&lease.model),
+            image,
+            &row.promt_tao_video,
+        )
+        .map_err(|e| e.as_api_fail())?
+    } else if op.status != "prepared" {
+        match crate::plugins::client::lookup(&op.owner, &op.operation_id) {
+            Ok(v) => v,
+            Err(e) if e.http == Some(404) => {
+                return Err(persist_plugin_operation_error(
+                    ctx,
+                    &op,
+                    &e,
+                    "reconcile_needed",
+                ))
+            }
+            Err(e) => return Err(e.as_api_fail()),
+        }
+    } else {
+        crate::state_db::update_plugin_operation(
+            ctx.conn,
+            &op.operation_id,
+            "submitting",
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| ApiFail {
+            kind: ApiFailKind::NghiepVu,
+            http_status: None,
+            code: "DB_TX_FAIL".into(),
+            message: e.to_string(),
+        })?;
+        match crate::plugins::client::submit_video(
+            &submit_cfg,
+            &op.owner,
+            &op.operation_id,
+            request["model"].as_str().unwrap_or(&lease.model),
+            image,
+            &row.promt_tao_video,
+        ) {
+            Ok(v) => v,
+            Err(e) => match crate::plugins::client::lookup(&op.owner, &op.operation_id) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(persist_plugin_operation_error(
+                        ctx,
+                        &op,
+                        &e,
+                        if e.http.is_some() {
+                            "failed"
+                        } else {
+                            "reconcile_needed"
+                        },
+                    ))
+                }
+            },
+        }
+    };
+    let mut task_id = op.task_id.clone();
+    let start = Instant::now();
+    loop {
+        if let Some(t) = value.get("task_id").and_then(|v| v.as_str()) {
+            task_id = Some(t.to_owned());
+            let _ = ctx.conn.execute(
+                "UPDATE jobs SET video_task_id=?1 WHERE id=?2",
+                rusqlite::params![t, ctx.job_id],
+            );
+        }
+        match value["status"].as_str().unwrap_or("") {
+            "succeeded" => {
+                let name = value["media_name"].as_str().ok_or_else(|| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "PLUGIN_BAD_RESPONSE".into(),
+                    message: "Plugin thiếu media_name".into(),
+                })?;
+                crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    "succeeded",
+                    task_id.as_deref(),
+                    Some(name),
+                    None,
+                )
+                .map_err(|e| ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "DB_TX_FAIL".into(),
+                    message: e.to_string(),
+                })?;
+                let url = crate::plugins::client::media_url(&op.owner, name)
+                    .map_err(|e| e.as_api_fail())?;
+                let mut cfg = ctx.cfg.clone();
+                cfg.video_source = op.owner.clone();
+                let owner_ctx = WorkerRowCtx {
+                    emitter: ctx.emitter,
+                    cfg: &cfg,
+                    conn: ctx.conn,
+                    csv_path: ctx.csv_path,
+                    image_out: ctx.image_out,
+                    video_out: ctx.video_out,
+                    stop_flag: ctx.stop_flag,
+                    run_id: ctx.run_id,
+                    job_id: ctx.job_id,
+                    total: ctx.total,
+                    done_count: ctx.done_count,
+                    active_rows: ctx.active_rows,
+                };
+                download_and_commit_video(
+                    &owner_ctx,
+                    row,
+                    &url,
+                    task_id.as_deref().unwrap_or(&op.operation_id),
+                )?;
+                return Ok(RowStatus::DaTaoVideo);
+            }
+            "failed" | "reconcile_needed" | "cancelled" | "abandoned" => {
+                let error = value.get("error").cloned().unwrap_or_default();
+                let st = value["status"].as_str().unwrap_or("failed");
+                let _ = crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    st,
+                    task_id.as_deref(),
+                    None,
+                    Some(&error.to_string()),
+                );
+                let failure = crate::plugins::client::PluginError::from_error(&error, None);
+                crate::plugins::routing::block(&op.owner, &op.media_kind, &failure);
+                return Err(failure.as_api_fail());
+            }
+            "processing" => {
+                let _ = crate::state_db::update_plugin_operation(
+                    ctx.conn,
+                    &op.operation_id,
+                    "processing",
+                    task_id.as_deref(),
+                    None,
+                    None,
+                );
+                if ctx.stop_flag.load(Ordering::SeqCst) {
+                    crate::state_db::request_plugin_operation_stop(ctx.conn, &op.operation_id)
+                        .map_err(|e| ApiFail {
+                            kind: ApiFailKind::NghiepVu,
+                            http_status: None,
+                            code: "DB_TX_FAIL".into(),
+                            message: e.to_string(),
+                        })?;
+                    match crate::plugins::client::cancel(&op.owner, &op.operation_id) {
+                        Ok(v) => {
+                            let st = v["status"].as_str().unwrap_or("reconcile_needed");
+                            let _ = crate::state_db::confirm_plugin_operation_stop(
+                                ctx.conn,
+                                &op.operation_id,
+                                st,
+                            );
+                        }
+                        Err(e) => crate::plugins::routing::block(&op.owner, "video", &e),
+                    }
+                    return Err(ApiFail::stopped("Đang chờ plugin xác nhận dừng video"));
+                }
+                if start.elapsed().as_secs() >= lease.poll_max_s {
+                    return Err(ApiFail {
+                        kind: ApiFailKind::TamThoi {
+                            retry_after_s: None,
+                        },
+                        http_status: None,
+                        code: "POLL_TIMEOUT".into(),
+                        message:
+                            "Hết thời gian poll; operation plugin được giữ để tiếp tục đối soát"
+                                .into(),
+                    });
+                }
+                if adapters::sleep_interruptible(
+                    Duration::from_secs(lease.poll_interval_s.max(1)),
+                    ctx.stop_flag,
+                ) {
+                    continue;
+                }
+                let read = match task_id.as_deref() {
+                    Some(id) => crate::plugins::client::poll(&op.owner, id),
+                    None => crate::plugins::client::lookup(&op.owner, &op.operation_id),
+                };
+                value = match read {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(persist_plugin_operation_error(
+                            ctx,
+                            &op,
+                            &e,
+                            "reconcile_needed",
+                        ));
+                    }
+                };
+                // /videos/{task_id} may omit operation_id; the polling response is authoritative.
+                if value.get("status").and_then(|v| v.as_str()) == Some("processing") {
+                    continue;
+                }
+            }
+            _ => {
+                return Err(ApiFail {
+                    kind: ApiFailKind::NghiepVu,
+                    http_status: None,
+                    code: "PLUGIN_BAD_RESPONSE".into(),
+                    message: "Plugin trả trạng thái operation không hợp lệ".into(),
+                })
+            }
+        }
+    }
+}
+
+/// Recover a plugin clip that was abandoned or lost during polling. The saved
+/// operation owner and recovery ID are authoritative across Settings changes.
+pub fn recover_row_media(
+    cfg: &Settings,
+    project_path: &Path,
+    row_key: &str,
+) -> AppResult<serde_json::Value> {
+    let csv_path = project_path.join("prompts.csv");
+    let rows = prompts_csv::read_all(&csv_path)?;
+    let mut row = prompts_csv::find_row_by_key(&rows, row_key)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::new("ROW_NOT_FOUND", format!("Không tìm thấy dòng '{row_key}'."))
+        })?;
+    let conn =
+        crate::state_db::open(project_path).map_err(|e| AppError::new("DB_FAIL", e.to_string()))?;
+    let op = crate::state_db::load_plugin_operation(&conn, row_key, "B3")
+        .map_err(|e| AppError::new("DB_FAIL", e.to_string()))?
+        .ok_or_else(|| {
+            AppError::new(
+                "NO_RECOVERABLE_MEDIA",
+                "Không có operation plugin để khôi phục.",
+            )
+        })?;
+    let recovery_id = op
+        .error_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v["recoverable_media_id"].as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            AppError::new(
+                "NO_RECOVERABLE_MEDIA",
+                "Operation không có recoverable_media_id.",
+            )
+        })?;
+    let lease = crate::plugins::routing::hold_owner(&op.owner, "video", &AtomicBool::new(false))
+        .map_err(|e| AppError::new(&e.code, e.message))?;
+    let action = crate::plugins::client::action(
+        &op.owner,
+        "recover_media",
+        &serde_json::json!({"recoverable_media_id":recovery_id}),
+    )
+    .map_err(|e| AppError::new(&e.code, e.message))?;
+    let mut task_id = action["task_id"]
+        .as_str()
+        .map(str::to_owned)
+        .or(op.task_id.clone());
+    if let Some(id) = task_id.as_deref() {
+        crate::state_db::update_plugin_operation(
+            &conn,
+            &op.operation_id,
+            "processing",
+            Some(id),
+            None,
+            None,
+        )
+        .map_err(|e| AppError::new("DB_FAIL", e.to_string()))?;
+    }
+    let mut value = action;
+    let started = Instant::now();
+    loop {
+        if value["status"] == "succeeded" {
+            if let Some(name) = value["media_name"].as_str() {
+                let url = crate::plugins::client::media_url(&op.owner, name)
+                    .map_err(|e| AppError::new(&e.code, e.message))?;
+                let job_id=op.job_id.or_else(||conn.query_row("SELECT id FROM jobs WHERE LOWER(row_key)=LOWER(?1) ORDER BY id DESC LIMIT 1",rusqlite::params![row_key],|r|r.get(0)).ok())
+                    .ok_or_else(||AppError::new("JOB_NOT_FOUND","Không tìm thấy job để lưu video."))?;
+                let no_op = |_: &str, _: serde_json::Value| {};
+                let done = AtomicUsize::new(0);
+                let active = parking_lot::Mutex::new(Vec::new());
+                let stop = AtomicBool::new(false);
+                let mut local_cfg = cfg.clone();
+                local_cfg.video_source = op.owner.clone();
+                let image_out = project_path.join("image_out");
+                let video_out = project_path.join("video_out");
+                let ctx = WorkerRowCtx {
+                    emitter: &no_op,
+                    cfg: &local_cfg,
+                    conn: &conn,
+                    csv_path: &csv_path,
+                    image_out: &image_out,
+                    video_out: &video_out,
+                    stop_flag: &stop,
+                    run_id: 0,
+                    job_id,
+                    total: 1,
+                    done_count: &done,
+                    active_rows: &active,
+                };
+                download_and_commit_video(
+                    &ctx,
+                    &mut row,
+                    &url,
+                    task_id.as_deref().unwrap_or(&op.operation_id),
+                )
+                .map_err(|e| AppError::new(&e.code, e.message))?;
+                crate::state_db::update_plugin_operation(
+                    &conn,
+                    &op.operation_id,
+                    "succeeded",
+                    task_id.as_deref(),
+                    Some(name),
+                    None,
+                )
+                .map_err(|e| AppError::new("DB_FAIL", e.to_string()))?;
+                return Ok(
+                    serde_json::json!({"status":"succeeded","operation_id":op.operation_id,"owner":op.owner,"task_id":task_id,"media_name":name}),
+                );
+            }
+        }
+        if value["status"] == "failed"
+            || value["status"] == "reconcile_needed"
+            || value["status"] == "abandoned"
+        {
+            let error = value.get("error").cloned().unwrap_or_default();
+            let _ = crate::state_db::update_plugin_operation(
+                &conn,
+                &op.operation_id,
+                value["status"].as_str().unwrap_or("reconcile_needed"),
+                task_id.as_deref(),
+                None,
+                Some(&error.to_string()),
+            );
+            return Err(AppError::new(
+                "PLUGIN_RECOVERY_FAILED",
+                error["message"]
+                    .as_str()
+                    .unwrap_or("Plugin không thể phục hồi media."),
+            ));
+        }
+        if started.elapsed().as_secs() >= lease.poll_max_s {
+            return Ok(
+                serde_json::json!({"status":"processing","operation_id":op.operation_id,"owner":op.owner,"task_id":task_id}),
+            );
+        }
+        std::thread::sleep(Duration::from_secs(lease.poll_interval_s.max(1)));
+        let id = task_id.clone().ok_or_else(|| {
+            AppError::new("PLUGIN_BAD_RESPONSE", "Action recovery thiếu task_id.")
+        })?;
+        value = crate::plugins::client::poll(&op.owner, &id)
+            .map_err(|e| AppError::new(&e.code, e.message))?;
+        if let Some(id) = value["task_id"].as_str() {
+            task_id = Some(id.to_owned());
+        }
+    }
 }
 
 #[cfg(test)]

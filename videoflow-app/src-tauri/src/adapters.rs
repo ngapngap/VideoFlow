@@ -56,6 +56,23 @@ fn active_api_key(base_url: &str, which: &str) -> String {
 ///   Sidecar chưa chạy thì tự spawn (lazy). Lỗi spawn → ApiFail NghiepVu (không
 ///   retry — lỗi cấu hình/môi trường, người dùng phải sửa xong mới chạy lại).
 /// - Mặc định `"gateway"`: giữ nguyên endpoint ngoài đã lưu + model đã cấu hình + key keyring.
+fn plugin_endpoint(source: &str, kind: &str) -> Result<(String, String, String), ApiFail> {
+    use crate::plugins::{client::PluginError, host, routing};
+    let owners = routing::candidates(source).map_err(|e| e.as_api_fail())?;
+    let owner = owners.first().ok_or_else(|| {
+        PluginError::local("PLUGIN_UNAVAILABLE", "Không có instance khả dụng").as_api_fail()
+    })?;
+    let session = host::session(owner)
+        .map_err(|e| PluginError::local("PLUGIN_UNAVAILABLE", e.message).as_api_fail())?;
+    let model = session
+        .config
+        .get(format!("{kind}_model"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((format!("{}/v1", session.origin), session.token, model))
+}
+
 fn resolve_video_base_and_key(cfg: &Settings) -> Result<(String, String, String), ApiFail> {
     resolve_video_base_and_key_with(cfg, crate::muse_sidecar::ensure_running)
 }
@@ -67,8 +84,15 @@ fn resolve_video_base_and_key_with<F>(
 where
     F: FnOnce(&Settings) -> AppResult<crate::muse_sidecar::SidecarSession>,
 {
+    if crate::plugins::routing::is_plugin(&cfg.video_source) {
+        return plugin_endpoint(&cfg.video_source, "video");
+    }
     if cfg.video_source != "internal" {
-        let base = cfg.endpoint_video_base_url.trim().trim_end_matches('/').to_string();
+        let base = cfg
+            .endpoint_video_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         let key = active_api_key(&base, "video");
         return Ok((base, key, cfg.endpoint_video_model.trim().to_string()));
     }
@@ -92,8 +116,15 @@ fn is_internal_video_source(cfg: &Settings) -> bool {
 ///   model cố định `muse-image` (muse2api tự resolve alias).
 /// - Mặc định: endpoint gateway ngoài + model đã cấu hình + key keyring.
 fn resolve_image_base_and_key(cfg: &Settings) -> Result<(String, String, String), ApiFail> {
+    if crate::plugins::routing::is_plugin(&cfg.image_source) {
+        return plugin_endpoint(&cfg.image_source, "image");
+    }
     if cfg.image_source != "internal" {
-        let base = cfg.endpoint_image_base_url.trim().trim_end_matches('/').to_string();
+        let base = cfg
+            .endpoint_image_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         let key = active_api_key(&base, "anh");
         return Ok((base, key, cfg.endpoint_image_model.trim().to_string()));
     }
@@ -1148,7 +1179,25 @@ pub fn download_video(
         let (base_clean, key, _model) = resolve_video_base_and_key(cfg)?;
         let attach_auth = !key.is_empty() && is_same_origin(&current_url, &base_clean);
 
-        let mut req = client_for_url(600, current_url.trim()).get(current_url.trim());
+        let plugin_media = crate::plugins::routing::is_plugin(&cfg.video_source);
+        let http = if plugin_media {
+            if !attach_auth {
+                return Err(crate::plugins::client::PluginError::local(
+                    "PLUGIN_MEDIA_ORIGIN",
+                    "Origin của media không khớp phiên plugin",
+                )
+                .as_api_fail());
+            }
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(600))
+                .build()
+                .map_err(|e| ApiFail::network(&e))?
+        } else {
+            client_for_url(600, current_url.trim())
+        };
+        let mut req = http.get(current_url.trim());
         if attach_auth {
             req = req.bearer_auth(&key);
         }
@@ -1156,6 +1205,14 @@ pub fn download_video(
         match req.send() {
             Ok(mut resp) => {
                 let st = resp.status().as_u16();
+                if plugin_media && st != 200 {
+                    let err = resp.json::<Value>().unwrap_or_default();
+                    return Err(crate::plugins::client::PluginError::from_error(
+                        &err["error"],
+                        Some(st),
+                    )
+                    .as_api_fail());
+                }
                 if (st == 403 || st == 404) && !refreshed_url_once {
                     refreshed_url_once = true;
                     // URL hết hạn: poll lại task 1 lần để lấy URL mới, KHÔNG tính là 1 trong 3 lần retry download
@@ -1344,6 +1401,23 @@ pub fn test_connection(
     api_key: Option<&str>,
 ) -> AppResult<(bool, u64, String)> {
     let start = Instant::now();
+    if base_url.is_none() && api_key.is_none() {
+        let source = if which == "anh" {
+            &cfg.image_source
+        } else {
+            &cfg.video_source
+        };
+        if crate::plugins::routing::is_plugin(source) {
+            let models = list_models(cfg, which, None, None);
+            return Ok((
+                models.is_ok(),
+                start.elapsed().as_millis() as u64,
+                models
+                    .map(|_| "Đã đọc capabilities".into())
+                    .unwrap_or_else(|e| e.message),
+            ));
+        }
+    }
     let (base, key) = resolve_endpoint_and_key(cfg, which, base_url, api_key);
     if base.is_empty() {
         return Ok((false, 0, "Chưa nhập Base URL endpoint".into()));
@@ -1381,6 +1455,29 @@ pub fn list_models(
     base_url: Option<&str>,
     api_key: Option<&str>,
 ) -> AppResult<Vec<String>> {
+    if base_url.is_none() && api_key.is_none() {
+        let (source, kind) = if which == "anh" {
+            (&cfg.image_source, "image")
+        } else {
+            (&cfg.video_source, "video")
+        };
+        if crate::plugins::routing::is_plugin(source) {
+            let owners = crate::plugins::routing::candidates(source)
+                .map_err(|e| AppError::new(&e.code, e.message))?;
+            let owner = owners
+                .first()
+                .ok_or_else(|| AppError::new("PLUGIN_UNAVAILABLE", "Không có instance khả dụng"))?;
+            let session = crate::plugins::host::session(owner)?;
+            let caps = crate::plugins::client::get(owner, &session.capabilities_path)
+                .map_err(|e| AppError::new(&e.code, e.message))?;
+            return Ok(caps[kind]["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect());
+        }
+    }
     let (base, key) = resolve_endpoint_and_key(cfg, which, base_url, api_key);
     if base.is_empty() {
         return Err(AppError::new(
