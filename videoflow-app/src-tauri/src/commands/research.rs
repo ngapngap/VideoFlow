@@ -107,15 +107,28 @@ pub async fn research(
 ) -> AppResult<Value> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let fields = payload.as_object_mut().ok_or_else(|| invalid("Payload phải là object."))?;
-        if fields.contains_key("_provider") { return Err(invalid("Nguồn prompt do host quản lý.")); }
-        match action.as_str() {
-            "develop_start" | "batch_resume" | "develop_repair" | "variant_edit" => { fields.insert("_provider".into(),provider(&cfg)?); }
-            "search_start" | "search_list" | "search_get" | "search_resume" | "search_stop" |
-            "search_sources" | "set_sources" | "idea_get" | "prepare_ideas" | "idea_update" | "select_idea" | "batch_get" | "batch_stop" => {}
-            _ => return Err(invalid("Thao tác Reels không hợp lệ.")),
+        if !payload.is_object() || payload.get("_provider").is_some() {
+            return Err(invalid("Payload hoặc nguồn prompt không hợp lệ."));
         }
         let session = crate::muse_sidecar::ensure_running(&cfg)?;
+        match action.as_str() {
+            "develop_start" => payload["_provider"] = provider(&cfg)?,
+            "batch_resume" | "develop_repair" | "variant_edit" => {
+                let batch = post(&session, "batch_get", &json!({"batch_id":payload["batch_id"]}))?;
+                let mut saved = batch.pointer("/batch/provider").or_else(||batch.get("provider"))
+                    .cloned().ok_or_else(||invalid("Thiếu cấu hình đã lưu của lượt triển khai."))?;
+                if saved["source"] == "gateway" {
+                    let base = saved["base_url"].as_str().ok_or_else(||invalid("Thiếu endpoint đã lưu."))?;
+                    let key = settings::prompt_key(base).ok_or_else(||invalid("Thiếu API key cho endpoint đã lưu của lượt triển khai."))?;
+                    saved["api_key"] = json!(key);
+                }
+                payload["_provider"] = saved;
+            }
+            "search_start" | "search_list" | "search_get" | "search_resume" | "search_stop" |
+            "search_sources" | "set_sources" | "idea_get" | "prepare_ideas" | "idea_update" |
+            "select_idea" | "batch_get" | "batch_stop" => {}
+            _ => return Err(invalid("Thao tác Reels không hợp lệ.")),
+        }
         let mut result = post(&session,&action,&payload)?;
         attach_assets(&app, &mut result)?;
         if !matches!(action.as_str(),"search_get"|"search_list"|"search_sources"|"idea_get"|"batch_get") {
@@ -272,15 +285,94 @@ pub async fn research_transfer(
         let prepared=post(&session,"transfer_prepare",&payload)?;
         if prepared["status"]=="committed" || prepared["committed"]==true {return Ok(prepared);}
         let data=serde_json::from_value(prepared).map_err(|_| invalid("Phản hồi bàn giao thiếu dữ liệu."))?;
+        let gate = PROJECT_WRITE_GATE.lock();
         let current=state.project.read();
         if current.as_ref()!=Some(&project) {return Err(invalid("Project đã thay đổi."));}
         ensure_not_running(&state)?;
         let added=write_rows(&project,&ordinals,data)?;
         drop(current);
+        drop(gate);
         payload["added"]=json!(added);
         payload["existing"]=json!(ordinals.len()-added);
         let result=post(&session,"transfer_commit",&payload)?;
         let _=app.emit("research:changed",json!({"action":"transfer_commit","batch_id":batch_id}));
         Ok(result)
     }).await.map_err(|e|invalid(&e.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(rows: &[u32]) -> Prepared {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = encoded.into_inner();
+        Prepared {
+            image_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            image_sha256: format!("{:x}", Sha256::digest(bytes)),
+            rows: rows
+                .iter()
+                .map(|&ordinal| TransferRow {
+                    ordinal,
+                    image_prompt: format!("Ảnh {ordinal}"),
+                    video_prompt: format!("Video {ordinal}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn transfer_reuses_image_and_existing_rows_after_interrupted_commit() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("input")).unwrap();
+        assert_eq!(write_rows(project.path(), &[1], sample(&[1])).unwrap(), 1);
+        assert_eq!(
+            write_rows(project.path(), &[1, 3], sample(&[1, 3])).unwrap(),
+            1
+        );
+        assert_eq!(
+            write_rows(project.path(), &[1, 3], sample(&[1, 3])).unwrap(),
+            0
+        );
+        let rows = prompts_csv::read_all(&project.path().join("prompts.csv")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].anh_tham_chieu, rows[1].anh_tham_chieu);
+        assert_eq!(rows[1].promt_tao_video, "Video 3");
+        assert_eq!(
+            std::fs::read_dir(project.path().join("input"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mismatched_hash_or_ordinals_prevent_writes() {
+        let project = tempfile::tempdir().unwrap();
+        let mut data = sample(&[1]);
+        data.image_sha256 = "0".repeat(64);
+        assert!(write_rows(project.path(), &[1], data).is_err());
+        assert!(write_rows(project.path(), &[1], sample(&[2])).is_err());
+        assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_install_gets_research_defaults_and_separate_prompt_endpoint() {
+        let settings: Settings =
+            serde_json::from_value(json!({"video_source":"internal"})).unwrap();
+        assert_eq!(
+            (settings.reels_min_likes, settings.reels_min_views),
+            (Some(500), Some(30_000))
+        );
+        assert_eq!(settings.prompt_source, "gateway");
+        assert!(settings.endpoint_prompt_base_url.is_empty());
+        assert_eq!(
+            settings::prompt_origin("https://example.org:443/v1").unwrap(),
+            "https://example.org"
+        );
+        assert!(settings::prompt_origin("https://key@example.org/v1").is_err());
+    }
 }

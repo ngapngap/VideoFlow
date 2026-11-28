@@ -1250,7 +1250,11 @@ fn app_exiting_error() -> AppError {
     )
 }
 
+// Serialize the short CSV transfer commit with admission to the rendering engine.
+pub(super) static PROJECT_WRITE_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 pub(crate) fn try_begin_run(state: &AppState) -> AppResult<()> {
+    let _gate = PROJECT_WRITE_GATE.lock();
     if state.exit_requested.load(Ordering::SeqCst) {
         return Err(app_exiting_error());
     }
