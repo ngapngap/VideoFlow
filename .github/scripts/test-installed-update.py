@@ -62,6 +62,12 @@ with sync_playwright() as pw:
     except TimeoutError:
         subprocess.Popen([APP])
         after, new_page = attach(pw.chromium, "1.6.0", 90)
-    new_page.get_by_text("Ý tưởng Reels", exact=False).first.click(timeout=30000)
+    new_page.get_by_test_id("nav-reels").click(timeout=30000)
+    result = new_page.evaluate("""() => window.__TAURI_INTERNALS__.invoke(
+        'research', {action:'search_list',payload:{limit:20}})""")
+    assert isinstance(result.get("items"), list), result
+    settings = new_page.evaluate("() => window.__TAURI_INTERNALS__.invoke('get_settings')")
+    assert settings["settings"]["prompt_source"] == "gateway"
+    assert settings["settings"]["reels_min_likes"] == 500
     new_page.screenshot(path="reels-after-update.png")
     print("PASS: signed updater installed 1.6.0, new desktop opened Reels", flush=True)

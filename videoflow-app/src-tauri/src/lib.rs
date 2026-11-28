@@ -61,6 +61,7 @@ pub fn run() {
             commands::list_models,
             commands::research::research,
             commands::research::research_transfer,
+            commands::research::research_open_url,
             commands::get_settings,
             commands::save_settings,
             commands::set_api_key_cmd,

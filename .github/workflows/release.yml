@@ -321,6 +321,9 @@ jobs:
               Write-Host "mock: driver=$($st.driver.driver) ok=$($st.driver.ok)"
               if ($st.driver.driver -ne "mock") { throw "driver sai: $($st.driver.driver)" }
 
+              $research = Invoke-RestMethod "$base/internal/research/search_list" -Method Post -Headers $h -ContentType "application/json" -Body '{"limit":20}'
+              if (-not $research.ok -or $null -eq $research.data.items) { throw "Missing packaged Reels research service" }
+
               # /v1/models phải có model VideoFlow dùng
               $models = Invoke-RestMethod -Uri "$base/v1/models" -Headers $h
               $ids = @($models.data | ForEach-Object { $_.id })
@@ -434,6 +437,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $base = "https://github.com/${{ github.repository }}/releases/latest/download"
+          $manifest = Invoke-RestMethod "$base/latest.json"
+          if ($manifest.version.TrimStart('v') -ne '1.6.0') { throw "Wrong updater manifest $($manifest.version)" }
+          $target = $manifest.platforms.'windows-x86_64'
+          if (-not $target.url -or -not $target.signature) { throw "Missing Windows signed update" }
+          $sig = (Invoke-RestMethod "$($target.url).sig").Trim()
+          if ($sig -cne $target.signature.Trim()) { throw "Manifest signature differs from published .sig" }
           gh release download v1.5.5 --pattern '*_x64-setup.exe' --dir "$env:RUNNER_TEMP/previous"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $installer = Get-ChildItem "$env:RUNNER_TEMP/previous" -Filter '*.exe'

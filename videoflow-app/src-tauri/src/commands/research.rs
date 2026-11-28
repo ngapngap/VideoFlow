@@ -64,8 +64,9 @@ pub(super) fn test_prompt(
         .timeout(Duration::from_secs(cfg.prompt_timeout_s.clamp(5, 3600)))
         .build()
         .map_err(|_| invalid("Không khởi tạo được HTTP client."))?;
+    let endpoint = if base.ends_with("/chat/completions") { base } else { format!("{base}/chat/completions") };
     let mut request = client
-        .post(format!("{base}/chat/completions"))
+        .post(endpoint)
         .json(&json!({
             "model":model,"stream":false,"messages":[{"role":"user","content":"Reply OK."}]
         }));
@@ -96,6 +97,18 @@ pub(super) fn test_prompt(
         start.elapsed().as_millis() as u64,
         format!("{model} đã trả lời."),
     ))
+}
+
+#[tauri::command]
+pub fn research_open_url(url: String) -> AppResult<()> {
+    let target = reqwest::Url::parse(&url).map_err(|_|invalid("URL không hợp lệ."))?;
+    if !matches!(target.scheme(),"http"|"https") || target.host_str().is_none()
+        || !target.username().is_empty() || target.password().is_some() {
+        return Err(invalid("Chỉ mở liên kết HTTP(S)."));
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(target.as_str()).spawn().map_err(|e|AppError::new("OPEN_URL",e.to_string()))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -292,6 +305,7 @@ pub async fn research_transfer(
         let added=write_rows(&project,&ordinals,data)?;
         drop(current);
         drop(gate);
+        let _ = app.emit("external_files_changed",json!({"path":project}));
         payload["added"]=json!(added);
         payload["existing"]=json!(ordinals.len()-added);
         let result=post(&session,"transfer_commit",&payload)?;
