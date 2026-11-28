@@ -32,7 +32,7 @@ jobs:
           if ($result.ExitCode) { throw "NSIS exit code $($result.ExitCode)" }
           python -m pip install websockets==16.0
       - name: Upgrade through the 1.5.5 WebView and verify installed 1.6.0
-        run: python .github/scripts/test-installed-update.py
+        run: python -X utf8 .github/scripts/test-installed-update.py
       - uses: actions/upload-artifact@v4
         if: success()
         with:
