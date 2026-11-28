@@ -417,3 +417,33 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           args: --target x86_64-pc-windows-msvc
+
+  upgrade-from-155:
+    name: Installed Desktop update 1.5.5 to 1.6.0
+    if: github.ref == 'refs/tags/v1.6.0'
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install official previous release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v1.5.5 --pattern '*_x64-setup.exe' --dir "$env:RUNNER_TEMP/previous"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $installer = Get-ChildItem "$env:RUNNER_TEMP/previous" -Filter '*.exe'
+          $result = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -PassThru -Wait
+          if ($result.ExitCode) { throw "NSIS exit code $($result.ExitCode)" }
+          python -m pip install playwright
+      - name: Upgrade through the 1.5.5 WebView and verify installed 1.6.0
+        run: python .github/scripts/test-installed-update.py
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: installed-update-1.5.5-to-1.6.0
+          path: reels-after-update.png

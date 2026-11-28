@@ -59,6 +59,8 @@ pub fn run() {
             commands::skip_row,
             commands::save_row_prompts,
             commands::list_models,
+            commands::research::research,
+            commands::research::research_transfer,
             commands::get_settings,
             commands::save_settings,
             commands::set_api_key_cmd,

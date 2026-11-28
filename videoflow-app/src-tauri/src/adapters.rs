@@ -1298,6 +1298,12 @@ pub fn resolve_endpoint_and_key(
     base_url: Option<&str>,
     api_key: Option<&str>,
 ) -> (String, String) {
+    if which == "prompt" {
+        let base = base_url.unwrap_or(&cfg.endpoint_prompt_base_url).trim();
+        let key = api_key.map(str::to_string).or_else(|| crate::settings::prompt_key(base)).unwrap_or_default();
+        crate::settings::register_secret_for_redaction(&key);
+        return (base.to_owned(), key);
+    }
     // Nguồn nội bộ (ảnh hoặc video) chỉ áp dụng khi không truyền draft URL/key.
     if base_url.is_none() && api_key.is_none() {
         let internal = if which == "anh" {

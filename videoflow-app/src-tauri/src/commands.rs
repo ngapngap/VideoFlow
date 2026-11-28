@@ -125,6 +125,7 @@ fn compute_duration_ms(started_at: &str, finished_at: Option<&str>) -> Option<i6
 pub mod history;
 pub mod muse;
 pub mod proxies;
+pub mod research;
 pub use history::*;
 pub use muse::*;
 pub use proxies::*;
@@ -261,6 +262,8 @@ pub struct SettingsView {
     pub settings: Settings,
     pub image_key_preview: Option<String>,
     pub video_key_preview: Option<String>,
+    pub prompt_key_preview: Option<String>,
+    pub has_prompt_key: bool,
     pub has_image_key: bool,
     pub has_video_key: bool,
     pub muse_total_accounts: usize,
@@ -2361,7 +2364,10 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsView {
     let (muse_total_accounts, muse_video_accounts) =
         crate::muse_sidecar::count_accounts_from_disk(&muse_dir);
     let ffmpeg_resolved = crate::ffmpeg::resolve_ffmpeg_binary(&s.ffmpeg_path).ok();
+    let prompt_key = settings::prompt_key(&s.endpoint_prompt_base_url);
     SettingsView {
+        has_prompt_key: prompt_key.is_some(),
+        prompt_key_preview: prompt_key.as_deref().and_then(settings::mask_api_key),
         settings: s,
         image_key_preview: settings::key_preview("anh"),
         video_key_preview: settings::key_preview("video"),
@@ -2420,10 +2426,22 @@ pub async fn pick_ffmpeg_binary(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn save_settings(settings: Settings, state: State<'_, AppState>) -> AppResult<bool> {
+pub fn save_settings(mut settings: Settings, prompt_key: Option<String>, state: State<'_, AppState>) -> AppResult<bool> {
     let muse_dir = settings::app_data_dir().join(crate::muse_sidecar::MUSE_DATA_DIR);
     let (_, muse_video_accounts) = crate::muse_sidecar::count_accounts_from_disk(&muse_dir);
     validate_settings_concurrency(&settings, muse_video_accounts)?;
+    settings.endpoint_prompt_base_url = settings.endpoint_prompt_base_url.trim().trim_end_matches('/').into();
+    settings.endpoint_prompt_model = settings.endpoint_prompt_model.trim().into();
+    settings.reels_country = settings.reels_country.trim().to_ascii_uppercase();
+    if !settings.endpoint_prompt_base_url.is_empty() {
+        settings::prompt_origin(&settings.endpoint_prompt_base_url)?;
+    }
+    if !matches!(settings.prompt_source.as_str(), "gateway" | "internal")
+        || !(5..=3600).contains(&settings.prompt_timeout_s)
+        || [settings.reels_min_likes,settings.reels_min_views].into_iter().flatten().any(|n| n > i32::MAX as u32)
+        || !(settings.reels_country.is_empty() || (settings.reels_country.len() == 2 && settings.reels_country.bytes().all(|c| c.is_ascii_uppercase()))) {
+        return Err(AppError::new("BAD_RESEARCH_SETTINGS","Kiểm tra cấu hình Reels và endpoint prompt."));
+    }
 
     let start_with_windows = {
         let mut cur = state.settings_cache.write();
@@ -2432,7 +2450,16 @@ pub fn save_settings(settings: Settings, state: State<'_, AppState>) -> AppResul
         let mut s = settings;
         s.recent_projects = recent;
         s.current_project = current;
-        state.settings.save(&s)?;
+        let old_key = prompt_key.as_ref().and_then(|_| settings::prompt_key(&s.endpoint_prompt_base_url));
+        if let Some(key) = &prompt_key {
+            settings::set_prompt_key(&s.endpoint_prompt_base_url, key)?;
+        }
+        if let Err(error) = state.settings.save(&s) {
+            if prompt_key.is_some() {
+                settings::set_prompt_key(&s.endpoint_prompt_base_url, old_key.as_deref().unwrap_or(""))?;
+            }
+            return Err(error);
+        }
         let loaded = state.settings.load();
         let autostart = loaded.start_with_windows;
         *cur = loaded;
@@ -2516,12 +2543,17 @@ pub fn force_quit_app(
 #[tauri::command]
 pub async fn test_connection(
     which: String,
+    source: Option<String>,
+    model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<(bool, u64, String)> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if which == "prompt" {
+            return research::test_prompt(&cfg, source.as_deref(), base_url.as_deref(), model.as_deref(), api_key.as_deref());
+        }
         crate::adapters::test_connection(&cfg, &which, base_url.as_deref(), api_key.as_deref())
     })
     .await
@@ -2537,6 +2569,9 @@ pub async fn list_models(
 ) -> AppResult<Vec<String>> {
     let cfg = state.settings_cache.read().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if which == "prompt" {
+            settings::prompt_origin(base_url.as_deref().unwrap_or(&cfg.endpoint_prompt_base_url))?;
+        }
         crate::adapters::list_models(&cfg, &which, base_url.as_deref(), api_key.as_deref())
     })
     .await

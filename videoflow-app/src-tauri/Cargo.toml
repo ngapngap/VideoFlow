@@ -1,6 +1,6 @@
 [package]
 name = "videoflow-desktop"
-version = "1.5.5"
+version = "1.6.0"
 description = "VideoFlow Desktop - chay luong tao anh - tao video local-only"
 edition = "2021"
 rust-version = "1.77"
@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "stream", "blocking", "socks"] }
+tempfile = "3"
 base64 = "0.22"
 getrandom = "0.2"
 sha2 = "0.10"

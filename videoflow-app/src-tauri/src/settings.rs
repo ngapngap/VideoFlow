@@ -44,6 +44,14 @@ pub struct Settings {
     /// Nguồn sinh ảnh: "gateway" (gateway ngoài, mặc định) | "internal" (VideoFlow Muse).
     pub image_source: String,
     pub endpoint_video_base_url: String,
+    pub prompt_source: String,
+    pub endpoint_prompt_base_url: String,
+    pub endpoint_prompt_model: String,
+    pub prompt_timeout_s: u64,
+    pub reels_min_likes: Option<u32>,
+    pub reels_min_views: Option<u32>,
+    pub reels_country: String,
+    pub reels_require_buy_link: bool,
     pub endpoint_video_model: String,
     /// Nguồn sinh video: "gateway" (gateway ngoài, mặc định) | "internal" (muse2api nội bộ).
     pub video_source: String,
@@ -87,6 +95,14 @@ impl Default for Settings {
             endpoint_image_model: "gpt-image-2".into(),
             image_source: "gateway".into(),
             endpoint_video_base_url: "https://muse.photowrapped.com/v1".into(),
+            prompt_source: "gateway".into(),
+            endpoint_prompt_base_url: String::new(),
+            endpoint_prompt_model: String::new(),
+            prompt_timeout_s: 900,
+            reels_min_likes: Some(500),
+            reels_min_views: Some(30_000),
+            reels_country: String::new(),
+            reels_require_buy_link: false,
             endpoint_video_model: "muse-video".into(),
             video_source: "gateway".into(),
             muse_chromium_path: String::new(),
@@ -378,6 +394,28 @@ pub fn set_api_key(which: &str, value: &str) -> AppResult<()> {
         "video" => KEY_VIDEO,
         _ => return Err(AppError::new("BAD_KEY_NAME", "Tên khóa không hợp lệ")),
     };
+    write_credential(key_name, value)
+}
+
+pub fn prompt_origin(base: &str) -> AppResult<String> {
+    let bad = || AppError::new("BAD_PROMPT_URL", "Endpoint prompt phải là URL HTTP(S).");
+    let url = reqwest::Url::parse(base.trim()).map_err(|_| bad())?;
+    if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none()
+        || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(bad());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+pub fn prompt_key(base: &str) -> Option<String> {
+    read_credential(&format!("endpoint_prompt_key:{}", prompt_origin(base).ok()?))
+}
+
+pub fn set_prompt_key(base: &str, value: &str) -> AppResult<()> {
+    write_credential(&format!("endpoint_prompt_key:{}", prompt_origin(base)?), value)
+}
+
+fn write_credential(key_name: &str, value: &str) -> AppResult<()> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, key_name)
         .map_err(|e| AppError::new("KEYRING_FAIL", format!("{e}")))?;
 
@@ -404,6 +442,10 @@ pub fn get_api_key(which: &str) -> Option<String> {
         "video" => KEY_VIDEO,
         _ => return None,
     };
+    read_credential(key_name)
+}
+
+fn read_credential(key_name: &str) -> Option<String> {
     let key = keyring::Entry::new(KEYRING_SERVICE, key_name)
         .ok()
         .and_then(|e| e.get_password().ok())
