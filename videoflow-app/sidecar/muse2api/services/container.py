@@ -15,7 +15,9 @@ from ..drivers.browser.interactive import InteractiveBrowserManager
 from ..drivers.registry import create_driver
 from .gateway import Gateway
 from .request_log import RequestLog, current_record
+from .research_store import ResearchStore
 from .tasks import Task, TaskManager
+from .transport import MuseResearchTransport
 
 
 @dataclass
@@ -30,6 +32,9 @@ class Services:
     keys: KeyStore
     requests: RequestLog
     interactive: InteractiveBrowserManager | None = None
+    research_store: ResearchStore | None = None
+    research: object | None = None
+    research_transport: MuseResearchTransport | None = None
 
     @classmethod
     def build(cls, settings: Settings, driver: MuseDriver | None = None) -> Services:
@@ -58,7 +63,7 @@ class Services:
                 is_blocked=interactive.is_session_active,
             )
 
-        return cls(
+        instance = cls(
             settings=settings,
             driver=driver,
             pool=pool,
@@ -70,3 +75,8 @@ class Services:
             requests=requests,
             interactive=interactive,
         )
+        from .research_service import ResearchService
+        instance.research = ResearchService(settings.data_dir.parent / "research", instance)
+        instance.research_store = instance.research.store
+        instance.research_transport = MuseResearchTransport(settings, pool, driver)
+        return instance

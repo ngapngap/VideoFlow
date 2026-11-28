@@ -181,7 +181,7 @@ fn attach_assets(app: &AppHandle, value: &mut Value) -> AppResult<()> {
                         app.asset_protocol_scope()
                             .allow_file(&path)
                             .map_err(|e| invalid(&e.to_string()))?;
-                        fields.insert("asset_path".into(), json!(path));
+                        fields.insert("asset".into(), json!(path));
                     }
                 }
             }

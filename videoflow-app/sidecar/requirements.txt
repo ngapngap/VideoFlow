@@ -13,5 +13,6 @@ httpx[socks]==0.28.1
 socksio==1.0.0
 websockets==16.0
 python-multipart==0.0.26
+pillow==11.3.0
 # Build tool (không cần khi chỉ chạy source)
 pyinstaller==6.20.0

@@ -200,6 +200,15 @@ export interface Settings {
   endpoint_video_model: string;
   /** Nguồn sinh video: "gateway" (mặc định) | "internal" (VideoFlow Muse nội bộ) */
   video_source: string;
+  /** Nguồn tạo prompt cho quy trình nghiên cứu: gateway độc lập hoặc Muse nội bộ. */
+  prompt_source: "gateway" | "internal" | string;
+  endpoint_prompt_base_url: string;
+  endpoint_prompt_model: string;
+  prompt_timeout_s: number;
+  reels_min_likes: number | null;
+  reels_min_views: number | null;
+  reels_country: string;
+  reels_require_buy_link: boolean;
   /** Đường dẫn trình duyệt (Edge/Chrome) sidecar điều khiển; rỗng = tự dò */
   muse_chromium_path: string;
   /** Sidecar chạy Chromium headless (mặc định true) */
@@ -240,6 +249,8 @@ export interface SettingsView {
   video_key_preview: string | null;
   has_image_key: boolean;
   has_video_key: boolean;
+  prompt_key_preview?: string | null;
+  has_prompt_key?: boolean;
   muse_total_accounts?: number;
   muse_video_accounts?: number;
   max_concurrency?: number;
@@ -404,14 +415,20 @@ export const api = {
   list_models: (which: string, baseUrl?: string, apiKey?: string) =>
     invoke<string[]>("list_models", { which, baseUrl, apiKey }),
   get_settings: () => invoke<SettingsView>("get_settings"),
-  save_settings: (settings: Settings) => invoke<boolean>("save_settings", { settings }),
+  save_settings: (settings: Settings, promptKey?: string | null) =>
+    invoke<boolean>("save_settings", { settings, promptKey }),
   set_api_key: (which: string, value: string) =>
     invoke<boolean>("set_api_key_cmd", { which, value }),
   check_ffmpeg: (overridePath?: string | null) =>
     invoke<FfmpegStatus>("check_ffmpeg", { overridePath: overridePath ?? null }),
   pick_ffmpeg_binary: () => invoke<string | null>("pick_ffmpeg_binary"),
-  test_connection: (which: string, baseUrl?: string, apiKey?: string) =>
-    invoke<[boolean, number, string]>("test_connection", { which, baseUrl, apiKey }),
+  test_connection: (
+    which: string,
+    baseUrl?: string,
+    apiKey?: string,
+    model?: string,
+    source?: "gateway" | "internal"
+  ) => invoke<[boolean, number, string]>("test_connection", { which, baseUrl, apiKey, model, source }),
   get_history: (
     page = 1,
     pageSize = 25,

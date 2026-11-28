@@ -45,8 +45,9 @@
   import Icons from "../lib/Icons.svelte";
   import Modal from "../lib/Modal.svelte";
 
-  type Tab = "project" | "image" | "video" | "run" | "general";
-  let tab: Tab = "project";
+  type Tab = "project" | "image" | "video" | "prompt" | "reels" | "run" | "general";
+  export let initialTab: Tab = "project";
+  let tab: Tab = initialTab;
   let loading = true;
   let saving = false;
   let recheckingProject = false;
@@ -55,18 +56,24 @@
   let settingsMuseVideoAccounts = 0;
   let imageKeyPreview = "";
   let videoKeyPreview = "";
+  let promptKeyPreview = "";
   let hasImageKey = false;
   let hasVideoKey = false;
+  let hasPromptKey = false;
 
   let imageKeyInput = "";
   let videoKeyInput = "";
+  let promptKeyInput = "";
   let pendingClearImageKey = false;
   let pendingClearVideoKey = false;
+  let pendingClearPromptKey = false;
 
   let showImageKey = false;
   let showVideoKey = false;
+  let showPromptKey = false;
   let imageKeyHideTimer: ReturnType<typeof setTimeout> | null = null;
   let videoKeyHideTimer: ReturnType<typeof setTimeout> | null = null;
+  let promptKeyHideTimer: ReturnType<typeof setTimeout> | null = null;
 
   let dirty = false;
   let saveMsg = "";
@@ -98,6 +105,12 @@
   let loadingVideoModels = false;
   let videoModels: string[] = [];
   let videoModelMsg = "";
+  let loadingPromptModels = false;
+  let promptModels: string[] = [];
+  let promptModelMsg = "";
+  let testingPrompt = false;
+  let testPrompt = "";
+  let testPromptOk: boolean | null = null;
 
   // ━━ VideoFlow Muse nội bộ: engine + pool cookie + hạn mức (tab Endpoint video) ━━
   let museLoading = false;
@@ -243,6 +256,8 @@
     { key: "project", label: "Dự án Local", icon: "folder" },
     { key: "image", label: "Endpoint ảnh", icon: "image" },
     { key: "video", label: "Endpoint video", icon: "video" },
+    { key: "prompt", label: "Endpoint prompt", icon: "beaker" },
+    { key: "reels", label: "Tìm ý tưởng Reels", icon: "search" },
     { key: "run", label: "Chạy và thử lại", icon: "redo" },
     { key: "general", label: "Chung", icon: "settings" },
   ];
@@ -252,6 +267,7 @@
   function hideAllKeyVisibility() {
     showImageKey = false;
     showVideoKey = false;
+    showPromptKey = false;
     if (imageKeyHideTimer) {
       clearTimeout(imageKeyHideTimer);
       imageKeyHideTimer = null;
@@ -260,9 +276,13 @@
       clearTimeout(videoKeyHideTimer);
       videoKeyHideTimer = null;
     }
+    if (promptKeyHideTimer) {
+      clearTimeout(promptKeyHideTimer);
+      promptKeyHideTimer = null;
+    }
   }
 
-  function toggleKeyVisibility(which: "anh" | "video") {
+  function toggleKeyVisibility(which: "anh" | "video" | "prompt") {
     if (which === "anh") {
       if (imageKeyHideTimer) {
         clearTimeout(imageKeyHideTimer);
@@ -275,7 +295,7 @@
           imageKeyHideTimer = null;
         }, 10000);
       }
-    } else {
+    } else if (which === "video") {
       if (videoKeyHideTimer) {
         clearTimeout(videoKeyHideTimer);
         videoKeyHideTimer = null;
@@ -287,6 +307,12 @@
           videoKeyHideTimer = null;
         }, 10000);
       }
+    } else {
+      if (promptKeyHideTimer) clearTimeout(promptKeyHideTimer);
+      showPromptKey = !showPromptKey;
+      promptKeyHideTimer = showPromptKey
+        ? setTimeout(() => { showPromptKey = false; promptKeyHideTimer = null; }, 10000)
+        : null;
     }
   }
 
@@ -341,6 +367,25 @@
         errs.push("Model tạo video không được để trống.");
       }
     }
+    if (cfg.prompt_source !== "internal" && (cfg.endpoint_prompt_base_url?.trim() || cfg.endpoint_prompt_model?.trim())) {
+      if (!isValidHttpUrl(cfg.endpoint_prompt_base_url)) {
+        errs.push("Base URL endpoint prompt phải bắt đầu bằng http:// hoặc https://.");
+      }
+      if (!cfg.endpoint_prompt_model?.trim()) {
+        errs.push("Model tạo prompt không được để trống.");
+      }
+    }
+    if (!isValidIntInRange(cfg.prompt_timeout_s, 5, 3600)) {
+      errs.push("Timeout tạo prompt phải là số nguyên từ 5 đến 3600 giây.");
+    }
+    for (const [label, threshold] of [["lượt thích", cfg.reels_min_likes], ["lượt xem", cfg.reels_min_views]] as const) {
+      if (threshold != null && (!Number.isSafeInteger(threshold) || threshold < 0 || threshold > 2_147_483_647)) {
+        errs.push(`Ngưỡng ${label} phải là số nguyên từ 0 đến 2.147.483.647 hoặc để trống.`);
+      }
+    }
+    if (cfg.reels_country && !/^[A-Za-z]{2}$/.test(cfg.reels_country.trim())) {
+      errs.push("Mã thị trường phải gồm hai chữ cái ISO hoặc để trống.");
+    }
     if (!isValidIntInRange(cfg.muse_sidecar_port, 1, 65535)) {
       errs.push("Port VideoFlow Muse phải là số nguyên từ 1 đến 65535.");
     }
@@ -389,6 +434,14 @@
 
   function applySettingsView(view: SettingsView) {
     const cloned: Settings = JSON.parse(JSON.stringify(view.settings));
+    cloned.prompt_source = cloned.prompt_source || "gateway";
+    cloned.endpoint_prompt_base_url = cloned.endpoint_prompt_base_url || "";
+    cloned.endpoint_prompt_model = cloned.endpoint_prompt_model || "";
+    cloned.prompt_timeout_s = Number(cloned.prompt_timeout_s ?? 900);
+    cloned.reels_min_likes = cloned.reels_min_likes ?? 500;
+    cloned.reels_min_views = cloned.reels_min_views ?? 30000;
+    cloned.reels_country = cloned.reels_country ?? "";
+    cloned.reels_require_buy_link = Boolean(cloned.reels_require_buy_link);
     if (!Array.isArray(cloned.backoff_s) || cloned.backoff_s.length < 3) {
       cloned.backoff_s = [30, 120, 300];
     }
@@ -412,10 +465,14 @@
     }
     imageKeyPreview = view.image_key_preview ?? "";
     videoKeyPreview = view.video_key_preview ?? "";
+    promptKeyPreview = view.prompt_key_preview ?? "";
     hasImageKey = Boolean(view.has_image_key);
     hasVideoKey = Boolean(view.has_video_key);
+    hasPromptKey = Boolean(view.has_prompt_key);
     pendingClearImageKey = false;
     pendingClearVideoKey = false;
+    pendingClearPromptKey = false;
+    promptKeyInput = "";
 
     endpointStatus.set({
       imageConfigured: cloned.image_source === "internal" || hasImageKey,
@@ -461,6 +518,12 @@
     mark();
   }
 
+  function onPromptKeyInput(e: Event) {
+    promptKeyInput = (e.currentTarget as HTMLInputElement).value;
+    if (promptKeyInput.trim()) pendingClearPromptKey = false;
+    mark();
+  }
+
   // Đánh dấu xóa khóa nháp — chỉ xóa thật trong Keyring khi bấm "Lưu cài đặt" ("Hủy" khôi phục nguyên vẹn)
   function stageClearApiKey(which: "anh" | "video") {
     if ($running) return;
@@ -478,6 +541,16 @@
         mark();
         showToast("info", "Đã đánh dấu xóa khóa API video — bấm 'Lưu cài đặt' để áp dụng hoặc 'Hủy' để giữ lại.");
       }
+    }
+  }
+
+  function stageClearPromptKey() {
+    if ($running) return;
+    promptKeyInput = "";
+    if (hasPromptKey) {
+      pendingClearPromptKey = true;
+      mark();
+      showToast("info", "Đã đánh dấu xóa khóa Endpoint prompt — bấm Lưu cài đặt để áp dụng hoặc Hủy để giữ lại.");
     }
   }
 
@@ -549,6 +622,12 @@
         endpoint_image_model: s.endpoint_image_model.trim(),
         endpoint_video_base_url: s.endpoint_video_base_url.trim(),
         endpoint_video_model: s.endpoint_video_model.trim(),
+        endpoint_prompt_base_url: s.endpoint_prompt_base_url.trim(),
+        endpoint_prompt_model: s.endpoint_prompt_model.trim(),
+        prompt_timeout_s: Math.round(Number(s.prompt_timeout_s)),
+        reels_min_likes: s.reels_min_likes == null ? null : Math.round(Number(s.reels_min_likes)),
+        reels_min_views: s.reels_min_views == null ? null : Math.round(Number(s.reels_min_views)),
+        reels_country: (s.reels_country || "").trim().toUpperCase(),
         video_size: s.video_size.trim(),
         video_seconds: Math.round(Number(s.video_seconds)),
         image_timeout_s: Math.round(Number(s.image_timeout_s)),
@@ -578,7 +657,10 @@
         pendingClearImageKey,
         pendingClearVideoKey,
         deps: {
-          saveSettings: (cfg) => api.save_settings(cfg),
+          saveSettings: (cfg) => api.save_settings(
+            cfg,
+            promptKeyInput.trim() ? promptKeyInput : pendingClearPromptKey ? "" : null
+          ),
           setApiKey: (which, value) => api.set_api_key(which, value),
           getSettings: () => api.get_settings(),
         },
@@ -856,6 +938,82 @@
       if (which === "anh") loadingImageModels = false;
       else loadingVideoModels = false;
     }
+  }
+
+  async function testPromptEndpoint() {
+    if (!s || testingPrompt) return;
+    const source = s.prompt_source === "internal" ? "internal" : "gateway";
+    const baseUrl = source === "gateway" ? s.endpoint_prompt_base_url.trim() : "";
+    const model = source === "internal" ? "muse-chat" : s.endpoint_prompt_model.trim();
+    const rawDraftKey = promptKeyInput.trim();
+    if (source === "gateway" && (!isValidHttpUrl(baseUrl) || !model)) {
+      testPromptOk = false;
+      testPrompt = !isValidHttpUrl(baseUrl)
+        ? "Base URL phải là địa chỉ http(s) hợp lệ."
+        : "Chọn hoặc nhập model prompt trước khi kiểm tra.";
+      return;
+    }
+    if (pendingClearPromptKey && !rawDraftKey) {
+      testPromptOk = false;
+      testPrompt = "Khóa đang được đánh dấu xóa — nhập khóa mới hoặc bấm Hủy trước khi kiểm tra.";
+      return;
+    }
+    testingPrompt = true;
+    testPrompt = "";
+    testPromptOk = null;
+    try {
+      const [ok, ms, msg] = await api.test_connection(
+        "prompt",
+        baseUrl,
+        rawDraftKey || undefined,
+        model,
+        source
+      );
+      testPromptOk = ok;
+      testPrompt = `${ok ? "Kết nối OK" : "Không đạt"} (${ms} ms) — ${msg}`;
+    } catch (error) {
+      testPromptOk = false;
+      testPrompt = formatApiError(error);
+    } finally {
+      testingPrompt = false;
+    }
+  }
+
+  async function loadPromptModels() {
+    if (!s) return;
+    const baseUrl = s.endpoint_prompt_base_url.trim();
+    const draftKey = promptKeyInput.trim();
+    if (!isValidHttpUrl(baseUrl)) {
+      promptModelMsg = "Vui lòng nhập Base URL http(s) hợp lệ trước.";
+      return;
+    }
+    if (pendingClearPromptKey && !draftKey) {
+      promptModelMsg = "Khóa đang được đánh dấu xóa — nhập khóa mới trước khi tải model.";
+      return;
+    }
+    loadingPromptModels = true;
+    promptModelMsg = "";
+    try {
+      promptModels = await api.list_models("prompt", baseUrl, draftKey || undefined);
+      promptModelMsg = promptModels.length
+        ? `Đã tải ${promptModels.length} model; chọn model hoặc nhập ID ở trên.`
+        : "Endpoint không trả danh sách model; có thể nhập model ID thủ công.";
+    } catch (error) {
+      promptModels = [];
+      promptModelMsg = formatApiError(error);
+    } finally {
+      loadingPromptModels = false;
+    }
+  }
+
+  function onPromptModelSelect(e: Event) {
+    if (!s) return;
+    const value = (e.currentTarget as HTMLSelectElement).value;
+    if (!value) return;
+    s.endpoint_prompt_model = value;
+    promptModels = [];
+    promptModelMsg = `Đã chọn model prompt: ${value}`;
+    mark();
   }
 
   function onModelSelect(which: "anh" | "video", e: Event) {
@@ -1541,6 +1699,92 @@
           {/if}
         </div>
         {/if}
+
+      {:else if tab === "prompt"}
+        <div class="label">Nguồn tạo prompt</div>
+        <div class="source-radios">
+          <label class="radio-card" class:active={s.prompt_source !== "internal"}>
+            <input type="radio" name="prompt-source" value="gateway" checked={s.prompt_source !== "internal"} disabled={$running}
+              on:change={() => { if (s) { s.prompt_source = "gateway"; mark(); } }} />
+            <div><strong>Gateway ngoài</strong><span>Gọi model text tại endpoint đã cấu hình; không tự chuyển sang Muse khi lỗi.</span></div>
+          </label>
+          <label class="radio-card" class:active={s.prompt_source === "internal"}>
+            <input type="radio" name="prompt-source" value="internal" checked={s.prompt_source === "internal"} disabled={$running}
+              on:change={() => { if (s) { s.prompt_source = "internal"; mark(); } }} />
+            <div><strong>VideoFlow Muse (nội bộ)</strong><span>Dùng phiên Muse đã lưu và model muse-chat; không gửi dữ liệu sang gateway.</span></div>
+          </label>
+        </div>
+
+        {#if s.prompt_source === "internal"}
+          <div class="hint">B3 sẽ dùng <code>muse-chat</code> với tài khoản Muse đã lưu. GENERATE, CHECK và lần sửa của cùng batch giữ nguyên nguồn này.</div>
+          <div class="muse-accounts-summary-row">
+            <span class="muse-summary-info">Muse: {$museSidecarStatus?.sidecar.running ? "Engine đang chạy" : "Engine sẽ khởi động khi cần"} · {usableMuseAccounts} tài khoản khả dụng</span>
+            <button type="button" class="btn-secondary jump-accounts-btn" on:click={() => dispatch("navigate", "accounts")}>Mở Tài khoản</button>
+          </div>
+        {:else}
+          <label class="label" for="cfg-prompt-base-url">Địa chỉ gốc (Base URL)</label>
+          <input id="cfg-prompt-base-url" class="input full" class:invalid={!isValidHttpUrl(s.endpoint_prompt_base_url)}
+            bind:value={s.endpoint_prompt_base_url} on:input={mark} disabled={$running} placeholder="https://api.example.com/v1" />
+
+          <label class="label" for="cfg-prompt-api-key">API Key
+            {#if pendingClearPromptKey}<span class="pending-clear-tag">(sẽ xóa khi bấm Lưu cài đặt)</span>
+            {:else if promptKeyPreview}(đã lưu: {promptKeyPreview})
+            {:else}(chưa lưu trong Keyring){/if}
+          </label>
+          <div class="inline">
+            <div class="key-input-wrap grow">
+              <input id="cfg-prompt-api-key" class="input full key-input" type={showPromptKey ? "text" : "password"}
+                placeholder={hasPromptKey && !pendingClearPromptKey ? "Nhập khóa mới để thay thế..." : "Nhập API key endpoint prompt..."}
+                value={promptKeyInput} on:input={onPromptKeyInput} disabled={$running} autocomplete="off" />
+              <button type="button" class="btn-ghost eye-btn" aria-label={showPromptKey ? "Ẩn API key prompt" : "Hiện API key prompt (tự ẩn sau 10s)"}
+                title={showPromptKey ? "Ẩn khóa" : "Hiện khóa (tự ẩn sau 10 giây)"} disabled={$running} on:click={() => toggleKeyVisibility("prompt")}>
+                <Icons name={showPromptKey ? "eye-off" : "eye"} size={15} />
+              </button>
+            </div>
+            <button type="button" class="btn-secondary" disabled={$running || ((!hasPromptKey || pendingClearPromptKey) && !promptKeyInput)} on:click={stageClearPromptKey}>
+              <Icons name="trash" size={14} /><span>Xóa khóa</span>
+            </button>
+          </div>
+
+          <label class="label" for="cfg-prompt-model">Model sinh prompt</label>
+          <div class="inline">
+            <input id="cfg-prompt-model" class="input grow" bind:value={s.endpoint_prompt_model} on:input={mark} disabled={$running} placeholder="ví dụ: gpt-4.1-mini" />
+            <button type="button" class="btn-secondary" disabled={$running || loadingPromptModels} on:click={loadPromptModels}>{loadingPromptModels ? "Đang tải…" : "Tải danh sách model"}</button>
+          </div>
+          {#if promptModels.length}<select class="input full" aria-label="Chọn model prompt" value="" on:change={onPromptModelSelect}><option value="">— Chọn model ({promptModels.length}) —</option>{#each promptModels as id (id)}<option value={id}>{id}</option>{/each}</select>{/if}
+          {#if promptModelMsg}<div class="hint">{promptModelMsg}</div>{/if}
+        {/if}
+
+        <div class="grid-2">
+          <div><label class="label" for="cfg-prompt-timeout">Thời gian chờ tối đa mỗi lần gọi (5–3600 giây)</label>
+            <input id="cfg-prompt-timeout" class="input full" type="number" min="5" max="3600" step="1" class:invalid={!isValidIntInRange(s.prompt_timeout_s, 5, 3600)} bind:value={s.prompt_timeout_s} on:input={mark} disabled={$running} /></div>
+        </div>
+        <div class="inline">
+          <button type="button" class="btn-secondary" disabled={$running || testingPrompt} on:click={testPromptEndpoint}>{testingPrompt ? "Đang kiểm tra…" : "Kiểm tra kết nối"}</button>
+          {#if testPrompt}<span class="connection-result" class:ok={testPromptOk === true} class:bad={testPromptOk === false} role="status">{testPrompt}</span>{/if}
+        </div>
+        <div class="hint">Key prompt độc lập với key ảnh/video. Đổi Base URL không gửi lại key đã lưu; bản nháp chỉ có hiệu lực khi bấm Lưu cài đặt.</div>
+
+      {:else if tab === "reels"}
+        <div class="label">Bộ lọc tìm ý tưởng Reels · giá trị mặc định cấp ứng dụng</div>
+        <div class="grid-2">
+          <div><label class="label" for="cfg-reels-likes">Lượt thích trên</label>
+            <input id="cfg-reels-likes" class="input full" type="number" min="0" max="2147483647" step="1" bind:value={s.reels_min_likes} on:input={mark} disabled={$running} placeholder="Trống = bỏ điều kiện" />
+            <small class="hint">Chỉ đạt khi lượt thích lớn hơn ngưỡng; để trống để bỏ điều kiện.</small></div>
+          <div><label class="label" for="cfg-reels-views">Lượt xem trên</label>
+            <input id="cfg-reels-views" class="input full" type="number" min="0" max="2147483647" step="1" bind:value={s.reels_min_views} on:input={mark} disabled={$running} placeholder="Trống = bỏ điều kiện" />
+            <small class="hint">Ví dụ 30.000 nghĩa là giá trị phải lớn hơn 30.000.</small></div>
+        </div>
+        <div class="grid-2">
+          <div><label class="label" for="cfg-reels-country">Thị trường mục tiêu</label>
+            <input id="cfg-reels-country" class="input full" maxlength="2" bind:value={s.reels_country} on:input={mark} disabled={$running} placeholder="Tất cả hoặc mã ISO 2 chữ cái, ví dụ US" />
+            <small class="hint">Không suy ra thị trường từ IP, ngôn ngữ caption hoặc vị trí tài khoản.</small></div>
+          <label class="muse-checkbox"><input type="checkbox" bind:checked={s.reels_require_buy_link} on:change={mark} disabled={$running} /> Yêu cầu link mua và CTA trong caption của chính Reel</label>
+        </div>
+        <div class="hint">Chủ đề được nhập riêng cho mỗi lần tìm (1–1.000 ký tự). Mỗi lượt tìm chụp snapshot bộ lọc; thay đổi ở đây chỉ dùng cho lượt sau.</div>
+        <div class="inline">
+          <button type="button" class="btn-secondary" disabled={$running} on:click={() => { if (!s) return; s.reels_min_likes = 500; s.reels_min_views = 30000; s.reels_country = ""; s.reels_require_buy_link = false; mark(); }}>Khôi phục mặc định</button>
+        </div>
 
       {:else if tab === "run"}
         <div class="two-cols">

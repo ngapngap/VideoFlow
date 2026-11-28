@@ -1,5 +1,5 @@
 <script context="module" lang="ts">
-  export type Screen = "dash" | "rows" | "accounts" | "proxies" | "history" | "folder" | "settings";
+  export type Screen = "dash" | "rows" | "accounts" | "proxies" | "history" | "folder" | "research" | "settings";
 </script>
 
 <script lang="ts">
@@ -63,8 +63,10 @@
   import History from "./screens/History.svelte";
   import LocalFolder from "./screens/LocalFolder.svelte";
   import Settings from "./screens/Settings.svelte";
+  import Research from "./screens/Research.svelte";
 
   let screen: Screen = "dash";
+  let settingsInitialTab: "project" | "prompt" = "project";
   let sidebarCollapsed = false;
   let stoppingHeader = false;
   let quittingApp = false;
@@ -76,6 +78,7 @@
     { key: "proxies" as Screen, label: $t("nav.proxies"), icon: "globe" },
     { key: "history" as Screen, label: $t("nav.history"), icon: "history" },
     { key: "folder" as Screen, label: $t("nav.folder"), icon: "folder" },
+    { key: "research" as Screen, label: $t("nav.research"), icon: "search" },
   ];
 
   $: screenTitles = {
@@ -85,6 +88,7 @@
     proxies: $t("title.proxies"),
     history: $t("title.history"),
     folder: $t("title.folder"),
+    research: $t("title.research"),
     settings: $t("title.settings"),
   } as Record<Screen, string>;
 
@@ -193,6 +197,16 @@
       return;
     }
     screen = target;
+  }
+
+  function openPromptSettings() {
+    settingsInitialTab = "prompt";
+    requestNavigate("settings");
+  }
+
+  function openGeneralSettings() {
+    settingsInitialTab = "project";
+    requestNavigate("settings");
   }
 
   function confirmDiscardSettings() {
@@ -425,7 +439,7 @@
   }
 
   // ━━ Cập nhật ứng dụng (auto-update qua GitHub Releases) ━━
-  let appVersion = "1.5.5";
+  let appVersion = "1.6.0";
   let updateInfo: UpdateInfo | null = null;
   let updateChecking = false;
   let updateInstalling = false;
@@ -599,6 +613,7 @@
           class="nav-item"
           class:active={screen === item.key}
           title={item.label}
+          data-testid={item.key === "research" ? "nav-reels" : undefined}
           on:click={() => requestNavigate(item.key)}
         >
           <Icons name={item.icon} size={18} />
@@ -617,7 +632,7 @@
           : settingsNeedsAttention
             ? "Cài đặt (cần kiểm tra API key / cấu trúc)"
             : "Cài đặt"}
-        on:click={() => requestNavigate("settings")}
+        on:click={openGeneralSettings}
       >
         <Icons name="settings" size={18} />
         <span class="nav-label">{$t("nav.settings")}</span>
@@ -714,7 +729,7 @@
           class:active={screen === "settings"}
           aria-label={$t("header.settings")}
           title={$t("header.settings")}
-          on:click={() => requestNavigate("settings")}
+          on:click={openGeneralSettings}
         >
           <Icons name="settings" size={18} />
         </button>
@@ -755,8 +770,10 @@
         <History />
       {:else if screen === "folder"}
         <LocalFolder />
+      {:else if screen === "research"}
+        <Research on:configurePrompt={openPromptSettings} />
       {:else}
-        <Settings on:navigate={handleDashboardNavigate} />
+        <Settings initialTab={settingsInitialTab} on:navigate={handleDashboardNavigate} />
       {/if}
     </main>
   </div>

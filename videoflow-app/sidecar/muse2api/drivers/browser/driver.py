@@ -1011,16 +1011,26 @@ class BrowserDriver(GenerationMixin, QuotaSessionMixin, MuseDriver):
         if images:
             await self._wait_upload_complete(tab, timeout=self._UPLOAD_TIMEOUT)
 
-    async def _send(self, tab: _Tab, prompt: str) -> None:
+    async def _send(self, tab: _Tab, prompt: str, cancel: asyncio.Event | None = None) -> None:
+        if cancel and cancel.is_set():
+            raise asyncio.CancelledError
         res = await tab.session.evaluate(dom.fill_input(prompt))
         if not (res or {}).get("ok"):
             raise UpstreamError(f"cannot fill chat input: {(res or {}).get('err')}")
+        if cancel and cancel.is_set():
+            raise asyncio.CancelledError
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
+            if cancel and cancel.is_set():
+                raise asyncio.CancelledError
             if await tab.session.evaluate(dom.CLICK_SEND) == "clicked":
                 return
             await asyncio.sleep(0.1)
+        if cancel and cancel.is_set():
+            raise asyncio.CancelledError
         for kind in ("keyDown", "keyUp"):
+            if cancel and cancel.is_set():
+                raise asyncio.CancelledError
             await tab.session.send(
                 "Input.dispatchKeyEvent",
                 {"type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13,

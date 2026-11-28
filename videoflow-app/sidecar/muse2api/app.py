@@ -89,6 +89,10 @@ def create_app(settings: Settings | None = None, driver: MuseDriver | None = Non
                     with contextlib.suppress(asyncio.CancelledError):
                         await bg
             await services.tasks.shutdown()
+            if services.research is not None and hasattr(services.research, "shutdown"):
+                await services.research.shutdown()
+            if services.research_transport is not None:
+                await services.research_transport.shutdown()
             if services.interactive is not None:
                 await services.interactive.shutdown()
             await services.driver.shutdown()

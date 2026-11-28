@@ -75,6 +75,16 @@ class CDPSession:
     def on(self, method: str, callback: Callable[[dict], None]) -> None:
         self._listeners[method].append(callback)
 
+    def off(self, method: str, callback: Callable[[dict], None]) -> None:
+        """Remove a temporary event listener from a long-lived page session."""
+        listeners = self._listeners.get(method)
+        if not listeners:
+            return
+        with contextlib.suppress(ValueError):
+            listeners.remove(callback)
+        if not listeners:
+            self._listeners.pop(method, None)
+
     async def send(self, method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
         if self.closed:
             raise CDPError("cdp connection closed")

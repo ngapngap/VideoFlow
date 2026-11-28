@@ -7,7 +7,7 @@ import base64
 import contextlib
 import logging
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
 from ...accounts.model import Account, AccountStatus
@@ -32,6 +32,8 @@ from ..base import (
 from . import dom
 from .cdp import CDPError
 from .media_verify import _infer_mime_from_bytes, is_thread_url, verify_and_save_download
+from .research_dom import capture_turn_expression, stop_expression
+from .research_network import ResearchHttpCapture
 
 if TYPE_CHECKING:
     from .driver import _Tab
@@ -142,7 +144,10 @@ class GenerationMixin:
             )
         raise UpstreamTimeout("saved conversation did not become ready")
 
-    async def _begin_chat(self, account: Account, req: ChatRequest):
+    async def _begin_chat(self, account: Account, req: ChatRequest,
+                          before_send: Callable[[_Tab], None] | None = None,
+                          cancel: asyncio.Event | None = None,
+                          after_send_setup_failure: Callable[[_Tab], None] | None = None):
         """Send ``req`` on the saved conversation when it continues that page."""
         hint = req.conversation_hint or ""
         if hint:
@@ -193,13 +198,19 @@ class GenerationMixin:
                     await self._new_thread(tab)
             base = await self._state(tab)
             await self._attach(tab, images)
-            await self._send(tab, prompt)
+            if before_send is not None:
+                before_send(tab)
+            await self._send(tab, prompt, cancel=cancel)
             return tab, base
         except CDPError as exc:
+            if after_send_setup_failure is not None:
+                after_send_setup_failure(tab)
             await self._close_tab(tab)
             await self._checkin(tab)
             raise UpstreamError(f"browser error: {exc}") from exc
         except BaseException:
+            if after_send_setup_failure is not None:
+                after_send_setup_failure(tab)
             self._forget(tab)
             await self._checkin(tab)
             raise
@@ -281,6 +292,98 @@ class GenerationMixin:
                 await asyncio.shield(self._checkin(tab))
             if finished and not errored:
                 self.prewarm(account)
+
+    async def research_reply(
+        self,
+        account: Account,
+        *,
+        prompt: str,
+        operation_id: str,
+        stage: str,
+        images: list[InputImage] | None = None,
+        timeout: float = 900.0,
+        conversation_hint: str | None = None,
+        cancel: asyncio.Event | None = None,
+    ) -> dict[str, Any]:
+        """Submit one research prompt and return its bound raw assistant code node.
+
+        This intentionally bypasses chat_stream's flattened text deltas and hot-page
+        retry behavior. Once sent, this operation is observed on its exact turn only.
+        """
+        if self.account is None:
+            drv = await self._ensure_account_driver(account)
+            return await drv.research_reply(
+                account, prompt=prompt, operation_id=operation_id, stage=stage,
+                images=images, timeout=timeout, conversation_hint=conversation_hint, cancel=cancel,
+            )
+        if cancel and cancel.is_set():
+            return {"status": "stopped", "operation_id": operation_id, "stage": stage,
+                    "http_status": None, "http_body": None,
+                    "raw_ui_code_textcontent": None, "dom_turn": None}
+        req = ChatRequest(
+            prompt=prompt,
+            model="muse-chat",
+            images=list(images or []),
+            timeout=timeout,
+            first_token_timeout=min(timeout, 480.0),
+            conversation_hint=f"research:{operation_id}:{conversation_hint or ''}",
+            turns=[("user", prompt)],
+            cancel=cancel,
+        )
+        started = _drv().time.monotonic()
+        http_capture = ResearchHttpCapture(operation_id, stage)
+        tab, _base = await asyncio.wait_for(
+            self._begin_chat(account, req, before_send=http_capture.attach, cancel=cancel,
+                             after_send_setup_failure=lambda t: http_capture.detach(t.session)),
+            timeout=timeout)
+        expression = capture_turn_expression(account.id, operation_id, stage)
+        capture: dict[str, Any] = {"pending": True, "reason": "waiting-for-assistant"}
+        try:
+            while True:
+                if cancel and cancel.is_set():
+                    with contextlib.suppress(CDPError, TimeoutError):
+                        await tab.session.evaluate(stop_expression(operation_id, stage), timeout=5.0)
+                    return {
+                        "status": "stopped", "operation_id": operation_id, "stage": stage,
+                        "http_status": None, "http_body": None,
+                        "raw_ui_code_textcontent": capture.get("raw_ui_code_textcontent"),
+                        "dom_turn": capture if capture.get("owner_id") else None,
+                    }
+                elapsed = _drv().time.monotonic() - started
+                if elapsed >= timeout:
+                    raise UpstreamTimeout("research assistant reply timed out")
+                if elapsed >= min(timeout, 480.0) and capture.get("reason") == "waiting-for-assistant":
+                    raise UpstreamTimeout("no first research response from assistant")
+                state = await self._state(tab)
+                if state.get("approval"):
+                    await self._deny_approvals(tab)
+                capture = await tab.session.evaluate(expression, timeout=10.0) or capture
+                if capture.get("pending"):
+                    await _drv().asyncio.sleep(_drv().POLL_INTERVAL)
+                    continue
+                if capture.get("completed"):
+                    binding = {key: capture.get(key) for key in (
+                        "owner_id", "thread_id", "user_message_id", "assistant_message_id",
+                        "user_turn_id", "assistant_turn_id",
+                    )}
+                    http_receipt = await http_capture.snapshot(tab.session)
+                    return {
+                        "status": "completed" if not capture.get("error") else "protocol_error",
+                        "operation_id": operation_id,
+                        "stage": stage,
+                        **http_receipt,
+                        "raw_ui_code_textcontent": capture.get("raw_ui_code_textcontent"),
+                        "dom_turn": capture,
+                        "binding": binding,
+                        "capture_error": capture.get("error"),
+                    }
+                raise UpstreamError(f"research DOM capture failed: {capture.get('error', 'unknown')}")
+        except BaseException:
+            raise
+        finally:
+            http_capture.detach(tab.session)
+            self._forget(tab)
+            await asyncio.shield(self._checkin(tab))
 
     # ------------------------------------------------------------ warm threads
     _WARM_REPLY_TIMEOUT = 90.0
